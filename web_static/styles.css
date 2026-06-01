@@ -296,25 +296,16 @@ button {
 }
 
 .remote-item {
-  padding: 8px 10px;
+  padding: 7px 10px;
 }
 
 .remote-item strong {
   font-size: 12px;
-  line-height: 1.25;
+  line-height: 1.2;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
   overflow-wrap: normal;
-}
-
-.remote-item span {
-  margin-top: 4px;
-  font-size: 11px;
-  line-height: 1.25;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
 }
 
 .task-job-badge {

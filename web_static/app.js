@@ -500,7 +500,7 @@ function renderRemoteVideos() {
     item.className = `list-item remote-item ${state.selectedRemoteVideo?.remote_id === video.remote_id ? "active" : ""}`;
     item.type = "button";
     const title = video.name || video.display_name || "远程素材";
-    item.innerHTML = `<strong>${escapeHtml(title)}</strong><span>${escapeHtml(video.duration_text || "-")} · ${escapeHtml(video.create_time || "-")}</span>`;
+    item.innerHTML = `<strong>${escapeHtml(title)}</strong>`;
     item.addEventListener("click", () => selectRemoteVideo(video));
     box.appendChild(item);
   });
