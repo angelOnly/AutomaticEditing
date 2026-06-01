@@ -184,6 +184,12 @@ record_stations = [
 # Authorization = "Bearer xxx"
 # Cookie = "xxx"
 
+[multi_source]
+fps = 25
+sample_rate = 48000
+normalize_before_concat = true
+keep_source_manifest = true
+
 [gpu_limits]
 asr_slots = 1
 tts_slots = 1

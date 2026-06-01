@@ -26,7 +26,7 @@
               <button class="icon-button" id="refreshVideos" title="刷新素材"><i data-lucide="refresh-cw"></i></button>
             </div>
           </div>
-          <input id="videoUploadInput" class="sr-only" type="file" accept="video/mp4,video/quicktime,video/x-matroska,video/x-m4v,video/x-msvideo" />
+          <input id="videoUploadInput" class="sr-only" type="file" multiple accept="video/mp4,video/quicktime,video/x-matroska,video/x-m4v,video/x-msvideo" />
           <div id="videoList" class="list"></div>
         </section>
 
@@ -125,6 +125,21 @@
 
         <section class="main-grid">
           <div class="left-stack">
+            <section class="panel source-basket-panel">
+              <div class="panel-header">
+                <div>
+                  <h3>本次剪辑素材</h3>
+                  <p>支持本地素材、远程素材混合拖拽；按列表顺序拼接分析。</p>
+                </div>
+                <button id="clearSourceBasket" class="button secondary" type="button">清空</button>
+              </div>
+              <div id="sourceDropZone" class="source-drop-zone">
+                <strong>把多个视频拖到这里</strong>
+                <span>也可以从左侧本地素材 / 远程素材点击加入</span>
+              </div>
+              <div id="sourceBasket" class="source-basket"></div>
+            </section>
+
             <section class="panel params-panel">
               <div class="panel-header">
                 <div>

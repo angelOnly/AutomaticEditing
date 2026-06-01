@@ -77,6 +77,7 @@ const AUTO_REFRESH_MS = 10 * 1000;
 const state = {
   selectedVideo: null,
   selectedRemoteVideo: null,
+  sourceBasket: [],
   selectedTask: null,
   manifest: null,
   activeJob: null,
@@ -125,6 +126,7 @@ async function api(path, options = {}) {
 function init() {
   fillStepSelect();
   bindEvents();
+  renderSourceBasket();
   loadConfig().then(refreshAll);
   startAutoRefresh();
   lucide.createIcons();
@@ -225,6 +227,14 @@ function normalizeDefaultRunMode(mode) {
 function bindEvents() {
   $("uploadVideo")?.addEventListener("click", () => $("videoUploadInput")?.click());
   $("videoUploadInput")?.addEventListener("change", uploadSelectedVideo);
+  bindSourceDropZone();
+  $("clearSourceBasket")?.addEventListener("click", () => {
+    state.sourceBasket = [];
+    state.selectedVideo = null;
+    state.selectedRemoteVideo = null;
+    renderSourceBasket();
+    updateActiveTitleForSources();
+  });
   document.addEventListener("click", hideContextMenu);
   document.addEventListener("scroll", hideContextMenu, true);
   document.addEventListener("keydown", (event) => {
@@ -437,15 +447,12 @@ async function loadVideos() {
     item.type = "button";
     item.innerHTML = `<strong>${escapeHtml(video.name)}</strong><span>${video.size_mb} MB · ${video.updated_at}</span>`;
     item.addEventListener("click", () => {
-      state.selectedVideo = video;
-      state.selectedRemoteVideo = null;
+      addLocalSourceToBasket(video);
       state.selectedTask = null;
       state.manifest = null;
       applyDefaultControls();
-      $("taskIdInput").value = suggestedTaskId(video.name, $("productionMode").value);
-      $("activeTitle").textContent = video.name;
-      updateTaskSubtitle();
       clearTaskPanels();
+      updateActiveTitleForSources();
       $("videoPreview").src = `/api/videos/preview?path=${encodeURIComponent(video.path)}`;
       $("videoPreview").load();
       loadVideos();
@@ -501,7 +508,10 @@ function renderRemoteVideos() {
     item.type = "button";
     const title = video.name || video.display_name || "远程素材";
     item.innerHTML = `<strong>${escapeHtml(title)}</strong>`;
-    item.addEventListener("click", () => selectRemoteVideo(video));
+    item.addEventListener("click", () => {
+      addRemoteSourceToBasket(video);
+      selectRemoteVideo(video);
+    });
     box.appendChild(item);
   });
   lucide.createIcons();
@@ -511,6 +521,153 @@ function updateRemotePager() {
   const p = state.remotePagination || {};
   const maxPage = Math.max(1, Math.ceil((p.total || 0) / (p.pageSize || 10)));
   if ($("remotePageInfo")) $("remotePageInfo").textContent = `${p.current || 1} / ${maxPage} · 共 ${p.total || 0}`;
+}
+
+function addLocalSourceToBasket(video) {
+  if (state.sourceBasket.some((item) => item.source_type === "local" && item.path === video.path)) return;
+  state.sourceBasket.push({
+    id: makeSourceId(),
+    source_type: "local",
+    path: video.path,
+    display_name: video.name,
+    meta: video,
+  });
+  state.selectedVideo = video;
+  state.selectedRemoteVideo = null;
+  renderSourceBasket();
+  updateActiveTitleForSources();
+}
+
+function addRemoteSourceToBasket(video) {
+  const key = video.remote_id || String(video.id || video.name || "");
+  if (
+    state.sourceBasket.some(
+      (item) => item.source_type === "remote_ucms" && (item.remote_video.remote_id || item.remote_video.id || item.remote_video.name) === key
+    )
+  ) {
+    return;
+  }
+  state.sourceBasket.push({
+    id: makeSourceId(),
+    source_type: "remote_ucms",
+    remote_video: video,
+    display_name: video.display_name || video.name || "远程素材",
+  });
+  state.selectedRemoteVideo = video;
+  state.selectedVideo = null;
+  renderSourceBasket();
+  updateActiveTitleForSources();
+}
+
+function renderSourceBasket() {
+  const box = $("sourceBasket");
+  if (!box) return;
+  if (!state.sourceBasket.length) {
+    box.innerHTML = `<div class="source-empty">还没有选择素材。请从左侧加入，或拖拽上传多个视频。</div>`;
+    return;
+  }
+  box.innerHTML = state.sourceBasket
+    .map(
+      (item, index) => `
+    <div class="source-basket-item" draggable="true" data-id="${escapeAttr(item.id)}">
+      <span class="source-index">${index + 1}</span>
+      <div class="source-main">
+        <strong>${escapeHtml(item.display_name || "未命名素材")}</strong>
+        <small>${item.source_type === "remote_ucms" ? "远程素材" : "本地素材"}</small>
+      </div>
+      <button class="mini-button" data-action="up" data-id="${escapeAttr(item.id)}" type="button">上移</button>
+      <button class="mini-button" data-action="down" data-id="${escapeAttr(item.id)}" type="button">下移</button>
+      <button class="mini-button danger" data-action="remove" data-id="${escapeAttr(item.id)}" type="button">移除</button>
+    </div>`
+    )
+    .join("");
+
+  box.querySelectorAll("button[data-action]").forEach((button) => {
+    button.addEventListener("click", () => updateSourceBasketItem(button.dataset.id, button.dataset.action));
+  });
+  box.querySelectorAll(".source-basket-item").forEach((row) => {
+    row.addEventListener("dragstart", (event) => {
+      event.dataTransfer?.setData("text/plain", row.dataset.id || "");
+      row.classList.add("dragging");
+    });
+    row.addEventListener("dragend", () => row.classList.remove("dragging"));
+    row.addEventListener("dragover", (event) => event.preventDefault());
+    row.addEventListener("drop", (event) => {
+      event.preventDefault();
+      moveSourceBefore(event.dataTransfer?.getData("text/plain"), row.dataset.id);
+    });
+  });
+}
+
+function updateSourceBasketItem(id, action) {
+  const idx = state.sourceBasket.findIndex((item) => item.id === id);
+  if (idx < 0) return;
+  if (action === "remove") state.sourceBasket.splice(idx, 1);
+  if (action === "up" && idx > 0) [state.sourceBasket[idx - 1], state.sourceBasket[idx]] = [state.sourceBasket[idx], state.sourceBasket[idx - 1]];
+  if (action === "down" && idx < state.sourceBasket.length - 1) {
+    [state.sourceBasket[idx + 1], state.sourceBasket[idx]] = [state.sourceBasket[idx], state.sourceBasket[idx + 1]];
+  }
+  if (!state.sourceBasket.length) {
+    state.selectedVideo = null;
+    state.selectedRemoteVideo = null;
+  }
+  renderSourceBasket();
+  updateActiveTitleForSources();
+}
+
+function moveSourceBefore(sourceId, targetId) {
+  if (!sourceId || !targetId || sourceId === targetId) return;
+  const from = state.sourceBasket.findIndex((item) => item.id === sourceId);
+  const to = state.sourceBasket.findIndex((item) => item.id === targetId);
+  if (from < 0 || to < 0) return;
+  const [item] = state.sourceBasket.splice(from, 1);
+  const nextTo = state.sourceBasket.findIndex((candidate) => candidate.id === targetId);
+  state.sourceBasket.splice(nextTo, 0, item);
+  renderSourceBasket();
+  updateActiveTitleForSources();
+}
+
+function bindSourceDropZone() {
+  const zone = $("sourceDropZone");
+  if (!zone) return;
+  ["dragenter", "dragover"].forEach((name) => {
+    zone.addEventListener(name, (event) => {
+      event.preventDefault();
+      zone.classList.add("drag-over");
+    });
+  });
+  ["dragleave", "drop"].forEach((name) => {
+    zone.addEventListener(name, (event) => {
+      event.preventDefault();
+      zone.classList.remove("drag-over");
+    });
+  });
+  zone.addEventListener("drop", async (event) => {
+    const files = Array.from(event.dataTransfer?.files || []).filter(
+      (file) => file.type.startsWith("video/") || /\.(mp4|mov|mkv|m4v|avi)$/i.test(file.name)
+    );
+    if (files.length) await uploadFilesToBasket(files);
+  });
+}
+
+function updateActiveTitleForSources() {
+  if (!state.sourceBasket.length) {
+    $("activeTitle").textContent = state.selectedTask ? displayTaskId(state.selectedTask) : "请选择视频或任务";
+    if (!state.selectedTask && !state.selectedVideo && !state.selectedRemoteVideo) $("taskIdInput").value = "";
+    updateTaskSubtitle();
+    return;
+  }
+  const first = state.sourceBasket[0]?.display_name || "多源素材";
+  const name = state.sourceBasket.length === 1 ? first : `多源剪辑（${state.sourceBasket.length}段）`;
+  $("activeTitle").textContent = name;
+  if (!state.selectedTask) {
+    $("taskIdInput").value = suggestedTaskId(name, $("productionMode").value);
+    updateTaskSubtitle();
+  }
+}
+
+function makeSourceId() {
+  return crypto.randomUUID ? crypto.randomUUID() : `src_${Date.now()}_${Math.random().toString(16).slice(2)}`;
 }
 
 function renderRemoteError(error) {
@@ -526,8 +683,12 @@ function selectRemoteVideo(video) {
   state.selectedTask = null;
   state.manifest = null;
   applyDefaultControls();
-  $("taskIdInput").value = suggestedTaskId(video.name || "remote_video", $("productionMode").value);
-  $("activeTitle").textContent = video.display_name || video.name || "远程素材";
+  if (!state.sourceBasket.length) {
+    $("taskIdInput").value = suggestedTaskId(video.name || "remote_video", $("productionMode").value);
+    $("activeTitle").textContent = video.display_name || video.name || "远程素材";
+  } else {
+    updateActiveTitleForSources();
+  }
   updateTaskSubtitle();
   clearTaskPanels();
   if (video.preview_url) {
@@ -557,6 +718,8 @@ async function loadTasks() {
       state.selectedTask = task.task_id;
       state.selectedVideo = null;
       state.selectedRemoteVideo = null;
+      state.sourceBasket = [];
+      renderSourceBasket();
       $("taskIdInput").value = task.task_id;
       $("activeTitle").textContent = displayTaskId(task.task_id);
       updateTaskSubtitle(task.task_id);
@@ -574,32 +737,41 @@ async function loadTasks() {
 
 async function uploadSelectedVideo(event) {
   const input = event.target;
-  const file = input.files?.[0];
-  if (!file) return;
+  const files = Array.from(input.files || []);
+  if (!files.length) return;
+  try {
+    await uploadFilesToBasket(files);
+  } finally {
+    input.value = "";
+  }
+}
+
+async function uploadFilesToBasket(files) {
   const form = new FormData();
-  form.append("file", file);
+  files.forEach((file) => form.append(files.length > 1 ? "files" : "file", file));
   const uploadButton = $("uploadVideo");
   uploadButton.disabled = true;
   try {
-    const res = await fetch("/api/videos/upload", { method: "POST", body: form });
+    const endpoint = files.length > 1 ? "/api/videos/upload-multiple" : "/api/videos/upload";
+    const res = await fetch(endpoint, { method: "POST", body: form });
     if (!res.ok) throw new Error(await res.text() || res.statusText);
-    const video = await res.json();
+    const data = await res.json();
+    const uploaded = Array.isArray(data) ? data : [data];
+    uploaded.forEach((video) => addLocalSourceToBasket(video));
+    const video = uploaded[uploaded.length - 1];
     state.selectedVideo = video;
     state.selectedRemoteVideo = null;
     state.selectedTask = null;
     state.manifest = null;
     applyDefaultControls();
-    $("taskIdInput").value = suggestedTaskId(video.name, $("productionMode").value);
-    $("activeTitle").textContent = video.name;
-    updateTaskSubtitle();
     clearTaskPanels();
+    updateActiveTitleForSources();
     $("videoPreview").src = `/api/videos/preview?path=${encodeURIComponent(video.path)}`;
     $("videoPreview").load();
     await refreshWorkspace({ updatePreview: false });
   } catch (error) {
     alert(`上传失败：${cleanError(error)}`);
   } finally {
-    input.value = "";
     uploadButton.disabled = false;
     lucide.createIcons();
   }
@@ -1055,6 +1227,26 @@ async function runSelected() {
     state.selectedTask = existingTaskId;
     state.selectedVideo = null;
     state.selectedRemoteVideo = null;
+  } else if (state.sourceBasket.length) {
+    req.source_items = state.sourceBasket.map((item) => {
+      if (item.source_type === "remote_ucms") {
+        return {
+          source_type: "remote_ucms",
+          source_id: item.id,
+          display_name: item.display_name,
+          remote_video: item.remote_video,
+        };
+      }
+      return {
+        source_type: "local",
+        source_id: item.id,
+        display_name: item.display_name,
+        path: item.path,
+      };
+    });
+    req.input_video = null;
+    req.remote_video = null;
+    req.task_id = taskId || null;
   } else if (state.selectedVideo) {
     req.input_video = state.selectedVideo.path;
     req.remote_video = null;

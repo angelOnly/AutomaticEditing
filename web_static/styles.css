@@ -185,6 +185,12 @@ button {
   background: rgba(255, 255, 255, 0.075);
 }
 
+.mini-button.danger {
+  border-color: rgba(166, 29, 42, 0.28);
+  color: var(--brand);
+  background: rgba(166, 29, 42, 0.08);
+}
+
 .list {
   display: grid;
   gap: 10px;
@@ -552,6 +558,92 @@ h3 {
   border-radius: inherit;
   background: var(--brand);
   transition: width 240ms ease;
+}
+
+.source-basket-panel {
+  margin-bottom: 16px;
+}
+
+.source-drop-zone {
+  border: 1px dashed var(--line);
+  border-radius: 12px;
+  padding: 18px;
+  background: var(--panel-soft);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  align-items: center;
+  justify-content: center;
+  min-height: 88px;
+  color: var(--muted);
+  text-align: center;
+}
+
+.source-drop-zone strong {
+  color: var(--text);
+}
+
+.source-drop-zone.drag-over {
+  border-color: var(--brand);
+  background: var(--brand-soft);
+}
+
+.source-basket {
+  margin-top: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.source-basket-item {
+  display: grid;
+  grid-template-columns: 32px minmax(0, 1fr) auto auto auto;
+  gap: 8px;
+  align-items: center;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-soft);
+}
+
+.source-basket-item.dragging {
+  opacity: 0.6;
+}
+
+.source-index {
+  width: 26px;
+  height: 26px;
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--brand);
+  color: white;
+  font-weight: 700;
+}
+
+.source-main {
+  min-width: 0;
+}
+
+.source-main strong,
+.source-main small {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.source-main small {
+  color: var(--muted);
+}
+
+.source-empty {
+  padding: 12px;
+  color: var(--muted);
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+  background: var(--panel-soft);
 }
 
 .main-grid {
@@ -1123,6 +1215,15 @@ select:focus {
   .mode-picker,
   .mode-options {
     grid-template-columns: 1fr;
+  }
+
+  .source-basket-item {
+    grid-template-columns: 32px minmax(0, 1fr);
+  }
+
+  .source-basket-item .mini-button {
+    grid-column: 2;
+    justify-self: start;
   }
 
   #rerunStep {

@@ -20,6 +20,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from newsclip_agent.config import load_config
+from newsclip_agent.multisource import MultiSourceItem, build_multi_source_video
 from newsclip_agent.remote_ucms import (
     count_ucms_videos,
     download_ucms_video,
@@ -63,9 +64,12 @@ def preload_remote_station_counts() -> None:
 
 class RunRequest(BaseModel):
     input_video: str | None = None
+    input_videos: list[str] = Field(default_factory=list)
     remote_video: dict[str, Any] | None = None
+    remote_videos: list[dict[str, Any]] = Field(default_factory=list)
     remote_video_id: str | None = None
     remote_record_station: str | None = None
+    source_items: list[dict[str, Any]] = Field(default_factory=list)
     force_remote_download: bool = False
     task_id: str | None = None
     rerun: str | None = None
@@ -361,6 +365,33 @@ async def upload_video(file: UploadFile = File(...)) -> dict[str, Any]:
     }
 
 
+@app.post("/api/videos/upload-multiple")
+async def upload_multiple_videos(files: list[UploadFile] = File(...)) -> list[dict[str, Any]]:
+    results = []
+    for file in files:
+        suffix = Path(file.filename or "").suffix.lower()
+        if suffix not in {".mp4", ".mov", ".mkv", ".m4v", ".avi"}:
+            await file.close()
+            raise HTTPException(400, f"unsupported video type: {file.filename}")
+        ensure_dir(VIDEOS_DIR)
+        target = _unique_video_path(_safe_filename(file.filename or f"video{suffix}"))
+        try:
+            with target.open("wb") as out:
+                while chunk := await file.read(1024 * 1024):
+                    out.write(chunk)
+        finally:
+            await file.close()
+        results.append(
+            {
+                "name": target.name,
+                "path": relpath(target, ROOT),
+                "size_mb": round(target.stat().st_size / 1024 / 1024, 2),
+                "updated_at": datetime.fromtimestamp(target.stat().st_mtime).isoformat(timespec="seconds"),
+            }
+        )
+    return results
+
+
 @app.delete("/api/videos")
 def delete_video(path: str) -> dict[str, Any]:
     file_path = _resolve_input_video(path)
@@ -525,14 +556,46 @@ def run_pipeline(req: RunRequest) -> dict[str, Any]:
         req.audio_policy = "ai_voiceover"
         req.allow_original_audio_evidence = False
     _prepare_mode_switched_run(req)
-    input_path = _prepare_run_input_video(req)
-    fingerprint = _run_fingerprint(req, input_path) if input_path else ""
-    input_name_for_task = _display_input_name(req)
-    if input_name_for_task and not req.task_id:
-        task_id = _make_task_id_from_fingerprint(input_name_for_task, req.production_mode, fingerprint)
+    source_items = _resolve_run_sources(req)
+    source_manifest_path: Path | None = None
+    if len(source_items) > 1:
+        fingerprint = _multi_source_fingerprint(req, source_items)
+        input_name_for_task = _display_multi_source_name(source_items)
+        task_id = req.task_id.strip() if req.task_id else _make_task_id_from_fingerprint(input_name_for_task, req.production_mode, fingerprint)
+        task_dir = ensure_dir(OUTPUTS_DIR / task_id)
+        multi_source_config = PROJECT_CONFIG.raw.get("multi_source", {})
+        built = build_multi_source_video(
+            sources=source_items,
+            task_dir=task_dir,
+            root_dir=ROOT,
+            aspect_ratio=req.aspect_ratio,
+            fps=int(multi_source_config.get("fps", 25)),
+            sample_rate=int(multi_source_config.get("sample_rate", 48000)),
+        )
+        input_path = Path(built["input_video"])
+        source_manifest_path = Path(built["source_manifest"])
+        req.input_video = str(input_path)
+    elif source_items:
+        input_path = source_items[0].path
+        req.input_video = str(input_path)
+        if source_items[0].source_type == "remote_ucms":
+            req.remote_video = source_items[0].remote
+        fingerprint = _run_fingerprint(req, input_path)
+        input_name_for_task = _display_input_name(req)
+        if input_name_for_task and not req.task_id:
+            task_id = _make_task_id_from_fingerprint(input_name_for_task, req.production_mode, fingerprint)
+        else:
+            task_id = _resolve_run_task_id(req)
+        task_dir = ensure_dir(OUTPUTS_DIR / task_id)
     else:
-        task_id = _resolve_run_task_id(req)
-    task_dir = ensure_dir(OUTPUTS_DIR / task_id)
+        input_path = _prepare_run_input_video(req)
+        fingerprint = _run_fingerprint(req, input_path) if input_path else ""
+        input_name_for_task = _display_input_name(req)
+        if input_name_for_task and not req.task_id:
+            task_id = _make_task_id_from_fingerprint(input_name_for_task, req.production_mode, fingerprint)
+        else:
+            task_id = _resolve_run_task_id(req)
+        task_dir = ensure_dir(OUTPUTS_DIR / task_id)
     if req.remote_video:
         write_json(
             task_dir / "remote_source.json",
@@ -570,7 +633,7 @@ def run_pipeline(req: RunRequest) -> dict[str, Any]:
     log_dir = ensure_dir(task_dir / "web_jobs")
     log_path = log_dir / f"{job_id}.log"
 
-    cmd = _build_run_command(req, task_id, input_path)
+    cmd = _build_run_command(req, task_id, input_path, source_manifest_path)
     _save_web_run_options(task_dir, req)
 
     with JOB_LOCK:
@@ -603,7 +666,12 @@ def run_pipeline(req: RunRequest) -> dict[str, Any]:
     return _public_job(JOBS[job_id])
 
 
-def _build_run_command(req: RunRequest, task_id: str, input_path: Path | None = None) -> list[str]:
+def _build_run_command(
+    req: RunRequest,
+    task_id: str,
+    input_path: Path | None = None,
+    source_manifest_path: Path | None = None,
+) -> list[str]:
     cmd = [
         sys.executable,
         "-u",
@@ -635,6 +703,8 @@ def _build_run_command(req: RunRequest, task_id: str, input_path: Path | None = 
             cmd.append("--reassembly-export-individual-clips")
     if input_path:
         cmd.extend(["--input", str(input_path)])
+    if source_manifest_path:
+        cmd.extend(["--source-manifest", str(source_manifest_path)])
     if req.rerun:
         cmd.extend(["--rerun", req.rerun])
     if req.rerun_from:
@@ -1023,6 +1093,74 @@ def _prepare_run_input_video(req: RunRequest) -> Path | None:
     return _resolve_input_video(req.input_video) if req.input_video else None
 
 
+def _collect_source_items(req: RunRequest) -> list[dict[str, Any]]:
+    if req.source_items:
+        return req.source_items
+    items: list[dict[str, Any]] = []
+    if req.input_video:
+        items.append({"source_type": "local", "path": req.input_video})
+    for path in req.input_videos or []:
+        items.append({"source_type": "local", "path": path})
+    if req.remote_video:
+        items.append({"source_type": "remote_ucms", "remote_video": req.remote_video})
+    for remote in req.remote_videos or []:
+        items.append({"source_type": "remote_ucms", "remote_video": remote})
+    return items
+
+
+def _resolve_run_sources(req: RunRequest) -> list[MultiSourceItem]:
+    raw_items = _collect_source_items(req)
+    if not raw_items:
+        return []
+
+    resolved: list[MultiSourceItem] = []
+    for index, item in enumerate(raw_items, start=1):
+        source_type = str(item.get("source_type") or item.get("type") or "local")
+        if source_type in {"local", "video"}:
+            path_value = item.get("path") or item.get("input_video")
+            if not path_value:
+                raise HTTPException(400, f"source_items[{index}].path is required")
+            path = _resolve_input_video(str(path_value))
+            resolved.append(
+                MultiSourceItem(
+                    source_id=str(item.get("source_id") or f"src_{index:03d}"),
+                    source_type="local",
+                    path=path,
+                    display_name=str(item.get("display_name") or path.name),
+                )
+            )
+            continue
+
+        if source_type in {"remote", "remote_ucms"}:
+            remote_video = item.get("remote_video") or item
+            if not isinstance(remote_video, dict):
+                raise HTTPException(400, f"source_items[{index}].remote_video is required")
+            try:
+                cached = download_ucms_video(
+                    REMOTE_UCMS_CONFIG,
+                    remote_video,
+                    root_dir=ROOT,
+                    force=req.force_remote_download,
+                )
+            except Exception as exc:
+                raise HTTPException(502, f"remote video download failed: {exc}") from exc
+            path = _resolve_input_video(str(cached["path"]))
+            resolved.append(
+                MultiSourceItem(
+                    source_id=str(item.get("source_id") or remote_video.get("remote_id") or remote_video.get("id") or f"src_{index:03d}"),
+                    source_type="remote_ucms",
+                    path=path,
+                    display_name=str(remote_video.get("display_name") or remote_video.get("name") or path.name),
+                    remote=remote_video,
+                )
+            )
+            continue
+
+        raise HTTPException(400, f"unsupported source_type: {source_type}")
+
+    return resolved
+
+
 def _display_input_name(req: RunRequest) -> str | None:
     if req.remote_video:
         return str(
@@ -1150,6 +1288,31 @@ def _run_fingerprint(req: RunRequest, input_path: Path | None) -> str:
     }
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _multi_source_fingerprint(req: RunRequest, sources: list[MultiSourceItem]) -> str:
+    payload = {
+        "sources": [
+            {
+                "source_id": item.source_id,
+                "source_type": item.source_type,
+                "path": str(item.path.resolve()),
+                "size": item.path.stat().st_size,
+                "mtime": round(item.path.stat().st_mtime, 3),
+                "remote": _remote_video_fingerprint(item.remote),
+            }
+            for item in sources
+        ],
+        "production_mode": req.production_mode,
+        "aspect_ratio": req.aspect_ratio,
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _display_multi_source_name(sources: list[MultiSourceItem]) -> str:
+    first = sources[0].display_name or sources[0].path.stem
+    return f"multi_{len(sources)}_{first}"
 
 
 def _remote_video_fingerprint(remote_video: dict[str, Any] | None) -> dict[str, Any] | None:
