@@ -119,6 +119,48 @@ button {
   gap: 6px;
 }
 
+.remote-filter {
+  display: grid;
+  gap: 6px;
+  margin: 2px 0 0;
+}
+
+.remote-filter span {
+  color: var(--sidebar-muted);
+  font-size: 12px;
+}
+
+.remote-filter select {
+  width: 100%;
+  min-height: 38px;
+  border-color: rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--sidebar-text);
+}
+
+.remote-pager {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--sidebar-muted);
+  font-size: 12px;
+}
+
+.mini-button {
+  min-height: 30px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--sidebar-text);
+  padding: 0 9px;
+  cursor: pointer;
+}
+
+.mini-button:hover {
+  background: rgba(255, 255, 255, 0.075);
+}
+
 .list {
   display: grid;
   gap: 10px;

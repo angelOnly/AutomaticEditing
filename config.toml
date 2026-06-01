@@ -136,9 +136,32 @@ blur = 0
 box_padding_chars = 1
 
 [web_concurrency]
-max_running_jobs = 2
+max_running_jobs = 3
 max_pending_jobs = 20
 same_task_policy = "reject"
+
+[remote_ucms]
+enabled = true
+api_url = "https://ucms.ifeng.com/api/ve/list"
+default_record_station = "流项目高清卫星-凤凰咨询台"
+default_page_size = 30
+request_timeout_seconds = 20
+connect_timeout_seconds = 5
+cache_dir = "data/remote_videos"
+prefer_quality = "high"
+record_stations = [
+  "流项目专线-凤凰咨询台",
+  "流项目高清卫星-凤凰咨询台",
+  "资讯台高清卫星",
+  "资讯台高清",
+  "bak资讯台高清卫星",
+  "bak资讯台高清",
+  "流项目高清卫星-凤凰资讯台Backup",
+]
+
+[remote_ucms.headers]
+# Authorization = "Bearer xxx"
+# Cookie = "xxx"
 
 [gpu_limits]
 asr_slots = 1

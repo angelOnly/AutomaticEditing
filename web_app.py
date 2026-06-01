@@ -19,6 +19,12 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from newsclip_agent.config import load_config
+from newsclip_agent.remote_ucms import (
+    download_ucms_video,
+    list_ucms_videos,
+    load_remote_ucms_config,
+    public_config as remote_ucms_public_config,
+)
 from newsclip_agent.utils import ensure_dir, read_json, relpath, write_json
 
 
@@ -38,6 +44,7 @@ PROJECT_CONFIG = load_config(ROOT / "config.toml")
 WORKFLOW_DEFAULTS = PROJECT_CONFIG.workflow
 SHORT_VIDEO_DEFAULTS = PROJECT_CONFIG.short_video
 VOICEOVER_DEFAULTS = PROJECT_CONFIG.voiceover
+REMOTE_UCMS_CONFIG = load_remote_ucms_config(PROJECT_CONFIG)
 WEB_CONCURRENCY = PROJECT_CONFIG.raw.get("web_concurrency", {})
 MAX_RUNNING_JOBS = int(WEB_CONCURRENCY.get("max_running_jobs", 2))
 MAX_PENDING_JOBS = int(WEB_CONCURRENCY.get("max_pending_jobs", 20))
@@ -46,6 +53,10 @@ SAME_TASK_POLICY = str(WEB_CONCURRENCY.get("same_task_policy", "reject"))
 
 class RunRequest(BaseModel):
     input_video: str | None = None
+    remote_video: dict[str, Any] | None = None
+    remote_video_id: str | None = None
+    remote_record_station: str | None = None
+    force_remote_download: bool = False
     task_id: str | None = None
     rerun: str | None = None
     rerun_from: str | None = None
@@ -106,7 +117,41 @@ def get_config() -> dict[str, Any]:
             "tts_required_by_default": bool(VOICEOVER_DEFAULTS.get("tts_required_by_default", True)),
             "allow_original_audio_evidence": bool(VOICEOVER_DEFAULTS.get("allow_original_audio_evidence", False)),
         },
+        "remote_ucms": remote_ucms_public_config(REMOTE_UCMS_CONFIG),
     }
+
+
+@app.get("/api/remote-videos")
+def list_remote_videos(
+    record_station: str | None = None,
+    current: int = 1,
+    page_size: int | None = None,
+) -> dict[str, Any]:
+    try:
+        return list_ucms_videos(
+            REMOTE_UCMS_CONFIG,
+            record_station=record_station,
+            current=current,
+            page_size=page_size,
+        )
+    except Exception as exc:
+        raise HTTPException(502, f"remote video list failed: {exc}") from exc
+
+
+@app.post("/api/remote-videos/download")
+def download_remote_video(payload: dict[str, Any]) -> dict[str, Any]:
+    remote_video = payload.get("remote_video") or payload
+    if not isinstance(remote_video, dict):
+        raise HTTPException(400, "remote_video is required")
+    try:
+        return download_ucms_video(
+            REMOTE_UCMS_CONFIG,
+            remote_video,
+            root_dir=ROOT,
+            force=bool(payload.get("force_remote_download", False)),
+        )
+    except Exception as exc:
+        raise HTTPException(502, f"remote video download failed: {exc}") from exc
 
 
 @app.get("/api/videos")
@@ -319,13 +364,24 @@ def run_pipeline(req: RunRequest) -> dict[str, Any]:
         req.audio_policy = "ai_voiceover"
         req.allow_original_audio_evidence = False
     _prepare_mode_switched_run(req)
-    input_path = _resolve_input_video(req.input_video) if req.input_video else None
+    input_path = _prepare_run_input_video(req)
     fingerprint = _run_fingerprint(req, input_path) if input_path else ""
-    if req.input_video and not req.task_id:
-        task_id = _make_task_id_from_fingerprint(req.input_video, req.production_mode, fingerprint)
+    input_name_for_task = _display_input_name(req)
+    if input_name_for_task and not req.task_id:
+        task_id = _make_task_id_from_fingerprint(input_name_for_task, req.production_mode, fingerprint)
     else:
         task_id = _resolve_run_task_id(req)
     task_dir = ensure_dir(OUTPUTS_DIR / task_id)
+    if req.remote_video:
+        write_json(
+            task_dir / "remote_source.json",
+            {
+                "source_type": "remote_ucms",
+                "remote_video": req.remote_video,
+                "local_input_video": relpath(input_path, ROOT) if input_path else "",
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+            },
+        )
 
     existing_job = _find_active_job_by_task_id(task_id)
     if existing_job and not (req.rerun or req.rerun_from):
@@ -789,6 +845,32 @@ def _resolve_input_video(input_video: str) -> Path:
     return path
 
 
+def _prepare_run_input_video(req: RunRequest) -> Path | None:
+    if req.remote_video:
+        try:
+            cached = download_ucms_video(
+                REMOTE_UCMS_CONFIG,
+                req.remote_video,
+                root_dir=ROOT,
+                force=req.force_remote_download,
+            )
+        except Exception as exc:
+            raise HTTPException(502, f"remote video download failed: {exc}") from exc
+        req.input_video = str(cached["path"])
+    return _resolve_input_video(req.input_video) if req.input_video else None
+
+
+def _display_input_name(req: RunRequest) -> str | None:
+    if req.remote_video:
+        return str(
+            req.remote_video.get("name")
+            or req.remote_video.get("remote_id")
+            or req.remote_video.get("id")
+            or "remote_video"
+        )
+    return req.input_video
+
+
 def _safe_filename(name: str) -> str:
     filename = Path(name).name.strip()
     if not filename:
@@ -900,10 +982,26 @@ def _video_fingerprint(path: Path) -> dict[str, Any]:
 def _run_fingerprint(req: RunRequest, input_path: Path | None) -> str:
     payload = {
         "video": _video_fingerprint(input_path) if input_path else None,
+        "remote": _remote_video_fingerprint(req.remote_video),
         "production_mode": req.production_mode,
     }
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _remote_video_fingerprint(remote_video: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not remote_video:
+        return None
+    return {
+        "source_type": remote_video.get("source_type") or "remote_ucms",
+        "id": remote_video.get("id") or remote_video.get("remote_id"),
+        "guid": remote_video.get("guid", ""),
+        "name": remote_video.get("name", ""),
+        "record_station": remote_video.get("record_station") or remote_video.get("recordStation", ""),
+        "download_url": remote_video.get("download_url")
+        or remote_video.get("media_high_url")
+        or remote_video.get("mediaHigh", ""),
+    }
 
 
 def _make_task_id_from_fingerprint(input_video: str | None, production_mode: str, fingerprint: str) -> str:

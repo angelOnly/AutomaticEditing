@@ -32,6 +32,25 @@
 
         <section class="side-section">
           <div class="section-title">
+            <span>远程素材</span>
+            <div class="section-actions">
+              <button class="icon-button" id="refreshRemoteVideos" title="刷新远程素材"><i data-lucide="refresh-cw"></i></button>
+            </div>
+          </div>
+          <label class="remote-filter">
+            <span>信号源</span>
+            <select id="remoteRecordStation"></select>
+          </label>
+          <div class="remote-pager">
+            <button class="mini-button" id="remotePrev" type="button">上一页</button>
+            <span id="remotePageInfo">1 / -</span>
+            <button class="mini-button" id="remoteNext" type="button">下一页</button>
+          </div>
+          <div id="remoteVideoList" class="list"></div>
+        </section>
+
+        <section class="side-section">
+          <div class="section-title">
             <span>任务队列</span>
             <button class="icon-button" id="refreshTasks" title="刷新任务"><i data-lucide="refresh-cw"></i></button>
           </div>

@@ -76,6 +76,7 @@ const AUTO_REFRESH_MS = 10 * 1000;
 
 const state = {
   selectedVideo: null,
+  selectedRemoteVideo: null,
   selectedTask: null,
   manifest: null,
   activeJob: null,
@@ -85,6 +86,10 @@ const state = {
   contextMenu: null,
   latestDraft: null,
   drafts: [],
+  remoteVideos: [],
+  remotePagination: { current: 1, pageSize: 30, total: 0 },
+  remoteRecordStations: [],
+  remoteEnabled: false,
   defaults: {
     default_aspect_ratio: "16:9",
     default_chunk_seconds: 60,
@@ -130,11 +135,24 @@ async function loadConfig() {
     state.defaults.allow_long_video_default = config.short_video?.allow_long_video_default ?? state.defaults.allow_long_video_default;
     state.defaults.tts_required_by_default = config.voiceover?.tts_required_by_default ?? state.defaults.tts_required_by_default;
     state.defaults.allow_original_audio_evidence = config.voiceover?.allow_original_audio_evidence ?? state.defaults.allow_original_audio_evidence;
+    const remote = config.remote_ucms || {};
+    state.remoteEnabled = Boolean(remote.enabled);
+    state.remoteRecordStations = remote.record_stations || [];
+    state.remotePagination.pageSize = remote.default_page_size || 30;
+    fillRemoteStationSelect(remote.default_record_station || "");
     applyDefaultControls();
   } catch (error) {
     console.warn("配置加载失败，使用页面默认值", error);
     applyDefaultControls();
   }
+}
+
+function fillRemoteStationSelect(defaultStation) {
+  const select = $("remoteRecordStation");
+  if (!select) return;
+  const stations = state.remoteRecordStations.length ? state.remoteRecordStations : [defaultStation].filter(Boolean);
+  select.innerHTML = stations.map((station) => `<option value="${escapeAttr(station)}">${escapeHtml(station)}</option>`).join("");
+  if (defaultStation) select.value = defaultStation;
 }
 
 function applyDefaultControls() {
@@ -166,6 +184,17 @@ function bindEvents() {
     if (event.key === "Escape") hideContextMenu();
   });
   $("refreshVideos").addEventListener("click", loadVideos);
+  $("refreshRemoteVideos")?.addEventListener("click", () => loadRemoteVideos(1));
+  $("remoteRecordStation")?.addEventListener("change", () => loadRemoteVideos(1));
+  $("remotePrev")?.addEventListener("click", () => {
+    const current = Number(state.remotePagination.current || 1);
+    if (current > 1) loadRemoteVideos(current - 1);
+  });
+  $("remoteNext")?.addEventListener("click", () => {
+    const p = state.remotePagination || {};
+    const maxPage = Math.ceil((p.total || 0) / (p.pageSize || 30));
+    if (!maxPage || Number(p.current || 1) < maxPage) loadRemoteVideos(Number(p.current || 1) + 1);
+  });
   $("refreshTasks").addEventListener("click", loadTasks);
   $("refreshAll").addEventListener("click", refreshAll);
   $("runSelected").addEventListener("click", runSelected);
@@ -277,8 +306,13 @@ async function refreshWorkspace(options = {}) {
     restoreControls = true,
     updatePreview = true,
     refreshFiles = false,
+    refreshRemote = true,
   } = options;
-  await Promise.all([loadVideos(), loadTasks()]);
+  await Promise.all([
+    loadVideos().catch((error) => console.warn("本地视频加载失败", error)),
+    loadTasks().catch((error) => console.warn("任务加载失败", error)),
+    state.remoteEnabled && refreshRemote ? loadRemoteVideos(state.remotePagination.current || 1).catch(renderRemoteError) : Promise.resolve(),
+  ]);
   if (state.selectedTask) {
     await loadManifest(state.selectedTask, { refreshDrafts, restoreControls, updatePreview });
     if (refreshFiles) await loadTree().catch(() => {});
@@ -303,6 +337,7 @@ async function autoRefreshWorkspace() {
       restoreControls: false,
       updatePreview: false,
       refreshFiles: true,
+      refreshRemote: false,
     });
   } catch (error) {
     console.warn("Auto refresh failed", error);
@@ -322,6 +357,7 @@ async function loadVideos() {
     item.innerHTML = `<strong>${escapeHtml(video.name)}</strong><span>${video.size_mb} MB · ${video.updated_at}</span>`;
     item.addEventListener("click", () => {
       state.selectedVideo = video;
+      state.selectedRemoteVideo = null;
       state.selectedTask = null;
       state.manifest = null;
       applyDefaultControls();
@@ -332,12 +368,84 @@ async function loadVideos() {
       $("videoPreview").src = `/api/videos/preview?path=${encodeURIComponent(video.path)}`;
       $("videoPreview").load();
       loadVideos();
+      renderRemoteVideos();
       loadTasks();
     });
     attachContextDelete(item, () => deleteVideo(video));
     box.appendChild(item);
   });
   lucide.createIcons();
+}
+
+async function loadRemoteVideos(page = 1) {
+  const box = $("remoteVideoList");
+  if (!box) return;
+  if (!state.remoteEnabled) {
+    box.innerHTML = `<div class="list-item"><strong>远程素材未启用</strong><span>请检查 config.toml 的 remote_ucms 配置</span></div>`;
+    updateRemotePager();
+    return;
+  }
+  const station = $("remoteRecordStation")?.value || "";
+  box.innerHTML = `<div class="list-item"><strong>正在加载远程素材...</strong><span>${escapeHtml(station || "-")}</span></div>`;
+  const url = `/api/remote-videos?record_station=${encodeURIComponent(station)}&current=${page}&page_size=${state.remotePagination.pageSize || 30}`;
+  const data = await api(url);
+  state.remoteVideos = data.items || [];
+  state.remotePagination = data.pagination || { current: page, pageSize: 30, total: state.remoteVideos.length };
+  renderRemoteVideos();
+}
+
+function renderRemoteVideos() {
+  const box = $("remoteVideoList");
+  if (!box) return;
+  updateRemotePager();
+  box.innerHTML = state.remoteVideos.length
+    ? ""
+    : `<div class="list-item"><strong>没有远程素材</strong><span>请更换信号源或稍后刷新</span></div>`;
+  state.remoteVideos.forEach((video) => {
+    const item = document.createElement("button");
+    item.className = `list-item ${state.selectedRemoteVideo?.remote_id === video.remote_id ? "active" : ""}`;
+    item.type = "button";
+    const title = video.display_name || video.name || "远程素材";
+    item.innerHTML = `<strong>${escapeHtml(title)}</strong><span>${escapeHtml(video.record_station || "-")} · ${escapeHtml(video.duration_text || "-")} · ${escapeHtml(video.create_time || "-")}</span>`;
+    item.addEventListener("click", () => selectRemoteVideo(video));
+    box.appendChild(item);
+  });
+  lucide.createIcons();
+}
+
+function updateRemotePager() {
+  const p = state.remotePagination || {};
+  const maxPage = Math.max(1, Math.ceil((p.total || 0) / (p.pageSize || 30)));
+  if ($("remotePageInfo")) $("remotePageInfo").textContent = `${p.current || 1} / ${maxPage} · 共 ${p.total || 0}`;
+}
+
+function renderRemoteError(error) {
+  const box = $("remoteVideoList");
+  if (!box) return;
+  updateRemotePager();
+  box.innerHTML = `<div class="list-item"><strong>远程素材加载失败</strong><span>${escapeHtml(cleanError(error))}</span></div>`;
+}
+
+function selectRemoteVideo(video) {
+  state.selectedRemoteVideo = video;
+  state.selectedVideo = null;
+  state.selectedTask = null;
+  state.manifest = null;
+  applyDefaultControls();
+  $("taskIdInput").value = suggestedTaskId(video.name || "remote_video", $("productionMode").value);
+  $("activeTitle").textContent = video.display_name || video.name || "远程素材";
+  updateTaskSubtitle();
+  clearTaskPanels();
+  if (video.preview_url) {
+    $("videoPreview").src = video.preview_url;
+    $("videoPreview").load();
+    $("fileViewer").textContent = "正在预览远程原片。";
+  } else {
+    $("fileViewer").textContent = "该远程素材没有可预览地址。";
+  }
+  loadVideos();
+  loadTasks();
+  renderRemoteVideos();
 }
 
 async function loadTasks() {
@@ -354,12 +462,14 @@ async function loadTasks() {
     item.addEventListener("click", async () => {
       state.selectedTask = task.task_id;
       state.selectedVideo = null;
+      state.selectedRemoteVideo = null;
       $("taskIdInput").value = task.task_id;
       $("activeTitle").textContent = displayTaskId(task.task_id);
       updateTaskSubtitle(task.task_id);
       await loadManifest(task.task_id);
       await loadTree();
       loadVideos();
+      renderRemoteVideos();
       loadTasks();
     });
     attachContextDelete(item, () => deleteTask(task));
@@ -381,6 +491,7 @@ async function uploadSelectedVideo(event) {
     if (!res.ok) throw new Error(await res.text() || res.statusText);
     const video = await res.json();
     state.selectedVideo = video;
+    state.selectedRemoteVideo = null;
     state.selectedTask = null;
     state.manifest = null;
     applyDefaultControls();
@@ -496,6 +607,13 @@ function playSourceVideo() {
     $("videoPreview").src = `/api/tasks/${state.selectedTask}/preview`;
     $("videoPreview").load();
     $("fileViewer").textContent = "正在预览原片。";
+  } else if (state.selectedRemoteVideo) {
+    const url = state.selectedRemoteVideo.preview_url || state.selectedRemoteVideo.media_low_url || state.selectedRemoteVideo.media_high_url;
+    if (url) {
+      $("videoPreview").src = url;
+      $("videoPreview").load();
+      $("fileViewer").textContent = "正在预览远程原片。";
+    }
   } else if (state.selectedVideo) {
     $("videoPreview").src = `/api/videos/preview?path=${encodeURIComponent(state.selectedVideo.path)}`;
     $("videoPreview").load();
@@ -840,13 +958,21 @@ async function runSelected() {
     req.rerun_from = cutStepName;
     state.selectedTask = existingTaskId;
     state.selectedVideo = null;
+    state.selectedRemoteVideo = null;
   } else if (state.selectedVideo) {
     req.input_video = state.selectedVideo.path;
+    req.remote_video = null;
+    req.task_id = null;
+  } else if (state.selectedRemoteVideo) {
+    req.input_video = null;
+    req.remote_video = state.selectedRemoteVideo;
+    req.remote_video_id = state.selectedRemoteVideo.remote_id || String(state.selectedRemoteVideo.id || "");
+    req.remote_record_station = state.selectedRemoteVideo.record_station || $("remoteRecordStation")?.value || "";
     req.task_id = null;
   } else if (state.selectedTask) {
     req.task_id = state.selectedTask;
   } else {
-    alert("请选择一个视频素材或已有任务。");
+    alert("请选择一个本地视频、远程素材或已有任务。");
     return;
   }
   const job = await api("/api/run", { method: "POST", body: JSON.stringify(req) });
@@ -1041,11 +1167,12 @@ function clearTaskPanels() {
 }
 
 function syncSuggestedTaskIdForMode() {
-  if (!state.selectedVideo || state.selectedTask) return;
+  const selectedName = state.selectedVideo?.name || state.selectedRemoteVideo?.name;
+  if (!selectedName || state.selectedTask) return;
   const input = $("taskIdInput");
   const value = input.value.trim();
-  if (!value || isAutoTaskIdForVideo(value, state.selectedVideo.name)) {
-    input.value = suggestedTaskId(state.selectedVideo.name, $("productionMode").value);
+  if (!value || isAutoTaskIdForVideo(value, selectedName)) {
+    input.value = suggestedTaskId(selectedName, $("productionMode").value);
     updateTaskSubtitle();
   }
 }
