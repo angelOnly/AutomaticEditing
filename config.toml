@@ -173,6 +173,11 @@ record_stations = [
   "bak资讯台高清卫星",
   "bak资讯台高清",
   "浦项高清卫星-凤凰资讯台-Backup",
+  "浦项专线-凤凰中文台",
+  "浦项高清卫星-凤凰中文台",
+  "bak中文台高清卫星",
+  "bak中文台高清",
+  "浦项高清卫星-凤凰中文台-Backup"
 ]
 
 [remote_ucms.headers]

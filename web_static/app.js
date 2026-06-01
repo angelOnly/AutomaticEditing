@@ -497,10 +497,10 @@ function renderRemoteVideos() {
     : `<div class="list-item"><strong>没有远程素材</strong><span>请更换信号源、搜索词或稍后刷新</span></div>`;
   state.remoteVideos.forEach((video) => {
     const item = document.createElement("button");
-    item.className = `list-item ${state.selectedRemoteVideo?.remote_id === video.remote_id ? "active" : ""}`;
+    item.className = `list-item remote-item ${state.selectedRemoteVideo?.remote_id === video.remote_id ? "active" : ""}`;
     item.type = "button";
-    const title = video.display_name || video.name || "远程素材";
-    item.innerHTML = `<strong>${escapeHtml(title)}</strong><span>${escapeHtml(video.record_station || "-")} · ${escapeHtml(video.duration_text || "-")} · ${escapeHtml(video.create_time || "-")}</span>`;
+    const title = video.name || video.display_name || "远程素材";
+    item.innerHTML = `<strong>${escapeHtml(title)}</strong><span>${escapeHtml(video.duration_text || "-")} · ${escapeHtml(video.create_time || "-")}</span>`;
     item.addEventListener("click", () => selectRemoteVideo(video));
     box.appendChild(item);
   });
