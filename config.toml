@@ -114,20 +114,36 @@ long_source_min_video_count = 2
 
 [subtitle]
 mode = "sentence"
-max_chars_per_line_16_9 = 22
-max_chars_per_line_9_16 = 14
+max_chars_per_line_16_9 = 24
+max_chars_per_line_9_16 = 16
 max_lines = 1
 min_cue_seconds = 1.0
 max_cue_seconds = 4.0
 prefer_clause_split = true
-font_size_16_9 = 24
-font_size_9_16 = 20
-margin_v_16_9 = 25
-margin_v_9_16 = 120
-outline = 3
+font_name = "Microsoft YaHei"
+font_size_16_9 = 30
+font_size_9_16 = 28
+bold = 1
+margin_v_16_9 = 52
+margin_v_9_16 = 150
+primary_colour = "&H00FFFFFF"
+outline_colour = "&H00000000"
+back_colour = "&H80000000"
+border_style = 3
+outline = 1
 shadow = 0
-primary_colour = "&H00000000"
-outline_colour = "&H00FFFFFF"
+blur = 0
+box_padding_chars = 1
+
+[web_concurrency]
+max_running_jobs = 2
+max_pending_jobs = 20
+same_task_policy = "reject"
+
+[gpu_limits]
+asr_slots = 1
+tts_slots = 1
+render_slots = 1
 
 # python环境
 [reassembly]

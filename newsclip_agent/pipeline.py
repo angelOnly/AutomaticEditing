@@ -45,6 +45,7 @@ from .llm_digest import (
 )
 from .text_policy import sanitize_reporter_bylines
 from .tts_omnivoice import audio_metadata, generate_omnivoice_audio, release_omnivoice_models
+from .resource_locks import file_slot_lock
 from .utils import (
     copy_or_link,
     ensure_dir,
@@ -556,8 +557,10 @@ class PipelineRunner:
         ensure_dir(vdir)
         write_json(vdir / "input.json", {"audio": relpath(audio, self.task_dir), "config": self.config.funasr})
         try:
-            engine = self._get_asr_engine()
-            result = engine.transcribe(str(audio))
+            asr_slots = int(self.config.raw.get("gpu_limits", {}).get("asr_slots", 1))
+            with file_slot_lock("asr", slots=asr_slots):
+                engine = self._get_asr_engine()
+                result = engine.transcribe(str(audio))
             if not result.get("success"):
                 raise RuntimeError(result.get("error") or "FunASR failed")
             segments = self._normalize_asr_segments(result.get("segments", []), result.get("text", ""))
@@ -1459,6 +1462,11 @@ class PipelineRunner:
         return None, None
 
     def step_tts(self) -> None:
+        tts_slots = int(self.config.raw.get("gpu_limits", {}).get("tts_slots", 1))
+        with file_slot_lock("tts", slots=tts_slots):
+            self._step_tts_impl()
+
+    def _step_tts_impl(self) -> None:
         voiceover = self._load_step_json("voiceover_script")
         editing = self._load_optional_step_json("editing_script", {"scripts": []})
         scripts = voiceover.get("scripts", []) if isinstance(voiceover, dict) else []
@@ -2231,6 +2239,11 @@ class PipelineRunner:
             raise RuntimeError("reassembly_cut_plan has no available clips")
 
     def step_reassembly_render(self) -> None:
+        render_slots = int(self.config.raw.get("gpu_limits", {}).get("render_slots", 1))
+        with file_slot_lock("render", slots=render_slots):
+            self._step_reassembly_render_impl()
+
+    def _step_reassembly_render_impl(self) -> None:
         plan = self._load_step_json("reassembly_cut_plan")
         input_hash = stable_hash({"reassembly_cut_plan": self._step_version("reassembly_cut_plan")})
         if self._can_reuse("reassembly_render", input_hash):
@@ -2349,6 +2362,11 @@ class PipelineRunner:
         return 0.0
 
     def step_render(self) -> None:
+        render_slots = int(self.config.raw.get("gpu_limits", {}).get("render_slots", 1))
+        with file_slot_lock("render", slots=render_slots):
+            self._step_render_impl()
+
+    def _step_render_impl(self) -> None:
         plan = self._load_step_json("cut_plan")
         input_hash = stable_hash({"cut_plan": self._step_version("cut_plan")})
         if self._can_reuse("render", input_hash):
@@ -2529,14 +2547,18 @@ class PipelineRunner:
         return "scale=1920:-2"
 
     def _subtitle_config(self) -> dict[str, Any]:
-        return self.config.subtitle or {}
+        config = getattr(self, "config", None)
+        return getattr(config, "subtitle", None) or {}
 
     def _subtitle_mode(self) -> str:
+        if not hasattr(self, "config"):
+            return "segment"
         return str(self._subtitle_config().get("mode", "sentence")).strip().lower()
 
     def _subtitle_max_chars_per_line(self) -> int:
         cfg = self._subtitle_config()
-        if self.options.aspect_ratio == "9:16":
+        aspect_ratio = getattr(getattr(self, "options", None), "aspect_ratio", "16:9")
+        if aspect_ratio == "9:16":
             return int(cfg.get("max_chars_per_line_9_16", 14))
         return int(cfg.get("max_chars_per_line_16_9", 22))
 
@@ -2548,27 +2570,44 @@ class PipelineRunner:
 
     def _subtitle_force_style(self) -> str:
         cfg = self._subtitle_config()
-        if self.options.aspect_ratio == "9:16":
-            font_size = int(cfg.get("font_size_9_16", 20))
-            margin_v = int(cfg.get("margin_v_9_16", 120))
+        aspect_ratio = getattr(getattr(self, "options", None), "aspect_ratio", "16:9")
+        if aspect_ratio == "9:16":
+            font_size = int(cfg.get("font_size_9_16", 28))
+            margin_v = int(cfg.get("margin_v_9_16", 150))
         else:
-            font_size = int(cfg.get("font_size_16_9", 24))
-            margin_v = int(cfg.get("margin_v_16_9", 25))
-        primary = str(cfg.get("primary_colour", "&H00000000"))
-        outline_colour = str(cfg.get("outline_colour", "&H00FFFFFF"))
-        outline = int(cfg.get("outline", 3))
+            font_size = int(cfg.get("font_size_16_9", 30))
+            margin_v = int(cfg.get("margin_v_16_9", 52))
+        font_name = str(cfg.get("font_name", "Microsoft YaHei"))
+        primary = str(cfg.get("primary_colour", "&H00FFFFFF"))
+        outline_colour = str(cfg.get("outline_colour", "&H00000000"))
+        back_colour = str(cfg.get("back_colour", "&H80000000"))
+        border_style = int(cfg.get("border_style", 3))
+        outline = int(cfg.get("outline", 1))
         shadow = int(cfg.get("shadow", 0))
+        blur = int(cfg.get("blur", 0))
+        bold = int(cfg.get("bold", 1))
         return ",".join([
+            f"FontName={font_name}",
             f"Fontsize={font_size}",
+            f"Bold={bold}",
             f"PrimaryColour={primary}",
             f"OutlineColour={outline_colour}",
-            "BorderStyle=1",
+            f"BackColour={back_colour}",
+            f"BorderStyle={border_style}",
             f"Outline={outline}",
             f"Shadow={shadow}",
-            "Blur=1",
+            f"Blur={blur}",
             "Alignment=2",
             f"MarginV={margin_v}",
         ])
+
+    def _pad_subtitle_text(self, text: str) -> str:
+        if self._subtitle_mode() == "segment":
+            return text
+        pad = int(self._subtitle_config().get("box_padding_chars", 0))
+        if pad <= 0:
+            return text
+        return ("　" * pad) + text + ("　" * pad)
 
     def _effective_output_audio_policy(self, tts_success: bool) -> str:
         if self.options.audio_policy == "original":
@@ -2669,7 +2708,7 @@ class PipelineRunner:
             cue_end = min(cue_end, end)
             if cue_end <= cursor:
                 break
-            blocks.append(f"{index}\n{srt_time(cursor)} --> {srt_time(cue_end)}\n{chunk}\n")
+            blocks.append(f"{index}\n{srt_time(cursor)} --> {srt_time(cue_end)}\n{self._pad_subtitle_text(chunk)}\n")
             index += 1
             cursor = cue_end
 
@@ -2703,7 +2742,7 @@ class PipelineRunner:
             if end <= start:
                 continue
             if self._subtitle_mode() == "segment":
-                blocks.append(f"{index}\n{srt_time(start)} --> {srt_time(end)}\n{text}\n")
+                blocks.append(f"{index}\n{srt_time(start)} --> {srt_time(end)}\n{self._pad_subtitle_text(text)}\n")
                 index += 1
                 continue
             chunks = self._split_subtitle_text(text)
@@ -2731,7 +2770,7 @@ class PipelineRunner:
             if end <= start:
                 continue
             if self._subtitle_mode() == "segment":
-                blocks.append(f"{index}\n{srt_time(start)} --> {srt_time(end)}\n{text}\n")
+                blocks.append(f"{index}\n{srt_time(start)} --> {srt_time(end)}\n{self._pad_subtitle_text(text)}\n")
                 index += 1
                 continue
             chunks = self._split_subtitle_text(text)

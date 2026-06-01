@@ -64,6 +64,7 @@ const STATUS_LABELS = {
   stale: "已过期",
   failed: "失败",
   running: "运行中",
+  queued: "排队中",
 };
 
 const PRODUCTION_MODE_NAMES = {
@@ -72,7 +73,6 @@ const PRODUCTION_MODE_NAMES = {
 };
 
 const AUTO_REFRESH_MS = 10 * 1000;
-const LONG_PRESS_DELETE_MS = 800;
 
 const state = {
   selectedVideo: null,
@@ -321,7 +321,6 @@ async function loadVideos() {
     item.type = "button";
     item.innerHTML = `<strong>${escapeHtml(video.name)}</strong><span>${video.size_mb} MB · ${video.updated_at}</span>`;
     item.addEventListener("click", () => {
-      if (consumeLongPress(item)) return;
       state.selectedVideo = video;
       state.selectedTask = null;
       state.manifest = null;
@@ -335,7 +334,6 @@ async function loadVideos() {
       loadVideos();
       loadTasks();
     });
-    attachLongPressDelete(item, () => deleteVideo(video));
     attachContextDelete(item, () => deleteVideo(video));
     box.appendChild(item);
   });
@@ -348,11 +346,12 @@ async function loadTasks() {
   box.innerHTML = tasks.length ? "" : `<div class="list-item"><strong>暂无任务</strong><span>选择素材后开始分析</span></div>`;
   tasks.forEach((task) => {
     const item = document.createElement("button");
-    item.className = `list-item ${state.selectedTask === task.task_id ? "active" : ""}`;
+    const jobClass = task.job_status ? ` job-${task.job_status}` : "";
+    item.className = `list-item${jobClass} ${state.selectedTask === task.task_id ? "active" : ""}`;
     item.type = "button";
-    item.innerHTML = `<strong>${escapeHtml(displayTaskId(task.task_id))}</strong><span>${task.done_steps}/${task.step_count} 完成 · ${task.failed_steps} 失败 · ${task.updated_at || "-"}</span>`;
+    const jobBadge = task.job_status ? `<em class="task-job-badge ${escapeAttr(task.job_status)}">${escapeHtml(jobStatusLabel(task.job_status))}</em>` : "";
+    item.innerHTML = `<strong>${escapeHtml(displayTaskId(task.task_id))}</strong><span>${task.done_steps}/${task.step_count} 完成 · ${task.failed_steps} 失败 · ${task.updated_at || "-"}</span>${jobBadge}`;
     item.addEventListener("click", async () => {
-      if (consumeLongPress(item)) return;
       state.selectedTask = task.task_id;
       state.selectedVideo = null;
       $("taskIdInput").value = task.task_id;
@@ -363,7 +362,6 @@ async function loadTasks() {
       loadVideos();
       loadTasks();
     });
-    attachLongPressDelete(item, () => deleteTask(task));
     attachContextDelete(item, () => deleteTask(task));
     box.appendChild(item);
   });
@@ -437,39 +435,6 @@ async function runListDelete(action) {
   }
 }
 
-function attachLongPressDelete(item, onDelete) {
-  let timer = null;
-  let startX = 0;
-  let startY = 0;
-  const clear = () => {
-    if (timer) clearTimeout(timer);
-    timer = null;
-    item.classList.remove("long-pressing");
-  };
-  item.addEventListener("pointerdown", (event) => {
-    if (event.button !== 0) return;
-    startX = event.clientX;
-    startY = event.clientY;
-    timer = setTimeout(async () => {
-      item.dataset.longPressFired = "true";
-      item.classList.remove("long-pressing");
-      item.classList.add("deleting");
-      try {
-        await onDelete();
-      } finally {
-        item.classList.remove("deleting");
-      }
-    }, LONG_PRESS_DELETE_MS);
-    item.classList.add("long-pressing");
-  });
-  item.addEventListener("pointermove", (event) => {
-    if (Math.abs(event.clientX - startX) > 10 || Math.abs(event.clientY - startY) > 10) clear();
-  });
-  ["pointerup", "pointercancel", "pointerleave", "lostpointercapture"].forEach((type) => {
-    item.addEventListener(type, clear);
-  });
-}
-
 function attachContextDelete(item, onDelete) {
   item.addEventListener("contextmenu", (event) => {
     event.preventDefault();
@@ -499,12 +464,6 @@ function showContextMenu(x, y, onDelete) {
 function hideContextMenu() {
   state.contextMenu?.remove();
   state.contextMenu = null;
-}
-
-function consumeLongPress(item) {
-  if (item.dataset.longPressFired !== "true") return false;
-  delete item.dataset.longPressFired;
-  return true;
 }
 
 async function loadManifest(taskId, options = {}) {
@@ -683,6 +642,11 @@ function statusLabel(status) {
   return STATUS_LABELS[status] || status || "-";
 }
 
+function jobStatusLabel(status) {
+  if (status === "pending" || status === "queued") return "排队中";
+  return statusLabel(status);
+}
+
 function stepNote(step, item = {}) {
   if (!item || item.status === "pending") return "";
   if (item.status === "skipped") return skippedReasonText(item.reason, step);
@@ -774,11 +738,11 @@ function skippedReasonText(reason, step) {
 async function adoptRunningJob(taskId) {
   if (!taskId || state.activeJob) return;
   const jobs = await api("/api/jobs").catch(() => []);
-  const job = jobs.find((item) => item.task_id === taskId && item.status === "running");
+  const job = jobs.find((item) => item.task_id === taskId && ["pending", "running"].includes(item.status));
   if (!job) return;
   state.activeJob = job.job_id;
-  setRunControlsBusy(true);
-  $("metricJob").textContent = job.status;
+  setRunControlsBusy(false);
+  $("metricJob").textContent = jobStatusLabel(job.status);
   startJobPolling();
   await refreshLog().catch(() => {});
 }
@@ -854,10 +818,6 @@ async function openTaskFile(path) {
 }
 
 async function runSelected() {
-  if (state.activeJob) {
-    alert("当前已有任务在运行，请等待完成后再启动新的运行。");
-    return;
-  }
   const taskId = $("taskIdInput").value.trim();
   const req = baseRunRequest();
   const mode = $("runMode").value;
@@ -882,6 +842,7 @@ async function runSelected() {
     state.selectedVideo = null;
   } else if (state.selectedVideo) {
     req.input_video = state.selectedVideo.path;
+    req.task_id = null;
   } else if (state.selectedTask) {
     req.task_id = state.selectedTask;
   } else {
@@ -892,10 +853,6 @@ async function runSelected() {
   afterJobStarted(job);
 }
 async function rerun(fromStep) {
-  if (state.activeJob) {
-    alert("当前已有任务在运行，请等待完成后再重跑。");
-    return;
-  }
   if (!state.selectedTask) {
     alert("请先选择一个已有任务。");
     return;
@@ -903,6 +860,10 @@ async function rerun(fromStep) {
   const step = $("rerunStep").value;
   const req = baseRunRequest();
   req.task_id = state.selectedTask;
+  if (await selectedTaskHasActiveJob(state.selectedTask)) {
+    alert("当前任务已有运行中或排队中的 job，不能对同一个任务并发重跑。");
+    return;
+  }
   if (fromStep) req.rerun_from = step;
   else req.rerun = step;
   if (fromStep || step === "render") {
@@ -939,24 +900,30 @@ function baseRunRequest() {
     skip_tts: productionMode === "highlight_reassembly",
     skip_render: mode === "skip_render",
     mode: "normal",
+    client_id: getClientId(),
   };
 }
 
 function afterJobStarted(job) {
-  state.activeJob = job.job_id;
+  state.activeJob = job.job_id || null;
   state.selectedTask = job.task_id;
-  setRunControlsBusy(true);
+  setRunControlsBusy(false);
   $("taskIdInput").value = job.task_id;
   $("activeTitle").textContent = displayTaskId(job.task_id);
   updateTaskSubtitle(job.task_id);
-  $("metricJob").textContent = "运行中";
-  updateProgress(0, STEPS.length, 0, 0, 0);
-  if ($("metricCurrentStep")) $("metricCurrentStep").textContent = stepLabel(STEPS[0]);
-  updateJobMessage("");
-  $("logViewer").textContent = "任务已启动，等待日志输出...";
-  startJobPolling();
+  $("metricJob").textContent = jobStatusLabel(job.status || "pending");
+  updateJobMessage(job.message || "");
+  if (job.deduplicated) {
+    alert(job.message || "该任务正在执行，已切换到现有任务。");
+    $("logViewer").textContent = job.message || "已切换到现有任务。";
+  } else {
+    updateProgress(0, STEPS.length, 0, 0, 0);
+    if ($("metricCurrentStep")) $("metricCurrentStep").textContent = stepLabel(STEPS[0]);
+    $("logViewer").textContent = "任务已提交，等待日志输出...";
+  }
+  if (state.activeJob) startJobPolling();
   refreshActiveTaskSnapshot(job.task_id);
-  refreshJobAndLog();
+  if (state.activeJob) refreshJobAndLog();
 }
 
 function startJobPolling() {
@@ -967,7 +934,7 @@ function startJobPolling() {
 function setRunControlsBusy(isBusy) {
   ["runSelected", "rerunOne", "rerunFrom"].forEach((id) => {
     const button = $(id);
-    if (button) button.disabled = isBusy;
+    if (button) button.disabled = false;
   });
 }
 
@@ -987,11 +954,11 @@ async function refreshJobAndLog() {
     }
     return;
   }
-  $("metricJob").textContent = job.status;
+  $("metricJob").textContent = jobStatusLabel(job.status);
   updateJobMessage(job.user_message || "");
   await refreshActiveTaskSnapshot(job.task_id);
   await refreshLog();
-  if (job.status !== "running") {
+  if (!["pending", "running"].includes(job.status)) {
     clearInterval(state.logTimer);
     state.logTimer = null;
     state.activeJob = null;
@@ -1036,6 +1003,21 @@ async function refreshLog() {
   const text = await api(`/api/jobs/${state.activeJob}/log`);
   $("logViewer").textContent = text || "日志暂未写入。";
   $("logViewer").scrollTop = $("logViewer").scrollHeight;
+}
+
+async function selectedTaskHasActiveJob(taskId) {
+  if (!taskId) return false;
+  const jobs = await api("/api/jobs").catch(() => []);
+  return jobs.some((job) => job.task_id === taskId && ["pending", "running"].includes(job.status));
+}
+
+function getClientId() {
+  let id = localStorage.getItem("phoenix_client_id");
+  if (!id) {
+    id = crypto.randomUUID();
+    localStorage.setItem("phoenix_client_id", id);
+  }
+  return id;
 }
 
 function clearTaskPanels() {

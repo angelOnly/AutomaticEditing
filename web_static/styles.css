@@ -147,9 +147,26 @@ button {
   background: rgba(166, 29, 42, 0.18);
 }
 
-.list-item.long-pressing {
+.list-item.job-running {
   border-color: rgba(239, 68, 68, 0.86);
-  background: rgba(166, 29, 42, 0.28);
+  background: linear-gradient(90deg, rgba(166, 29, 42, 0.28), rgba(166, 29, 42, 0.1));
+  box-shadow: inset 3px 0 0 #ef4444;
+}
+
+.list-item.job-pending {
+  border-color: rgba(217, 119, 6, 0.78);
+  background: linear-gradient(90deg, rgba(217, 119, 6, 0.2), rgba(217, 119, 6, 0.08));
+  box-shadow: inset 3px 0 0 #f59e0b;
+}
+
+.list-item.job-running.active {
+  border-color: rgba(248, 113, 113, 0.95);
+  background: rgba(166, 29, 42, 0.34);
+}
+
+.list-item.job-pending.active {
+  border-color: rgba(251, 191, 36, 0.95);
+  background: rgba(217, 119, 6, 0.28);
 }
 
 .list-item.deleting {
@@ -210,6 +227,31 @@ button {
   color: var(--sidebar-muted);
   font-size: 12px;
   line-height: 1.35;
+}
+
+.task-job-badge {
+  display: inline-flex;
+  align-items: center;
+  width: fit-content;
+  min-height: 22px;
+  margin-top: 9px;
+  padding: 0 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-style: normal;
+  font-weight: 800;
+}
+
+.task-job-badge.running {
+  color: #fecaca;
+  background: rgba(239, 68, 68, 0.18);
+  border: 1px solid rgba(248, 113, 113, 0.42);
+}
+
+.task-job-badge.pending {
+  color: #fde68a;
+  background: rgba(217, 119, 6, 0.18);
+  border: 1px solid rgba(251, 191, 36, 0.42);
 }
 
 .workspace {

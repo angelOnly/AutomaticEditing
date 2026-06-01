@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import os
+import hashlib
+import json
 import shutil
 import subprocess
 import sys
 import uuid
+from collections import deque
 from datetime import datetime
 from pathlib import Path
+from threading import RLock
 from typing import Any
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
@@ -28,10 +32,16 @@ app = FastAPI(title="凤凰新闻视频智能拆条工作台")
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 JOBS: dict[str, dict[str, Any]] = {}
+JOB_LOCK = RLock()
+PENDING_JOB_IDS: deque[str] = deque()
 PROJECT_CONFIG = load_config(ROOT / "config.toml")
 WORKFLOW_DEFAULTS = PROJECT_CONFIG.workflow
 SHORT_VIDEO_DEFAULTS = PROJECT_CONFIG.short_video
 VOICEOVER_DEFAULTS = PROJECT_CONFIG.voiceover
+WEB_CONCURRENCY = PROJECT_CONFIG.raw.get("web_concurrency", {})
+MAX_RUNNING_JOBS = int(WEB_CONCURRENCY.get("max_running_jobs", 2))
+MAX_PENDING_JOBS = int(WEB_CONCURRENCY.get("max_pending_jobs", 20))
+SAME_TASK_POLICY = str(WEB_CONCURRENCY.get("same_task_policy", "reject"))
 
 
 class RunRequest(BaseModel):
@@ -62,6 +72,7 @@ class RunRequest(BaseModel):
     reassembly_max_clip_count: int = 8
     reassembly_export_individual_clips: bool = False
     reuse_from_task_id: str | None = None
+    client_id: str | None = None
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -156,6 +167,7 @@ def list_tasks() -> list[dict[str, Any]]:
     if not OUTPUTS_DIR.exists():
         return []
     tasks = []
+    seen_task_ids: set[str] = set()
     for task_dir in sorted([p for p in OUTPUTS_DIR.iterdir() if p.is_dir()], key=lambda p: p.stat().st_mtime, reverse=True):
         manifest = read_json(task_dir / "manifest.json", {})
         if not manifest:
@@ -164,6 +176,8 @@ def list_tasks() -> list[dict[str, Any]]:
         done = sum(1 for s in steps.values() if s.get("status") in {"success", "partial_success", "skipped"})
         stale = sum(1 for s in steps.values() if s.get("status") == "stale")
         failed = sum(1 for s in steps.values() if s.get("status") == "failed")
+        job_status = _active_job_status_for_task(task_dir.name)
+        seen_task_ids.add(task_dir.name)
         tasks.append(
             {
                 "task_id": task_dir.name,
@@ -174,6 +188,29 @@ def list_tasks() -> list[dict[str, Any]]:
                 "stale_steps": stale,
                 "failed_steps": failed,
                 "step_count": len(steps),
+                "job_status": job_status,
+            }
+        )
+    for job in sorted(
+        [_refresh_job(job_id) for job_id in list(JOBS)],
+        key=lambda item: item.get("created_at") or item.get("started_at") or "",
+        reverse=True,
+    ):
+        task_id = job.get("task_id")
+        if not task_id or task_id in seen_task_ids or job.get("status") not in {"pending", "running"}:
+            continue
+        seen_task_ids.add(task_id)
+        tasks.append(
+            {
+                "task_id": task_id,
+                "source_video": "",
+                "updated_at": job.get("created_at", ""),
+                "created_at": job.get("created_at", ""),
+                "done_steps": 0,
+                "stale_steps": 0,
+                "failed_steps": 0,
+                "step_count": 0,
+                "job_status": job.get("status", ""),
             }
         )
     return tasks
@@ -182,7 +219,7 @@ def list_tasks() -> list[dict[str, Any]]:
 @app.delete("/api/tasks/{task_id}")
 def delete_task(task_id: str) -> dict[str, Any]:
     for job in JOBS.values():
-        if job.get("task_id") == task_id and _refresh_job(job["job_id"]).get("status") == "running":
+        if job.get("task_id") == task_id and _refresh_job(job["job_id"]).get("status") in {"pending", "running"}:
             raise HTTPException(409, "task is running")
     task_dir = _task_dir(task_id)
     shutil.rmtree(task_dir)
@@ -282,13 +319,74 @@ def run_pipeline(req: RunRequest) -> dict[str, Any]:
         req.audio_policy = "ai_voiceover"
         req.allow_original_audio_evidence = False
     _prepare_mode_switched_run(req)
-    task_id = _resolve_run_task_id(req)
+    input_path = _resolve_input_video(req.input_video) if req.input_video else None
+    fingerprint = _run_fingerprint(req, input_path) if input_path else ""
+    if req.input_video and not req.task_id:
+        task_id = _make_task_id_from_fingerprint(req.input_video, req.production_mode, fingerprint)
+    else:
+        task_id = _resolve_run_task_id(req)
     task_dir = ensure_dir(OUTPUTS_DIR / task_id)
+
+    existing_job = _find_active_job_by_task_id(task_id)
+    if existing_job and not (req.rerun or req.rerun_from):
+        status = existing_job.get("status", "")
+        status_text = "排队中" if status == "pending" else "运行中"
+        return {
+            **_public_job(existing_job),
+            "deduplicated": True,
+            "message": f"该视频的{_mode_slug(req.production_mode)}任务正在{status_text}，已切换到现有任务。",
+        }
+
+    manifest = read_json(task_dir / "manifest.json", {})
+    if not (req.rerun or req.rerun_from) and _is_task_already_completed(manifest, req.production_mode):
+        return {
+            "job_id": "",
+            "task_id": task_id,
+            "status": "success",
+            "returncode": 0,
+            "deduplicated": True,
+            "message": "相同任务已完成，直接复用结果。",
+        }
+
     _seed_reusable_outputs(req, task_id, task_dir)
     job_id = f"job_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
     log_dir = ensure_dir(task_dir / "web_jobs")
     log_path = log_dir / f"{job_id}.log"
 
+    cmd = _build_run_command(req, task_id, input_path)
+    _save_web_run_options(task_dir, req)
+
+    with JOB_LOCK:
+        active_job = _find_active_job_by_task_id(task_id)
+        if active_job and SAME_TASK_POLICY == "reject":
+            raise HTTPException(409, f"任务 {task_id} 已有运行中或排队中的 job，请不要对同一任务并发运行")
+        pending_count = sum(1 for job in JOBS.values() if job.get("status") == "pending")
+        if pending_count >= MAX_PENDING_JOBS:
+            raise HTTPException(429, "等待队列已满，请稍后再提交")
+        log_path.write_text(" ".join(cmd) + "\n\n=== job queued ===\n", encoding="utf-8", errors="replace")
+        job = {
+            "job_id": job_id,
+            "task_id": task_id,
+            "pid": None,
+            "cmd": cmd,
+            "log": relpath(log_path, ROOT),
+            "log_path": str(log_path),
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "started_at": "",
+            "status": "pending",
+            "returncode": None,
+            "submitted_by": req.client_id or "anonymous",
+            "task_fingerprint": fingerprint,
+        }
+        JOBS[job_id] = job
+        PENDING_JOB_IDS.append(job_id)
+        _persist_job(job)
+
+    _schedule_jobs()
+    return _public_job(JOBS[job_id])
+
+
+def _build_run_command(req: RunRequest, task_id: str, input_path: Path | None = None) -> list[str]:
     cmd = [
         sys.executable,
         "-u",
@@ -316,8 +414,7 @@ def run_pipeline(req: RunRequest) -> dict[str, Any]:
             cmd.extend(["--reassembly-target-seconds", str(req.reassembly_target_seconds)])
         if req.reassembly_export_individual_clips:
             cmd.append("--reassembly-export-individual-clips")
-    if req.input_video:
-        input_path = _resolve_input_video(req.input_video)
+    if input_path:
         cmd.extend(["--input", str(input_path)])
     if req.rerun:
         cmd.extend(["--rerun", req.rerun])
@@ -344,18 +441,20 @@ def run_pipeline(req: RunRequest) -> dict[str, Any]:
         cmd.append("--require-tts")
     else:
         cmd.append("--no-require-tts")
+    return cmd
 
-    _save_web_run_options(task_dir, req)
 
-    log_file = log_path.open("w", encoding="utf-8", errors="replace")
-    log_file.write(" ".join(cmd) + "\n\n")
+def _start_job(job: dict[str, Any]) -> None:
+    log_path = Path(job["log_path"])
+    log_file = log_path.open("a", encoding="utf-8", errors="replace")
+    log_file.write("\n=== job started ===\n")
     log_file.flush()
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"
     env["PYTHONUNBUFFERED"] = "1"
     process = subprocess.Popen(
-        cmd,
+        job["cmd"],
         cwd=str(ROOT),
         stdout=log_file,
         stderr=subprocess.STDOUT,
@@ -365,21 +464,49 @@ def run_pipeline(req: RunRequest) -> dict[str, Any]:
         env=env,
         creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
     )
-    JOBS[job_id] = {
-        "job_id": job_id,
-        "task_id": task_id,
-        "pid": process.pid,
-        "cmd": cmd,
-        "log": relpath(log_path, ROOT),
-        "log_path": str(log_path),
-        "started_at": datetime.now().isoformat(timespec="seconds"),
-        "status": "running",
-        "returncode": None,
-        "process": process,
-        "log_file": log_file,
-    }
-    write_json(task_dir / "last_web_job.json", {k: v for k, v in JOBS[job_id].items() if k not in {"process", "log_file"}})
-    return _public_job(JOBS[job_id])
+    job.update(
+        {
+            "pid": process.pid,
+            "process": process,
+            "log_file": log_file,
+            "started_at": datetime.now().isoformat(timespec="seconds"),
+            "status": "running",
+            "returncode": None,
+        }
+    )
+    _persist_job(job)
+
+
+def _schedule_jobs() -> None:
+    with JOB_LOCK:
+        running = _running_job_count()
+        while running < MAX_RUNNING_JOBS and PENDING_JOB_IDS:
+            job_id = PENDING_JOB_IDS.popleft()
+            job = JOBS.get(job_id)
+            if not job or job.get("status") != "pending":
+                continue
+            try:
+                _start_job(job)
+                running += 1
+            except Exception as exc:
+                job["status"] = "failed"
+                job["returncode"] = -1
+                job["user_message"] = str(exc)
+                job["finished_at"] = datetime.now().isoformat(timespec="seconds")
+                _persist_job(job)
+
+
+def _running_job_count() -> int:
+    count = 0
+    for job_id in list(JOBS):
+        public = _refresh_job(job_id, schedule_next=False)
+        if public.get("status") == "running":
+            count += 1
+    return count
+
+
+def _persist_job(job: dict[str, Any]) -> None:
+    write_json(OUTPUTS_DIR / job["task_id"] / "last_web_job.json", _public_job(job))
 
 
 def _save_web_run_options(task_dir: Path, req: RunRequest) -> None:
@@ -476,7 +603,11 @@ def _copy_reusable_path(source: Path, target: Path) -> None:
 
 @app.get("/api/jobs")
 def list_jobs() -> list[dict[str, Any]]:
-    return [_refresh_job(job_id) for job_id in sorted(JOBS, reverse=True)]
+    return sorted(
+        [_refresh_job(job_id) for job_id in list(JOBS)],
+        key=lambda item: item.get("created_at") or item.get("started_at") or "",
+        reverse=True,
+    )
 
 
 @app.get("/api/jobs/{job_id}")
@@ -497,9 +628,10 @@ def get_job_log(job_id: str) -> PlainTextResponse:
     return PlainTextResponse(path.read_text(encoding="utf-8", errors="replace")[-80_000:])
 
 
-def _refresh_job(job_id: str) -> dict[str, Any]:
+def _refresh_job(job_id: str, schedule_next: bool = True) -> dict[str, Any]:
     job = JOBS[job_id]
     process = job.get("process")
+    changed_to_finished = False
     if process and job["status"] == "running":
         code = process.poll()
         if code is not None:
@@ -510,9 +642,12 @@ def _refresh_job(job_id: str) -> dict[str, Any]:
             if log_file:
                 log_file.close()
             job["user_message"] = _extract_user_message_from_log(Path(job["log_path"]))
-            write_json(OUTPUTS_DIR / job["task_id"] / "last_web_job.json", {k: v for k, v in job.items() if k not in {"process", "log_file"}})
+            _persist_job(job)
+            changed_to_finished = True
     elif Path(job.get("log_path", "")).exists():
         job["user_message"] = _extract_user_message_from_log(Path(job["log_path"]))
+    if changed_to_finished and schedule_next:
+        _schedule_jobs()
     return _public_job(job)
 
 
@@ -591,6 +726,39 @@ def _list_draft_videos(task_dir: Path) -> list[Path]:
 
 def _public_job(job: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in job.items() if k not in {"process", "log_file"}}
+
+
+def _active_job_status_for_task(task_id: str) -> str:
+    statuses = []
+    for job_id, job in list(JOBS.items()):
+        if job.get("task_id") != task_id:
+            continue
+        public = _refresh_job(job_id)
+        if public.get("status") in {"pending", "running"}:
+            statuses.append(public["status"])
+    if "running" in statuses:
+        return "running"
+    if "pending" in statuses:
+        return "pending"
+    return ""
+
+
+def _find_active_job_by_task_id(task_id: str) -> dict[str, Any] | None:
+    for job_id, job in list(JOBS.items()):
+        if job.get("task_id") != task_id:
+            continue
+        public = _refresh_job(job_id)
+        if public.get("status") in {"pending", "running"}:
+            return job
+    return None
+
+
+def _is_task_already_completed(manifest: dict[str, Any], production_mode: str) -> bool:
+    if not manifest:
+        return False
+    steps = manifest.get("steps", {})
+    final_step = "reassembly_render" if production_mode == "highlight_reassembly" else "render"
+    return steps.get(final_step, {}).get("status") in {"success", "partial_success"}
 
 
 def _task_dir(task_id: str) -> Path:
@@ -718,6 +886,33 @@ def _make_task_id(input_video: str | None, production_mode: str = "ai_voiceover"
         safe = "".join(ch if ch.isalnum() else "_" for ch in name).strip("_")
         prefix = safe[:24] or "task"
     return f"{prefix}_{_mode_slug(production_mode)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+
+def _video_fingerprint(path: Path) -> dict[str, Any]:
+    stat = path.stat()
+    return {
+        "path": str(path.resolve()),
+        "size": stat.st_size,
+        "mtime": round(stat.st_mtime, 3),
+    }
+
+
+def _run_fingerprint(req: RunRequest, input_path: Path | None) -> str:
+    payload = {
+        "video": _video_fingerprint(input_path) if input_path else None,
+        "production_mode": req.production_mode,
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _make_task_id_from_fingerprint(input_video: str | None, production_mode: str, fingerprint: str) -> str:
+    prefix = "task"
+    if input_video:
+        name = Path(input_video).stem
+        safe = "".join(ch if ch.isalnum() else "_" for ch in name).strip("_")
+        prefix = safe[:24] or "task"
+    return f"{prefix}_{_mode_slug(production_mode)}_{fingerprint}"
 
 
 def _with_mode_suffix(task_id: str, production_mode: str) -> str:
