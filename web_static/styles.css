@@ -138,6 +138,30 @@ button {
   color: var(--sidebar-text);
 }
 
+.remote-tools {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 108px;
+  gap: 8px;
+}
+
+.remote-tools label {
+  min-width: 0;
+}
+
+.remote-tools span {
+  color: var(--sidebar-muted);
+  font-size: 12px;
+}
+
+.remote-tools input,
+.remote-tools select {
+  width: 100%;
+  min-height: 38px;
+  border-color: rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--sidebar-text);
+}
+
 .remote-pager {
   display: flex;
   align-items: center;

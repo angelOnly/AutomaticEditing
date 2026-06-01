@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import re
@@ -24,6 +24,8 @@ class RemoteVideoSourceConfig:
     request_timeout_seconds: int
     connect_timeout_seconds: int
     station_count_timeout_seconds: int
+    search_page_size: int
+    max_scan_items: int
     cache_dir: Path
     prefer_quality: str
     record_stations: list[str]
@@ -39,10 +41,12 @@ def load_remote_ucms_config(project_config: ProjectConfig) -> RemoteVideoSourceC
         enabled=bool(raw.get("enabled", False)),
         api_url=str(raw.get("api_url", "https://ucms.ifeng.com/api/ve/list")),
         default_record_station=str(raw.get("default_record_station", "")),
-        default_page_size=int(raw.get("default_page_size", 30)),
+        default_page_size=int(raw.get("default_page_size", 10)),
         request_timeout_seconds=int(raw.get("request_timeout_seconds", 20)),
         connect_timeout_seconds=int(raw.get("connect_timeout_seconds", 5)),
         station_count_timeout_seconds=int(raw.get("station_count_timeout_seconds", raw.get("connect_timeout_seconds", 5))),
+        search_page_size=int(raw.get("search_page_size", 100)),
+        max_scan_items=int(raw.get("max_scan_items", 3000)),
         cache_dir=cache_dir,
         prefer_quality=str(raw.get("prefer_quality", "high")).lower(),
         record_stations=[str(item) for item in raw.get("record_stations", [])],
@@ -68,7 +72,7 @@ def public_config(
         "record_station_options": [
             {
                 "value": station,
-                "label": f"{station}（{counts[station]}）" if station in counts else station,
+                "label": f"{station} ({counts[station]})" if station in counts else station,
                 "total": counts.get(station),
             }
             for station in cfg.record_stations
@@ -82,26 +86,39 @@ def list_ucms_videos(
     record_station: str | None = None,
     current: int = 1,
     page_size: int | None = None,
+    keyword: str | None = None,
+    sort_order: str = "desc",
 ) -> dict[str, Any]:
     size = int(page_size or cfg.default_page_size)
     page = max(1, int(current or 1))
+    station = record_station or cfg.default_record_station
+    order = _normalize_sort_order(sort_order)
+    query = str(keyword or "").strip()
     if not cfg.enabled:
         return _empty_response(page, size, cfg)
 
-    raw = _query_ucms(cfg, record_station or cfg.default_record_station, current=page, page_size=size, timeout=cfg.request_timeout_seconds)
+    if query or order in {"asc", "desc"}:
+        return _list_ucms_videos_scanned(
+            cfg,
+            record_station=station,
+            current=page,
+            page_size=size,
+            keyword=query,
+            sort_order=order,
+        )
+
+    raw = _query_ucms(cfg, station, current=page, page_size=size, timeout=cfg.request_timeout_seconds)
     data = _response_data(raw)
     raw_items = _response_items(data)
     pagination = _response_pagination(data, page, size, len(raw_items))
-    return {
-        "items": [
-            normalize_ucms_item(item, prefer_quality=cfg.prefer_quality)
-            for item in raw_items
-            if isinstance(item, dict)
-        ],
-        "pagination": pagination,
-        "record_stations": cfg.record_stations,
-        "default_record_station": cfg.default_record_station,
-    }
+    return _list_response(
+        raw_items,
+        pagination,
+        cfg,
+        keyword=query,
+        sort_order=order,
+        scanned=False,
+    )
 
 
 def count_ucms_videos(cfg: RemoteVideoSourceConfig, *, record_station: str) -> int:
@@ -206,6 +223,75 @@ def download_ucms_video(
     }
 
 
+def _list_ucms_videos_scanned(
+    cfg: RemoteVideoSourceConfig,
+    *,
+    record_station: str,
+    current: int,
+    page_size: int,
+    keyword: str,
+    sort_order: str,
+) -> dict[str, Any]:
+    scan_size = max(1, min(int(cfg.search_page_size), 200))
+    max_items = max(scan_size, int(cfg.max_scan_items))
+    all_items: list[dict[str, Any]] = []
+    total = 0
+    page = 1
+    while len(all_items) < max_items:
+        raw = _query_ucms(cfg, record_station, current=page, page_size=scan_size, timeout=cfg.request_timeout_seconds)
+        data = _response_data(raw)
+        raw_items = [item for item in _response_items(data) if isinstance(item, dict)]
+        if page == 1:
+            total = int(_response_pagination(data, page, scan_size, len(raw_items)).get("total") or len(raw_items))
+        all_items.extend(raw_items)
+        if not raw_items or len(all_items) >= total:
+            break
+        page += 1
+
+    filtered = [item for item in all_items if _matches_keyword(item, keyword)]
+    filtered.sort(key=_item_create_time_sort_key, reverse=sort_order == "desc")
+    start = max(0, (current - 1) * page_size)
+    page_items = filtered[start : start + page_size]
+    return _list_response(
+        page_items,
+        {
+            "current": current,
+            "pageSize": page_size,
+            "total": len(filtered),
+            "sourceTotal": total,
+            "scanned": min(len(all_items), max_items),
+        },
+        cfg,
+        keyword=keyword,
+        sort_order=sort_order,
+        scanned=True,
+    )
+
+
+def _list_response(
+    raw_items: list[Any],
+    pagination: dict[str, Any],
+    cfg: RemoteVideoSourceConfig,
+    *,
+    keyword: str,
+    sort_order: str,
+    scanned: bool,
+) -> dict[str, Any]:
+    return {
+        "items": [
+            normalize_ucms_item(item, prefer_quality=cfg.prefer_quality)
+            for item in raw_items
+            if isinstance(item, dict)
+        ],
+        "pagination": pagination,
+        "record_stations": cfg.record_stations,
+        "default_record_station": cfg.default_record_station,
+        "keyword": keyword,
+        "sort_order": sort_order,
+        "scanned": scanned,
+    }
+
+
 def _query_ucms(
     cfg: RemoteVideoSourceConfig,
     record_station: str,
@@ -250,6 +336,36 @@ def _response_pagination(data: dict[str, Any], current: int, page_size: int, ite
     pagination.setdefault("current", current)
     pagination.setdefault("pageSize", page_size)
     return pagination
+
+
+def _matches_keyword(item: dict[str, Any], keyword: str) -> bool:
+    if not keyword:
+        return True
+    needle = keyword.casefold()
+    fields = [
+        item.get("name"),
+        item.get("id"),
+        item.get("guid"),
+        item.get("createTime"),
+        item.get("recordStation"),
+        item.get("tvStation"),
+        item.get("preCutMsg"),
+    ]
+    return any(needle in str(value or "").casefold() for value in fields)
+
+
+def _item_create_time_sort_key(item: dict[str, Any]) -> tuple[datetime, str]:
+    value = str(item.get("createTime") or "")
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        parsed = datetime.min
+    return parsed, str(item.get("id") or item.get("guid") or item.get("name") or "")
+
+
+def _normalize_sort_order(value: str | None) -> str:
+    order = str(value or "desc").lower()
+    return order if order in {"asc", "desc", "source"} else "desc"
 
 
 def _empty_response(current: int, page_size: int, cfg: RemoteVideoSourceConfig) -> dict[str, Any]:
@@ -319,3 +435,4 @@ def _safe_path_part(value: Any) -> str:
     text = re.sub(r'[<>:"/\\|?*\s]+', "_", text)
     text = text.strip("._")
     return text[:80] or "unknown"
+

@@ -87,9 +87,10 @@ const state = {
   latestDraft: null,
   drafts: [],
   remoteVideos: [],
-  remotePagination: { current: 1, pageSize: 30, total: 0 },
+  remotePagination: { current: 1, pageSize: 10, total: 0 },
   remoteRecordStations: [],
   remoteStationCounts: {},
+  remoteSearchTimer: null,
   remoteEnabled: false,
   voices: [],
   defaultVoiceId: "",
@@ -144,7 +145,7 @@ async function loadConfig() {
     state.remoteEnabled = Boolean(remote.enabled);
     state.remoteRecordStations = remote.record_stations || [];
     state.remoteStationCounts = remote.station_counts || {};
-    state.remotePagination.pageSize = remote.default_page_size || 30;
+    state.remotePagination.pageSize = remote.default_page_size || 10;
     fillRemoteStationSelect(remote.default_record_station || "");
     fillVoiceSelect();
     applyDefaultControls();
@@ -232,13 +233,24 @@ function bindEvents() {
   $("refreshVideos").addEventListener("click", loadVideos);
   $("refreshRemoteVideos")?.addEventListener("click", () => loadRemoteVideos(1));
   $("remoteRecordStation")?.addEventListener("change", () => loadRemoteVideos(1));
+  $("remoteSortOrder")?.addEventListener("change", () => loadRemoteVideos(1));
+  $("remoteSearch")?.addEventListener("input", () => {
+    if (state.remoteSearchTimer) clearTimeout(state.remoteSearchTimer);
+    state.remoteSearchTimer = setTimeout(() => loadRemoteVideos(1), 350);
+  });
+  $("remoteSearch")?.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    if (state.remoteSearchTimer) clearTimeout(state.remoteSearchTimer);
+    loadRemoteVideos(1);
+  });
   $("remotePrev")?.addEventListener("click", () => {
     const current = Number(state.remotePagination.current || 1);
     if (current > 1) loadRemoteVideos(current - 1);
   });
   $("remoteNext")?.addEventListener("click", () => {
     const p = state.remotePagination || {};
-    const maxPage = Math.ceil((p.total || 0) / (p.pageSize || 30));
+    const maxPage = Math.ceil((p.total || 0) / (p.pageSize || 10));
     if (!maxPage || Number(p.current || 1) < maxPage) loadRemoteVideos(Number(p.current || 1) + 1);
   });
   $("refreshTasks").addEventListener("click", loadTasks);
@@ -455,11 +467,19 @@ async function loadRemoteVideos(page = 1) {
     return;
   }
   const station = $("remoteRecordStation")?.value || "";
+  const keyword = $("remoteSearch")?.value?.trim() || "";
+  const sortOrder = $("remoteSortOrder")?.value || "desc";
   box.innerHTML = `<div class="list-item"><strong>正在加载远程素材...</strong><span>${escapeHtml(station || "-")}</span></div>`;
-  const url = `/api/remote-videos?record_station=${encodeURIComponent(station)}&current=${page}&page_size=${state.remotePagination.pageSize || 30}`;
-  const data = await api(url);
+  const params = new URLSearchParams({
+    record_station: station,
+    current: String(page),
+    page_size: String(state.remotePagination.pageSize || 10),
+    sort_order: sortOrder,
+  });
+  if (keyword) params.set("keyword", keyword);
+  const data = await api(`/api/remote-videos?${params.toString()}`);
   state.remoteVideos = data.items || [];
-  state.remotePagination = data.pagination || { current: page, pageSize: 30, total: state.remoteVideos.length };
+  state.remotePagination = data.pagination || { current: page, pageSize: 10, total: state.remoteVideos.length };
   state.remoteStationCounts = { ...state.remoteStationCounts, ...(data.station_counts || {}) };
   if (station && state.remotePagination.total !== undefined) {
     state.remoteStationCounts[station] = Number(state.remotePagination.total || 0);
@@ -474,7 +494,7 @@ function renderRemoteVideos() {
   updateRemotePager();
   box.innerHTML = state.remoteVideos.length
     ? ""
-    : `<div class="list-item"><strong>没有远程素材</strong><span>请更换信号源或稍后刷新</span></div>`;
+    : `<div class="list-item"><strong>没有远程素材</strong><span>请更换信号源、搜索词或稍后刷新</span></div>`;
   state.remoteVideos.forEach((video) => {
     const item = document.createElement("button");
     item.className = `list-item ${state.selectedRemoteVideo?.remote_id === video.remote_id ? "active" : ""}`;
@@ -489,7 +509,7 @@ function renderRemoteVideos() {
 
 function updateRemotePager() {
   const p = state.remotePagination || {};
-  const maxPage = Math.max(1, Math.ceil((p.total || 0) / (p.pageSize || 30)));
+  const maxPage = Math.max(1, Math.ceil((p.total || 0) / (p.pageSize || 10)));
   if ($("remotePageInfo")) $("remotePageInfo").textContent = `${p.current || 1} / ${maxPage} · 共 ${p.total || 0}`;
 }
 

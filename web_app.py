@@ -224,6 +224,8 @@ def list_remote_videos(
     record_station: str | None = None,
     current: int = 1,
     page_size: int | None = None,
+    keyword: str | None = None,
+    sort_order: str = "desc",
 ) -> dict[str, Any]:
     try:
         result = list_ucms_videos(
@@ -231,6 +233,8 @@ def list_remote_videos(
             record_station=record_station,
             current=current,
             page_size=page_size,
+            keyword=keyword,
+            sort_order=sort_order,
         )
         station = record_station or REMOTE_UCMS_CONFIG.default_record_station
         total = result.get("pagination", {}).get("total")

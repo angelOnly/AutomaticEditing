@@ -41,6 +41,19 @@
             <span>信号源</span>
             <select id="remoteRecordStation"></select>
           </label>
+          <div class="remote-tools">
+            <label>
+              <span>搜索</span>
+              <input id="remoteSearch" type="search" placeholder="名称 / 时间 / ID" />
+            </label>
+            <label>
+              <span>排序</span>
+              <select id="remoteSortOrder">
+                <option value="desc" selected>时间倒序</option>
+                <option value="asc">时间正序</option>
+              </select>
+            </label>
+          </div>
           <div class="remote-pager">
             <button class="mini-button" id="remotePrev" type="button">上一页</button>
             <span id="remotePageInfo">1 / -</span>
