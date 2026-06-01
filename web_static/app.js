@@ -89,7 +89,10 @@ const state = {
   remoteVideos: [],
   remotePagination: { current: 1, pageSize: 30, total: 0 },
   remoteRecordStations: [],
+  remoteStationCounts: {},
   remoteEnabled: false,
+  voices: [],
+  defaultVoiceId: "",
   defaults: {
     default_aspect_ratio: "16:9",
     default_chunk_seconds: 60,
@@ -135,14 +138,19 @@ async function loadConfig() {
     state.defaults.allow_long_video_default = config.short_video?.allow_long_video_default ?? state.defaults.allow_long_video_default;
     state.defaults.tts_required_by_default = config.voiceover?.tts_required_by_default ?? state.defaults.tts_required_by_default;
     state.defaults.allow_original_audio_evidence = config.voiceover?.allow_original_audio_evidence ?? state.defaults.allow_original_audio_evidence;
+    state.voices = config.voices || [];
+    state.defaultVoiceId = config.voiceover?.default_voice_id || "";
     const remote = config.remote_ucms || {};
     state.remoteEnabled = Boolean(remote.enabled);
     state.remoteRecordStations = remote.record_stations || [];
+    state.remoteStationCounts = remote.station_counts || {};
     state.remotePagination.pageSize = remote.default_page_size || 30;
     fillRemoteStationSelect(remote.default_record_station || "");
+    fillVoiceSelect();
     applyDefaultControls();
   } catch (error) {
     console.warn("配置加载失败，使用页面默认值", error);
+    fillVoiceSelect();
     applyDefaultControls();
   }
 }
@@ -150,9 +158,47 @@ async function loadConfig() {
 function fillRemoteStationSelect(defaultStation) {
   const select = $("remoteRecordStation");
   if (!select) return;
+  const selected = defaultStation || select.value;
   const stations = state.remoteRecordStations.length ? state.remoteRecordStations : [defaultStation].filter(Boolean);
-  select.innerHTML = stations.map((station) => `<option value="${escapeAttr(station)}">${escapeHtml(station)}</option>`).join("");
-  if (defaultStation) select.value = defaultStation;
+  select.innerHTML = stations.map((station) => `<option value="${escapeAttr(station)}">${escapeHtml(remoteStationLabel(station))}</option>`).join("");
+  if (selected) select.value = selected;
+}
+
+function remoteStationLabel(station) {
+  const count = state.remoteStationCounts?.[station];
+  return Number.isFinite(Number(count)) ? `${station}（${count}）` : station;
+}
+
+function fillVoiceSelect() {
+  const select = $("voiceSelect");
+  if (!select) return;
+  const voices = state.voices || [];
+  if (!voices.length) {
+    select.innerHTML = `<option value="">默认音色</option>`;
+    return;
+  }
+
+  select.innerHTML = voices.map((voice) => {
+    const label = [
+      voice.name || voice.id,
+      voice.gender ? genderLabel(voice.gender) : "",
+      voice.style ? styleLabel(voice.style) : "",
+    ].filter(Boolean).join(" · ");
+    return `<option value="${escapeAttr(voice.id)}">${escapeHtml(label)}</option>`;
+  }).join("");
+
+  const defaultVoice = voices.find((voice) => voice.is_default)
+    || voices.find((voice) => voice.id === state.defaultVoiceId)
+    || voices[0];
+  if (defaultVoice) select.value = defaultVoice.id;
+}
+
+function genderLabel(value) {
+  return { male: "男声", female: "女声" }[value] || value;
+}
+
+function styleLabel(value) {
+  return { news: "新闻", explainer: "解说", default: "默认" }[value] || value;
 }
 
 function applyDefaultControls() {
@@ -211,6 +257,7 @@ function bindEvents() {
   $("requireTtsSelect")?.addEventListener("change", () => {
     $("requireTts").checked = $("requireTtsSelect").value === "true";
   });
+  $("previewVoice")?.addEventListener("click", previewSelectedVoice);
   document.querySelectorAll(".mode-option").forEach((button) => {
     button.addEventListener("click", () => {
       $("productionMode").value = button.dataset.productionMode;
@@ -263,12 +310,34 @@ function onProductionModeChange() {
   $("allowOriginalAudioEvidence").checked = isReassembly;
   $("allowOriginalAudioEvidence").closest("label")?.classList.toggle("hidden", !isReassembly);
   $("requireTtsSelect")?.closest("label")?.classList.toggle("hidden", isReassembly);
+  $("voiceSelectWrap")?.classList.toggle("hidden", isReassembly);
+  $("previewVoice")?.classList.toggle("hidden", isReassembly);
   if (isReassembly && Number($("targetDuration").value || 0) < 60) $("targetDuration").value = 90;
   if (!isReassembly && Number($("targetDuration").value || 0) > 60) $("targetDuration").value = state.defaults.default_target_seconds || 30;
   syncFriendlyControls();
   updateSummaryControls();
   fillStepSelect();
   renderManifest();
+}
+
+async function previewSelectedVoice() {
+  const voiceId = $("voiceSelect")?.value;
+  if (!voiceId) {
+    alert("请先选择一个音色。");
+    return;
+  }
+
+  const voice = (state.voices || []).find((item) => item.id === voiceId);
+  const url = voice?.preview_url || `/api/voices/${encodeURIComponent(voiceId)}/preview`;
+  const audio = $("voicePreviewAudio");
+  audio.src = url;
+  audio.load();
+
+  try {
+    await audio.play();
+  } catch (error) {
+    alert(`试听失败：${cleanError(error)}`);
+  }
 }
 
 function syncFriendlyControls() {
@@ -391,6 +460,11 @@ async function loadRemoteVideos(page = 1) {
   const data = await api(url);
   state.remoteVideos = data.items || [];
   state.remotePagination = data.pagination || { current: page, pageSize: 30, total: state.remoteVideos.length };
+  state.remoteStationCounts = { ...state.remoteStationCounts, ...(data.station_counts || {}) };
+  if (station && state.remotePagination.total !== undefined) {
+    state.remoteStationCounts[station] = Number(state.remotePagination.total || 0);
+  }
+  fillRemoteStationSelect(station);
   renderRemoteVideos();
 }
 
@@ -667,7 +741,9 @@ function restoreRunControls(manifest) {
   $("reassemblyOutputMode").value = "single";
   $("reassemblySortMode").value = "editorial";
   if (opts.reassembly_max_clip_count) $("reassemblyMaxClipCount").value = opts.reassembly_max_clip_count;
+  if (opts.voice_id && $("voiceSelect")) $("voiceSelect").value = opts.voice_id;
   onProductionModeChange();
+  if (opts.voice_id && $("voiceSelect")) $("voiceSelect").value = opts.voice_id;
   if (typeof opts.require_tts === "boolean" && $("productionMode").value !== "highlight_reassembly") $("requireTts").checked = opts.require_tts;
   $("runMode").value = "all";
   syncFriendlyControls();
@@ -1020,6 +1096,7 @@ function baseRunRequest() {
     target_duration_mode: allowLongVideo && targetDuration === 30 ? "auto_within_60" : "fixed",
     allow_long_video: allowLongVideo,
     require_tts: productionMode === "highlight_reassembly" ? false : $("requireTts").checked,
+    voice_id: productionMode === "highlight_reassembly" ? null : ($("voiceSelect")?.value || null),
     audio_policy: productionMode === "highlight_reassembly" ? "original" : "ai_voiceover",
     allow_original_audio_evidence: productionMode === "highlight_reassembly",
     only_analysis: mode === "only_analysis",

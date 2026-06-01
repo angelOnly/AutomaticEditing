@@ -23,6 +23,7 @@ class RemoteVideoSourceConfig:
     default_page_size: int
     request_timeout_seconds: int
     connect_timeout_seconds: int
+    station_count_timeout_seconds: int
     cache_dir: Path
     prefer_quality: str
     record_stations: list[str]
@@ -41,6 +42,7 @@ def load_remote_ucms_config(project_config: ProjectConfig) -> RemoteVideoSourceC
         default_page_size=int(raw.get("default_page_size", 30)),
         request_timeout_seconds=int(raw.get("request_timeout_seconds", 20)),
         connect_timeout_seconds=int(raw.get("connect_timeout_seconds", 5)),
+        station_count_timeout_seconds=int(raw.get("station_count_timeout_seconds", raw.get("connect_timeout_seconds", 5))),
         cache_dir=cache_dir,
         prefer_quality=str(raw.get("prefer_quality", "high")).lower(),
         record_stations=[str(item) for item in raw.get("record_stations", [])],
@@ -48,13 +50,29 @@ def load_remote_ucms_config(project_config: ProjectConfig) -> RemoteVideoSourceC
     )
 
 
-def public_config(cfg: RemoteVideoSourceConfig) -> dict[str, Any]:
+def public_config(
+    cfg: RemoteVideoSourceConfig,
+    *,
+    station_counts: dict[str, int] | None = None,
+    station_count_errors: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    counts = station_counts or {}
     return {
         "enabled": cfg.enabled,
         "default_record_station": cfg.default_record_station,
         "default_page_size": cfg.default_page_size,
         "prefer_quality": cfg.prefer_quality,
         "record_stations": cfg.record_stations,
+        "station_counts": counts,
+        "station_count_errors": station_count_errors or {},
+        "record_station_options": [
+            {
+                "value": station,
+                "label": f"{station}（{counts[station]}）" if station in counts else station,
+                "total": counts.get(station),
+            }
+            for station in cfg.record_stations
+        ],
     }
 
 
@@ -80,6 +98,29 @@ def list_ucms_videos(
             "pagination": {"current": page, "pageSize": size},
         }
     }
+
+
+def count_ucms_videos(cfg: RemoteVideoSourceConfig, *, record_station: str) -> int:
+    if not cfg.enabled:
+        return 0
+    payload = {
+        "body": {
+            "query": [
+                {"key": "from", "type": "=", "value": "record"},
+                {"key": "record_station", "type": "=", "value": record_station},
+            ],
+            "pagination": {"current": 1, "pageSize": 1},
+        }
+    }
+    raw = _post_json(cfg.api_url, payload, headers=cfg.headers, timeout=cfg.station_count_timeout_seconds)
+    if int(raw.get("code", 0) or 0) not in {0, 200}:
+        raise RuntimeError(f"UCMS interface returned an error: {raw.get('message') or raw}")
+    data = raw.get("data") or {}
+    pagination = data.get("pagination") or data.get("page") or {}
+    total = pagination.get("total", data.get("total"))
+    if total is not None:
+        return int(total)
+    return len(data.get("list") or data.get("records") or data.get("items") or [])
     raw = _post_json(cfg.api_url, payload, headers=cfg.headers, timeout=cfg.request_timeout_seconds)
     if int(raw.get("code", 0) or 0) not in {0, 200}:
         raise RuntimeError(f"UCMS interface returned an error: {raw.get('message') or raw}")

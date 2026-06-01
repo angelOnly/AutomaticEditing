@@ -635,6 +635,20 @@ h3 {
   gap: 12px;
 }
 
+#voiceSelectWrap {
+  min-width: 180px;
+}
+
+.voice-preview-button {
+  align-self: end;
+  min-height: 45px;
+  white-space: nowrap;
+}
+
+#voicePreviewAudio {
+  display: none;
+}
+
 label span {
   display: block;
   margin-bottom: 7px;

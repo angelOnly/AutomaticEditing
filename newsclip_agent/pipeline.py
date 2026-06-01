@@ -168,6 +168,7 @@ class RunOptions:
     target_duration_seconds: int | None = None
     allow_long_video: bool = False
     require_tts: bool = True
+    voice_id: str | None = None
     audio_policy: str = "ai_voiceover"
     allow_original_audio_evidence: bool = False
     production_mode: str = "ai_voiceover"
@@ -299,6 +300,7 @@ class PipelineRunner:
             "target_duration_seconds": self.options.target_duration_seconds,
             "allow_long_video": self.options.allow_long_video,
             "require_tts": self.options.require_tts,
+            "voice_id": self.options.voice_id,
             "audio_policy": self.options.audio_policy,
             "allow_original_audio_evidence": self.options.allow_original_audio_evidence,
             "production_mode": self.options.production_mode,
@@ -1206,6 +1208,7 @@ class PipelineRunner:
             "allow_long_video": self.options.allow_long_video,
             "audio_policy": self.options.audio_policy,
             "require_tts": self.options.require_tts,
+            "voice_id": self.options.voice_id,
             "production_mode": self.options.production_mode,
         }
 
@@ -1214,8 +1217,37 @@ class PipelineRunner:
             "target_duration_seconds": self.options.target_duration_seconds or self.duration_settings.default_target_seconds,
             "allow_long_video": self.options.allow_long_video,
             "audio_policy": self.options.audio_policy,
+            "voice_id": self.options.voice_id,
             "production_mode": self.options.production_mode,
         }
+
+    def _resolve_voice_config(self) -> dict[str, Any]:
+        base = dict(self.config.omnivoice)
+        voices = self.config.raw.get("voices", {})
+        if not isinstance(voices, dict):
+            voices = {}
+
+        requested = str(self.options.voice_id or base.get("default_voice_id") or "").strip()
+        selected_id = requested
+        selected: dict[str, Any] = {}
+        if requested and isinstance(voices.get(requested), dict):
+            selected = dict(voices[requested])
+        elif voices:
+            for key, value in voices.items():
+                if isinstance(value, dict) and value.get("enabled") is not False:
+                    selected_id = str(value.get("id") or key)
+                    selected = dict(value)
+                    break
+
+        if selected:
+            merged = {**base, **selected}
+            merged["voice_id"] = str(selected.get("id") or selected_id)
+            merged["voice_name"] = str(selected.get("name") or merged["voice_id"])
+            return merged
+
+        base["voice_id"] = str(base.get("default_voice_id") or "default")
+        base["voice_name"] = "默认音色"
+        return base
 
     def _reassembly_options_payload(self) -> dict[str, Any]:
         return {
@@ -1475,10 +1507,16 @@ class PipelineRunner:
             for item in editing.get("scripts", [])
             if isinstance(item, dict)
         }
+        voice_config = self._resolve_voice_config()
         input_hash = stable_hash({
             "voiceover": self._step_version("voiceover_script"),
             "editing": self._step_version("editing_script"),
-            "config": self.config.omnivoice,
+            "voice_config": {
+                "voice_id": voice_config.get("voice_id"),
+                "reference_audio": voice_config.get("reference_audio"),
+                "reference_text": voice_config.get("reference_text"),
+                "speed": voice_config.get("speed"),
+            },
             "require_tts": self.options.require_tts,
             "audio_policy": self.options.audio_policy,
             "allow_original_audio_evidence": self.options.allow_original_audio_evidence,
@@ -1489,7 +1527,14 @@ class PipelineRunner:
         version, base_dir = self._version_dir("tts", "tts/omnivoice")
         outputs = []
         if self.options.audio_policy == "original" or self.options.skip_tts:
-            out_index = write_json(base_dir / "tts_outputs.json", {"version": version, "outputs": [], "status": "skipped", "reason": "audio_policy=original or skip_tts"})
+            out_index = write_json(base_dir / "tts_outputs.json", {
+                "version": version,
+                "outputs": [],
+                "status": "skipped",
+                "reason": "audio_policy=original or skip_tts",
+                "voice_id": voice_config.get("voice_id", ""),
+                "voice_name": voice_config.get("voice_name", ""),
+            })
             self._record_step(step="tts", version=version, status="skipped", output=relpath(out_index, self.task_dir), input_hash=input_hash, output_files=[out_index])
             print("跳过: tts")
             return
@@ -1498,7 +1543,11 @@ class PipelineRunner:
             vdir = ensure_dir(base_dir / sid)
             text = item.get("narration_text") or item.get("script_with_pause_marks") or item.get("formal_script") or item.get("short_video_script") or ""
             write_text(vdir / "input_script.txt", text)
-            write_json(vdir / "config.json", self.config.omnivoice)
+            write_json(vdir / "config.json", {
+                "omnivoice": voice_config,
+                "selected_voice_id": voice_config.get("voice_id", ""),
+                "selected_voice_name": voice_config.get("voice_name", ""),
+            })
             out = vdir / "voiceover.wav"
             item_status = "skipped"
             error = ""
@@ -1513,8 +1562,8 @@ class PipelineRunner:
                 else:
                     timeline_mode = "compact_segmented"
             if timeline_segments:
-                model_path = self.config.resolve_path(self.config.omnivoice.get("model_path"), "models/OmniVoice")
-                ref_audio = self.config.resolve_path(self.config.omnivoice.get("reference_audio"), "tts_ref/664925840_0_13s.mp3")
+                model_path = self.config.resolve_path(voice_config.get("model_path"), "models/OmniVoice")
+                ref_audio = self.config.resolve_path(voice_config.get("reference_audio"), "tts_ref/664925840_0_13s.mp3")
                 segment_dir = ensure_dir(vdir / "segments")
                 for seg in timeline_segments:
                     seg_text = seg.get("text", "")
@@ -1535,9 +1584,9 @@ class PipelineRunner:
                             output_path=seg_out,
                             model_path=model_path or "",
                             reference_audio=ref_audio or "",
-                            reference_text=self.config.omnivoice.get("reference_text", ""),
+                            reference_text=voice_config.get("reference_text", ""),
                             keep_model_loaded=True,
-                            speed=self.config.omnivoice.get("speed"),
+                            speed=voice_config.get("speed"),
                         )
                         seg_item.update(seg_result.to_dict())
                         seg_item["file"] = relpath(seg_out, self.task_dir)
@@ -1560,16 +1609,16 @@ class PipelineRunner:
                 if error:
                     write_json(vdir / "error.json", {"short_video_id": sid, "error": error, "created_at": now_iso(), "segments": segment_outputs})
             elif text.strip():
-                model_path = self.config.resolve_path(self.config.omnivoice.get("model_path"), "models/OmniVoice")
-                ref_audio = self.config.resolve_path(self.config.omnivoice.get("reference_audio"), "tts_ref/664925840_0_13s.mp3")
+                model_path = self.config.resolve_path(voice_config.get("model_path"), "models/OmniVoice")
+                ref_audio = self.config.resolve_path(voice_config.get("reference_audio"), "tts_ref/664925840_0_13s.mp3")
                 result = generate_omnivoice_audio(
                     text=text,
                     output_path=out,
                     model_path=model_path or "",
                     reference_audio=ref_audio or "",
-                    reference_text=self.config.omnivoice.get("reference_text", ""),
+                    reference_text=voice_config.get("reference_text", ""),
                     keep_model_loaded=True,
-                    speed=self.config.omnivoice.get("speed"),
+                    speed=voice_config.get("speed"),
                 )
                 item_status = result.status
                 error = result.error
@@ -1585,6 +1634,8 @@ class PipelineRunner:
                 "actual_duration_seconds": 0.0,
                 "sample_rate": 24000,
                 "voice_file_exists": out.exists(),
+                "voice_id": voice_config.get("voice_id", ""),
+                "voice_name": voice_config.get("voice_name", ""),
                 "timeline_mode": timeline_mode,
                 "segments": segment_outputs,
                 "timeline_voiceover_file": relpath(out, self.task_dir) if timeline_segments else "",
@@ -1600,7 +1651,12 @@ class PipelineRunner:
             step_status.update({"status": item_status, "error": error})
             self._write_status(vdir, step_status)
         release_omnivoice_models()
-        out_index = write_json(base_dir / "tts_outputs.json", {"version": version, "outputs": outputs})
+        out_index = write_json(base_dir / "tts_outputs.json", {
+            "version": version,
+            "outputs": outputs,
+            "voice_id": voice_config.get("voice_id", ""),
+            "voice_name": voice_config.get("voice_name", ""),
+        })
         failed = sum(1 for item in outputs if item.get("status") == "failed")
         success = sum(1 for item in outputs if item.get("status") == "success")
         tts_is_hard_required = self.options.require_tts and self.options.audio_policy in {"ai_voiceover", "mixed"}
@@ -1849,6 +1905,7 @@ class PipelineRunner:
             "target_duration_seconds": self.options.target_duration_seconds,
             "allow_long_video": self.options.allow_long_video,
             "require_tts": self.options.require_tts,
+            "voice_id": self.options.voice_id,
             "audio_policy": self.options.audio_policy,
             "allow_original_audio_evidence": self.options.allow_original_audio_evidence,
         })
@@ -2617,16 +2674,17 @@ class PipelineRunner:
         return "ai_voiceover_main" if tts_success else "ai_voiceover_missing"
 
     def _generate_tts(self, text: str, output_path: Path) -> None:
-        model_path = self.config.resolve_path(self.config.omnivoice.get("model_path"), "models/OmniVoice")
-        ref_audio = self.config.resolve_path(self.config.omnivoice.get("reference_audio"), "tts_ref/664925840_0_13s.mp3")
+        voice_config = self._resolve_voice_config()
+        model_path = self.config.resolve_path(voice_config.get("model_path"), "models/OmniVoice")
+        ref_audio = self.config.resolve_path(voice_config.get("reference_audio"), "tts_ref/664925840_0_13s.mp3")
         result = generate_omnivoice_audio(
             text=text,
             output_path=output_path,
             model_path=model_path or "",
             reference_audio=ref_audio or "",
-            reference_text=self.config.omnivoice.get("reference_text", ""),
+            reference_text=voice_config.get("reference_text", ""),
             keep_model_loaded=False,
-            speed=self.config.omnivoice.get("speed"),
+            speed=voice_config.get("speed"),
         )
         if result.status != "success":
             raise RuntimeError(f"OmniVoice 生成失败: {result.error}")
@@ -2893,6 +2951,7 @@ def parse_args(argv: list[str] | None = None) -> RunOptions:
     parser.add_argument("--allow-long-video", action="store_true", default=bool(default_config.short_video.get("allow_long_video_default", False)))
     parser.add_argument("--require-tts", action="store_true", default=bool(default_config.voiceover.get("tts_required_by_default", True)))
     parser.add_argument("--no-require-tts", action="store_false", dest="require_tts")
+    parser.add_argument("--voice-id", help="选择服务端内置音色 ID")
     parser.add_argument("--audio-policy", choices=["ai_voiceover", "original", "mixed"], default="ai_voiceover")
     parser.add_argument("--allow-original-audio-evidence", action="store_true")
     parser.add_argument("--production-mode", choices=["ai_voiceover", "highlight_reassembly"], default="ai_voiceover")

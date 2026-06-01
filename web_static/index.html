@@ -20,7 +20,7 @@
 
         <section class="side-section">
           <div class="section-title">
-            <span>视频素材</span>
+            <span>本地素材</span>
             <div class="section-actions">
               <button class="icon-button" id="uploadVideo" title="上传视频素材"><i data-lucide="upload"></i></button>
               <button class="icon-button" id="refreshVideos" title="刷新素材"><i data-lucide="refresh-cw"></i></button>
@@ -191,6 +191,16 @@
                     <option value="false">允许跳过</option>
                   </select>
                 </label>
+                <label id="voiceSelectWrap" class="select-like">
+                  <span>配音音色</span>
+                  <select id="voiceSelect">
+                    <option value="">默认音色</option>
+                  </select>
+                </label>
+                <button id="previewVoice" class="mini-button voice-preview-button" type="button">
+                  试听音色
+                </button>
+                <audio id="voicePreviewAudio" preload="none"></audio>
                 <label id="reassemblyOutputModeWrap" class="hidden">
                   <span>重组方式</span>
                   <select id="reassemblyOutputMode">

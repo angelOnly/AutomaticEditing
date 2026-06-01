@@ -38,6 +38,19 @@ model_path = "E:\\ai\\skills\\AutomaticEditing\\models\\OmniVoice"
 reference_audio = "E:\\ai\\skills\\AutomaticEditing\\tts_ref\\664925840_0_13s.mp3"
 reference_text = "问一下啊，今天所有来到我直播间，宝贝现在不要离开直播间。因为身上这个小黑裙是你们家衣柜里没有过的类型，没有过的风格。我知道宝贝，你们家都有裙子，夏天谁家没有小裙子，对不对？"
 speed = 0.85
+default_voice_id = "default_female"
+
+[voices.default_female]
+id = "default_female"
+name = "默认女声"
+description = "当前系统默认参考音色，适合通用新闻解说"
+style = "news"
+gender = "female"
+reference_audio = "tts_ref/664925840_0_13s.mp3"
+reference_text = "问一下啊，今天所有来到我直播间，宝贝现在不要离开直播间。因为身上这个小黑裙是你们家衣柜里没有过的类型，没有过的风格。我知道宝贝，你们家都有裙子，夏天谁家没有小裙子，对不对？"
+preview_audio = "tts_ref/664925840_0_13s.mp3"
+speed = 0.85
+enabled = true
 
 # 音频转文字
 [funasr]
@@ -143,20 +156,21 @@ same_task_policy = "reject"
 [remote_ucms]
 enabled = true
 api_url = "https://ucms.ifeng.com/api/ve/list"
-default_record_station = "流项目高清卫星-凤凰咨询台"
+default_record_station = "浦项高清卫星-凤凰咨询台"
 default_page_size = 30
 request_timeout_seconds = 20
 connect_timeout_seconds = 5
+station_count_timeout_seconds = 5
 cache_dir = "data/remote_videos"
 prefer_quality = "high"
 record_stations = [
-  "流项目专线-凤凰咨询台",
-  "流项目高清卫星-凤凰咨询台",
+  "浦项专线-凤凰咨询台",
+  "浦项高清卫星-凤凰咨询台",
   "资讯台高清卫星",
   "资讯台高清",
   "bak资讯台高清卫星",
   "bak资讯台高清",
-  "流项目高清卫星-凤凰资讯台Backup",
+  "浦项高清卫星-凤凰资讯台-Backup",
 ]
 
 [remote_ucms.headers]

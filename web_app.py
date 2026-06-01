@@ -8,6 +8,7 @@ import subprocess
 import sys
 import uuid
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from threading import RLock
@@ -20,6 +21,7 @@ from pydantic import BaseModel, Field
 
 from newsclip_agent.config import load_config
 from newsclip_agent.remote_ucms import (
+    count_ucms_videos,
     download_ucms_video,
     list_ucms_videos,
     load_remote_ucms_config,
@@ -45,10 +47,18 @@ WORKFLOW_DEFAULTS = PROJECT_CONFIG.workflow
 SHORT_VIDEO_DEFAULTS = PROJECT_CONFIG.short_video
 VOICEOVER_DEFAULTS = PROJECT_CONFIG.voiceover
 REMOTE_UCMS_CONFIG = load_remote_ucms_config(PROJECT_CONFIG)
+REMOTE_STATION_COUNTS: dict[str, int] = {}
+REMOTE_STATION_COUNT_ERRORS: dict[str, str] = {}
+REMOTE_STATION_COUNT_LOCK = RLock()
 WEB_CONCURRENCY = PROJECT_CONFIG.raw.get("web_concurrency", {})
 MAX_RUNNING_JOBS = int(WEB_CONCURRENCY.get("max_running_jobs", 2))
 MAX_PENDING_JOBS = int(WEB_CONCURRENCY.get("max_pending_jobs", 20))
 SAME_TASK_POLICY = str(WEB_CONCURRENCY.get("same_task_policy", "reject"))
+
+
+@app.on_event("startup")
+def preload_remote_station_counts() -> None:
+    _refresh_remote_station_counts()
 
 
 class RunRequest(BaseModel):
@@ -74,6 +84,7 @@ class RunRequest(BaseModel):
     target_duration_mode: str = "fixed"
     allow_long_video: bool = bool(SHORT_VIDEO_DEFAULTS.get("allow_long_video_default", False))
     require_tts: bool = bool(VOICEOVER_DEFAULTS.get("tts_required_by_default", True))
+    voice_id: str | None = None
     audio_policy: str = "ai_voiceover"
     allow_original_audio_evidence: bool = False
     production_mode: str = "ai_voiceover"
@@ -116,9 +127,96 @@ def get_config() -> dict[str, Any]:
         "voiceover": {
             "tts_required_by_default": bool(VOICEOVER_DEFAULTS.get("tts_required_by_default", True)),
             "allow_original_audio_evidence": bool(VOICEOVER_DEFAULTS.get("allow_original_audio_evidence", False)),
+            "default_voice_id": str(PROJECT_CONFIG.omnivoice.get("default_voice_id", "")),
         },
-        "remote_ucms": remote_ucms_public_config(REMOTE_UCMS_CONFIG),
+        "voices": _public_voice_catalog(),
+        "remote_ucms": remote_ucms_public_config(
+            REMOTE_UCMS_CONFIG,
+            station_counts=_remote_station_counts_snapshot(),
+            station_count_errors=_remote_station_count_errors_snapshot(),
+        ),
     }
+
+
+def _voice_catalog() -> dict[str, dict[str, Any]]:
+    voices = PROJECT_CONFIG.raw.get("voices", {})
+    if not isinstance(voices, dict):
+        voices = {}
+
+    catalog: dict[str, dict[str, Any]] = {}
+    for key, item in voices.items():
+        if not isinstance(item, dict):
+            continue
+        voice_id = str(item.get("id") or key).strip()
+        if not voice_id or item.get("enabled") is False:
+            continue
+        catalog[voice_id] = {
+            "id": voice_id,
+            "name": str(item.get("name") or voice_id),
+            "description": str(item.get("description") or ""),
+            "style": str(item.get("style") or ""),
+            "gender": str(item.get("gender") or ""),
+            "reference_audio": str(item.get("reference_audio") or ""),
+            "reference_text": str(item.get("reference_text") or ""),
+            "preview_audio": str(item.get("preview_audio") or item.get("reference_audio") or ""),
+            "speed": item.get("speed"),
+        }
+
+    if not catalog:
+        default_id = str(PROJECT_CONFIG.omnivoice.get("default_voice_id") or "default")
+        catalog[default_id] = {
+            "id": default_id,
+            "name": "默认音色",
+            "description": "来自 [omnivoice] 默认参考音频",
+            "style": "default",
+            "gender": "",
+            "reference_audio": str(PROJECT_CONFIG.omnivoice.get("reference_audio") or ""),
+            "reference_text": str(PROJECT_CONFIG.omnivoice.get("reference_text") or ""),
+            "preview_audio": str(PROJECT_CONFIG.omnivoice.get("reference_audio") or ""),
+            "speed": PROJECT_CONFIG.omnivoice.get("speed"),
+        }
+
+    return catalog
+
+
+def _public_voice_catalog() -> list[dict[str, Any]]:
+    default_voice_id = str(PROJECT_CONFIG.omnivoice.get("default_voice_id") or "")
+    return [
+        {
+            "id": voice["id"],
+            "name": voice["name"],
+            "description": voice["description"],
+            "style": voice["style"],
+            "gender": voice["gender"],
+            "preview_url": f"/api/voices/{voice['id']}/preview",
+            "is_default": bool(default_voice_id and voice["id"] == default_voice_id),
+        }
+        for voice in _voice_catalog().values()
+    ]
+
+
+@app.get("/api/voices")
+def list_voices() -> list[dict[str, Any]]:
+    return _public_voice_catalog()
+
+
+@app.get("/api/voices/{voice_id}/preview")
+def preview_voice(voice_id: str) -> FileResponse:
+    voice = _voice_catalog().get(voice_id)
+    if not voice:
+        raise HTTPException(404, "voice not found")
+    preview = voice.get("preview_audio") or voice.get("reference_audio")
+    if not preview:
+        raise HTTPException(404, "voice preview audio missing")
+    path = PROJECT_CONFIG.resolve_path(str(preview))
+    if not path or not path.exists() or not path.is_file():
+        raise HTTPException(404, "voice preview file not found")
+
+    root = ROOT.resolve()
+    resolved = path.resolve()
+    if root != resolved and root not in resolved.parents:
+        raise HTTPException(400, "voice preview must be inside project directory")
+    return FileResponse(str(resolved))
 
 
 @app.get("/api/remote-videos")
@@ -128,12 +226,19 @@ def list_remote_videos(
     page_size: int | None = None,
 ) -> dict[str, Any]:
     try:
-        return list_ucms_videos(
+        result = list_ucms_videos(
             REMOTE_UCMS_CONFIG,
             record_station=record_station,
             current=current,
             page_size=page_size,
         )
+        station = record_station or REMOTE_UCMS_CONFIG.default_record_station
+        total = result.get("pagination", {}).get("total")
+        if station and total is not None:
+            _set_remote_station_count(station, int(total))
+        result["station_counts"] = _remote_station_counts_snapshot()
+        result["station_count_errors"] = _remote_station_count_errors_snapshot()
+        return result
     except Exception as exc:
         raise HTTPException(502, f"remote video list failed: {exc}") from exc
 
@@ -152,6 +257,58 @@ def download_remote_video(payload: dict[str, Any]) -> dict[str, Any]:
         )
     except Exception as exc:
         raise HTTPException(502, f"remote video download failed: {exc}") from exc
+
+
+def _refresh_remote_station_counts() -> None:
+    stations = _configured_remote_stations()
+    if not REMOTE_UCMS_CONFIG.enabled or not stations:
+        return
+    counts: dict[str, int] = {}
+    errors: dict[str, str] = {}
+    max_workers = min(4, len(stations))
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {
+            pool.submit(count_ucms_videos, REMOTE_UCMS_CONFIG, record_station=station): station
+            for station in stations
+        }
+        for future in as_completed(futures):
+            station = futures[future]
+            try:
+                counts[station] = int(future.result())
+            except Exception as exc:
+                errors[station] = str(exc)
+    with REMOTE_STATION_COUNT_LOCK:
+        REMOTE_STATION_COUNTS.clear()
+        REMOTE_STATION_COUNTS.update(counts)
+        REMOTE_STATION_COUNT_ERRORS.clear()
+        REMOTE_STATION_COUNT_ERRORS.update(errors)
+
+
+def _configured_remote_stations() -> list[str]:
+    seen: set[str] = set()
+    stations = []
+    for station in [REMOTE_UCMS_CONFIG.default_record_station, *REMOTE_UCMS_CONFIG.record_stations]:
+        station = str(station or "").strip()
+        if station and station not in seen:
+            stations.append(station)
+            seen.add(station)
+    return stations
+
+
+def _set_remote_station_count(station: str, count: int) -> None:
+    with REMOTE_STATION_COUNT_LOCK:
+        REMOTE_STATION_COUNTS[station] = count
+        REMOTE_STATION_COUNT_ERRORS.pop(station, None)
+
+
+def _remote_station_counts_snapshot() -> dict[str, int]:
+    with REMOTE_STATION_COUNT_LOCK:
+        return dict(REMOTE_STATION_COUNTS)
+
+
+def _remote_station_count_errors_snapshot() -> dict[str, str]:
+    with REMOTE_STATION_COUNT_LOCK:
+        return dict(REMOTE_STATION_COUNT_ERRORS)
 
 
 @app.get("/api/videos")
@@ -462,6 +619,8 @@ def _build_run_command(req: RunRequest, task_id: str, input_path: Path | None = 
         "--production-mode",
         req.production_mode,
     ]
+    if req.voice_id:
+        cmd.extend(["--voice-id", req.voice_id])
     if req.production_mode == "highlight_reassembly":
         cmd.extend(["--reassembly-output-mode", req.reassembly_output_mode])
         cmd.extend(["--reassembly-sort-mode", req.reassembly_sort_mode])
