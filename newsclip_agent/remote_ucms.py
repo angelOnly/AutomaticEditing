@@ -88,56 +88,32 @@ def list_ucms_videos(
     if not cfg.enabled:
         return _empty_response(page, size, cfg)
 
-    station = record_station or cfg.default_record_station
-    payload = {
-        "body": {
-            "query": [
-                {"key": "from", "type": "=", "value": "record"},
-                {"key": "record_station", "type": "=", "value": station},
-            ],
-            "pagination": {"current": page, "pageSize": size},
-        }
+    raw = _query_ucms(cfg, record_station or cfg.default_record_station, current=page, page_size=size, timeout=cfg.request_timeout_seconds)
+    data = _response_data(raw)
+    raw_items = _response_items(data)
+    pagination = _response_pagination(data, page, size, len(raw_items))
+    return {
+        "items": [
+            normalize_ucms_item(item, prefer_quality=cfg.prefer_quality)
+            for item in raw_items
+            if isinstance(item, dict)
+        ],
+        "pagination": pagination,
+        "record_stations": cfg.record_stations,
+        "default_record_station": cfg.default_record_station,
     }
 
 
 def count_ucms_videos(cfg: RemoteVideoSourceConfig, *, record_station: str) -> int:
     if not cfg.enabled:
         return 0
-    payload = {
-        "body": {
-            "query": [
-                {"key": "from", "type": "=", "value": "record"},
-                {"key": "record_station", "type": "=", "value": record_station},
-            ],
-            "pagination": {"current": 1, "pageSize": 1},
-        }
-    }
-    raw = _post_json(cfg.api_url, payload, headers=cfg.headers, timeout=cfg.station_count_timeout_seconds)
-    if int(raw.get("code", 0) or 0) not in {0, 200}:
-        raise RuntimeError(f"UCMS interface returned an error: {raw.get('message') or raw}")
-    data = raw.get("data") or {}
+    raw = _query_ucms(cfg, record_station, current=1, page_size=1, timeout=cfg.station_count_timeout_seconds)
+    data = _response_data(raw)
     pagination = data.get("pagination") or data.get("page") or {}
     total = pagination.get("total", data.get("total"))
     if total is not None:
         return int(total)
-    return len(data.get("list") or data.get("records") or data.get("items") or [])
-    raw = _post_json(cfg.api_url, payload, headers=cfg.headers, timeout=cfg.request_timeout_seconds)
-    if int(raw.get("code", 0) or 0) not in {0, 200}:
-        raise RuntimeError(f"UCMS interface returned an error: {raw.get('message') or raw}")
-
-    data = raw.get("data") or {}
-    raw_items = data.get("list") or data.get("records") or data.get("items") or []
-    pagination = data.get("pagination") or data.get("page") or {}
-    if "total" not in pagination:
-        pagination["total"] = data.get("total") or len(raw_items)
-    pagination.setdefault("current", page)
-    pagination.setdefault("pageSize", size)
-    return {
-        "items": [normalize_ucms_item(item, prefer_quality=cfg.prefer_quality) for item in raw_items],
-        "pagination": pagination,
-        "record_stations": cfg.record_stations,
-        "default_record_station": cfg.default_record_station,
-    }
+    return len(_response_items(data))
 
 
 def normalize_ucms_item(item: dict[str, Any], *, prefer_quality: str = "high") -> dict[str, Any]:
@@ -230,6 +206,52 @@ def download_ucms_video(
     }
 
 
+def _query_ucms(
+    cfg: RemoteVideoSourceConfig,
+    record_station: str,
+    *,
+    current: int,
+    page_size: int,
+    timeout: int,
+) -> dict[str, Any]:
+    payload = {
+        "body": {
+            "query": [
+                {"key": "from", "type": "=", "value": "record"},
+                {"key": "record_station", "type": "=", "value": record_station},
+            ],
+            "pagination": {"current": int(current), "pageSize": int(page_size)},
+        }
+    }
+    raw = _post_json(cfg.api_url, payload, headers=cfg.headers, timeout=timeout)
+    if not isinstance(raw, dict):
+        raise RuntimeError(f"UCMS returned non-object response: {type(raw).__name__}")
+    if int(raw.get("code", 0) or 0) not in {0, 200}:
+        raise RuntimeError(f"UCMS interface returned an error: {raw.get('message') or raw}")
+    return raw
+
+
+def _response_data(raw: dict[str, Any]) -> dict[str, Any]:
+    data = raw.get("data") or {}
+    return data if isinstance(data, dict) else {}
+
+
+def _response_items(data: dict[str, Any]) -> list[Any]:
+    items = data.get("list") or data.get("records") or data.get("items") or []
+    return items if isinstance(items, list) else []
+
+
+def _response_pagination(data: dict[str, Any], current: int, page_size: int, item_count: int) -> dict[str, Any]:
+    pagination = data.get("pagination") or data.get("page") or {}
+    if not isinstance(pagination, dict):
+        pagination = {}
+    if "total" not in pagination:
+        pagination["total"] = data.get("total") or item_count
+    pagination.setdefault("current", current)
+    pagination.setdefault("pageSize", page_size)
+    return pagination
+
+
 def _empty_response(current: int, page_size: int, cfg: RemoteVideoSourceConfig) -> dict[str, Any]:
     return {
         "items": [],
@@ -239,7 +261,7 @@ def _empty_response(current: int, page_size: int, cfg: RemoteVideoSourceConfig) 
     }
 
 
-def _post_json(url: str, payload: dict[str, Any], *, headers: dict[str, str], timeout: int) -> dict[str, Any]:
+def _post_json(url: str, payload: dict[str, Any], *, headers: dict[str, str], timeout: int) -> Any:
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
         url,
