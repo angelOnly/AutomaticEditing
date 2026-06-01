@@ -1,0 +1,295 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>凤凰智剪</title>
+    <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
+    <link rel="stylesheet" href="/static/styles.css?v=20260528_1120" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark">F</div>
+          <div>
+            <h1>凤凰智剪</h1>
+            <p>断点续跑 · 高光识别 · 程序导出</p>
+          </div>
+        </div>
+
+        <section class="side-section">
+          <div class="section-title">
+            <span>视频素材</span>
+            <div class="section-actions">
+              <button class="icon-button" id="uploadVideo" title="上传视频素材"><i data-lucide="upload"></i></button>
+              <button class="icon-button" id="refreshVideos" title="刷新素材"><i data-lucide="refresh-cw"></i></button>
+            </div>
+          </div>
+          <input id="videoUploadInput" class="sr-only" type="file" accept="video/mp4,video/quicktime,video/x-matroska,video/x-m4v,video/x-msvideo" />
+          <div id="videoList" class="list"></div>
+        </section>
+
+        <section class="side-section">
+          <div class="section-title">
+            <span>任务队列</span>
+            <button class="icon-button" id="refreshTasks" title="刷新任务"><i data-lucide="refresh-cw"></i></button>
+          </div>
+          <div id="taskList" class="list"></div>
+        </section>
+      </aside>
+
+      <main class="workspace">
+        <header class="topbar">
+          <div>
+            <div class="eyebrow">PHOENIX NEWSCLIP AGENT</div>
+            <h2 id="activeTitle">请选择视频或任务</h2>
+            <p id="taskSubtitle" class="task-subtitle">任务 ID：等待选择视频后自动生成</p>
+          </div>
+          <div class="top-actions">
+            <button id="refreshAll" class="button secondary"><i data-lucide="rotate-cw"></i><span>刷新</span></button>
+            <button id="runSelected" class="button primary"><i data-lucide="play"></i><span>开始分析</span></button>
+          </div>
+        </header>
+
+        <section class="summary-grid" aria-label="任务状态概览">
+          <div class="metric progress-panel">
+            <div>
+              <span>当前运行进度</span>
+              <strong id="progressLabel">-</strong>
+              <small id="progressBreakdown">成功 0 · 跳过 0 · 失败 0</small>
+            </div>
+            <div class="progress-ring" id="progressRing"><strong id="progressPercent">0%</strong></div>
+            <div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+              <div id="progressFill" class="progress-fill"></div>
+            </div>
+          </div>
+
+          <div class="metric">
+            <span>运行状态</span>
+            <strong id="metricJob">空闲</strong>
+            <small>任务执行状态</small>
+          </div>
+          <div class="metric">
+            <span>画面比例</span>
+            <strong id="metricAspect">16:9</strong>
+            <small>横版新闻视频</small>
+          </div>
+          <div class="metric">
+            <span>当前步骤</span>
+            <strong id="metricCurrentStep">-</strong>
+            <small id="metricSteps">-</small>
+          </div>
+        </section>
+
+        <section id="actionRequiredBanner" class="action-required hidden">
+          <div>
+            <strong id="actionRequiredTitle">需要确认</strong>
+            <p id="actionRequiredText"></p>
+            <div id="actionRequiredFiles" class="review-links"></div>
+          </div>
+          <button id="confirmLongVideo" class="button primary"><i data-lucide="check-circle"></i><span>同意生成长版</span></button>
+        </section>
+
+        <section class="main-grid">
+          <div class="left-stack">
+            <section class="panel params-panel">
+              <div class="panel-header">
+                <div>
+                  <h3>任务参数</h3>
+                  <p>常用参数直接展示，高级参数保留在下方，避免启动前输入过载。</p>
+                </div>
+                <span class="pill">高级参数</span>
+              </div>
+
+              <div class="mode-picker" aria-label="生产模式">
+                <div>
+                  <span>生产模式</span>
+                </div>
+                <div class="mode-options">
+                  <button class="mode-option active" type="button" data-production-mode="ai_voiceover">
+                    <span>AI配音解说</span>
+                    <small>自动分析、写稿、配音、字幕和粗剪</small>
+                  </button>
+                  <button class="mode-option" type="button" data-production-mode="highlight_reassembly">
+                    <span>视频重组</span>
+                    <small>保留原声，按新闻逻辑重组高光片段</small>
+                  </button>
+                </div>
+              </div>
+
+              <div class="control-strip">
+                <label class="visually-hidden-control">
+                  <span>内部编号</span>
+                  <input id="taskIdInput" placeholder="留空自动生成" />
+                </label>
+                <label class="visually-hidden-control">
+                  <span>生产模式</span>
+                  <select id="productionMode">
+                    <option value="ai_voiceover" selected>AI 配音解说视频</option>
+                    <option value="highlight_reassembly">高光片段原声重组</option>
+                  </select>
+                </label>
+                <label class="visually-hidden-control">
+                  <span>运行范围</span>
+                  <select id="runMode">
+                    <option value="all" selected>完整流程：分析 → 配音字幕 → 粗剪视频</option>
+                    <option value="only_analysis">分步 1：只做内容分析</option>
+                    <option value="skip_render">分步 2：继续生成配音字幕</option>
+                    <option value="render_only">分步 3：继续生成粗剪视频</option>
+                  </select>
+                </label>
+                <label>
+                  <span>画面比例</span>
+                  <select id="aspectRatio">
+                    <option value="16:9" selected>16:9</option>
+                    <option value="9:16">9:16</option>
+                  </select>
+                </label>
+                <label class="visually-hidden-control">
+                  <span>内部时长参数</span>
+                  <input id="targetDuration" type="number" min="20" max="90" value="30" />
+                </label>
+                <label>
+                  <span>Chunk 秒数</span>
+                  <input id="chunkSeconds" type="number" min="10" max="300" value="60" />
+                </label>
+                <label>
+                  <span>抽帧间隔</span>
+                  <input id="frameInterval" type="number" min="1" max="30" value="5" />
+                </label>
+                <label class="select-like">
+                  <span>允许详述</span>
+                  <select id="allowLongVideoSelect">
+                    <option value="true">最长 60 秒</option>
+                    <option value="false">严格控制</option>
+                  </select>
+                </label>
+                <label class="select-like">
+                  <span>TTS</span>
+                  <select id="requireTtsSelect">
+                    <option value="true">必须成功</option>
+                    <option value="false">允许跳过</option>
+                  </select>
+                </label>
+                <label id="reassemblyOutputModeWrap" class="hidden">
+                  <span>重组方式</span>
+                  <select id="reassemblyOutputMode">
+                    <option value="single" selected>单条综合片</option>
+                    <option value="multiple">多条拆分片</option>
+                    <option value="clips">单片段预览</option>
+                  </select>
+                </label>
+                <label id="reassemblySortModeWrap" class="hidden">
+                  <span>排序方式</span>
+                  <select id="reassemblySortMode">
+                    <option value="editorial" selected>新闻逻辑优先</option>
+                    <option value="source_order">保持原始顺序</option>
+                    <option value="score">按高光评分</option>
+                  </select>
+                </label>
+                <label id="reassemblyMaxClipCountWrap" class="hidden">
+                  <span>最多片段数</span>
+                  <input id="reassemblyMaxClipCount" type="number" min="1" max="20" value="8" />
+                </label>
+                <label class="hidden">
+                  <span>音轨策略</span>
+                  <select id="audioPolicy" disabled>
+                    <option value="ai_voiceover" selected>AI 配音，不播放原声</option>
+                    <option value="original">保留原视频原声</option>
+                  </select>
+                </label>
+                <label class="inline-option hidden">
+                  <input id="allowOriginalAudioEvidence" type="checkbox" />
+                  <span>允许证据原声</span>
+                </label>
+                <label class="inline-option visually-hidden-control">
+                  <input id="allowLongVideo" type="checkbox" />
+                  <span>允许讲清楚（最长 60 秒）</span>
+                </label>
+                <label class="inline-option visually-hidden-control">
+                  <input id="requireTts" type="checkbox" checked />
+                  <span>TTS 必须成功</span>
+                </label>
+              </div>
+            </section>
+
+            <section class="panel timeline-panel">
+              <div class="panel-header">
+                <div>
+                  <h3>AI 处理流程</h3>
+                  <p>优先呈现步骤状态，路径和错误信息放在步骤详情里。</p>
+                </div>
+                <div class="panel-actions">
+                  <select id="rerunStep"></select>
+                  <input id="chunkInput" class="visually-hidden-control" placeholder="仅重跑 vision 时可填写 chunk_0007" />
+                  <button id="rerunOne" class="button secondary"><i data-lucide="repeat-2"></i><span>重跑步骤</span></button>
+                  <button id="rerunFrom" class="button secondary"><i data-lucide="corner-down-right"></i><span>从此步后续</span></button>
+                </div>
+              </div>
+              <div id="stepTable" class="pipeline"></div>
+            </section>
+          </div>
+
+          <aside class="right-stack">
+            <section class="panel preview-panel">
+              <div class="panel-header">
+                <div>
+                  <h3>视频预览</h3>
+                  <p>这里保留“最新成片”和“原片”，聚焦最终检查。</p>
+                </div>
+                <div class="segmented-actions">
+                  <button id="openDraft" class="active">最新成片</button>
+                  <button id="openSource">原片</button>
+                </div>
+              </div>
+              <video id="videoPreview" controls poster=""></video>
+              <div class="draft-box">
+                <div class="draft-title">成片列表</div>
+                <div id="draftList" class="draft-list">当前任务还没有生成粗剪视频。</div>
+              </div>
+            </section>
+
+            <section class="panel">
+              <div class="panel-header">
+                <div>
+                  <h3>输出产物</h3>
+                  <p>普通用户看结果，开发人员再展开路径。</p>
+                </div>
+                <button id="refreshTree" class="button secondary"><i data-lucide="folder-search"></i><span>刷新</span></button>
+              </div>
+              <div id="fileList" class="file-list"></div>
+            </section>
+
+            <section class="panel">
+              <div class="panel-header">
+                <div>
+                  <h3>文件内容</h3>
+                  <p>选择输出产物后在这里查看。</p>
+                </div>
+                <button id="copyViewer" class="button secondary"><i data-lucide="copy"></i><span>复制</span></button>
+              </div>
+              <pre id="fileViewer" class="viewer">选择左侧任务或文件后显示内容。</pre>
+            </section>
+
+            <section class="panel log-panel">
+              <div class="panel-header">
+                <div>
+                  <h3>运行日志</h3>
+                  <p>需要调试时再查看底层日志。</p>
+                </div>
+                <button id="refreshLog" class="button secondary"><i data-lucide="scroll-text"></i><span>刷新日志</span></button>
+              </div>
+              <div id="jobMessage" class="job-message hidden"></div>
+              <pre id="logViewer" class="log-viewer">暂无运行日志。</pre>
+            </section>
+          </aside>
+        </section>
+
+        <div id="metricIssues" class="sr-only">-</div>
+      </main>
+    </div>
+
+    <script src="/static/app.js?v=20260528_1225"></script>
+  </body>
+</html>

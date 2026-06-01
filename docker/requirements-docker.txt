@@ -1,0 +1,45 @@
+# Linux Docker runtime dependencies for this service.
+# The original conda env `comfy_5090_313_auto` is a Windows Python 3.13 env and
+# contains Windows-only wheels/local file URLs, so the Docker build uses this
+# portable Linux subset plus the source tree and local model files.
+
+fastapi==0.128.0
+uvicorn[standard]==0.44.0
+pydantic==2.9.2
+python-multipart==0.0.24
+
+openai==2.16.0
+dashscope==1.25.16
+volcengine-python-sdk==5.0.22
+json-repair==0.55.1
+
+numpy==2.3.5
+pillow==10.4.0
+opencv-python-headless==4.13.0.90
+moviepy==2.1.1
+imageio==2.37.2
+imageio-ffmpeg==0.6.0
+pydub==0.25.1
+pysrt==1.1.2
+soundfile==0.13.1
+librosa==0.10.2
+
+torch==2.9.1
+torchaudio==2.9.1
+torchvision==0.24.1
+transformers==5.3.0
+accelerate==1.13.0
+tensorboardX==2.6.5
+webdataset==1.0.2
+omnivoice==0.1.3
+
+funasr==1.3.1
+modelscope==1.17.1
+sentencepiece==0.2.1
+kaldiio==2.18.1
+torch-complex==0.4.4
+
+loguru==0.7.3
+edge-tts==7.2.7
+requests==2.32.5
+toml==0.10.2

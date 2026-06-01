@@ -1,0 +1,919 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Phoenix Newsclip Agent - 凤凰 SaaS 工作台</title>
+  <style>
+    :root {
+      --bg: #f3f4f6;
+      --panel: #ffffff;
+      --panel-soft: #f9fafb;
+      --text: #172033;
+      --muted: #64748b;
+      --line: #dfe3ea;
+      --brand: #a61d2a;
+      --brand-dark: #7f1620;
+      --brand-soft: rgba(166, 29, 42, 0.08);
+      --green: #16a34a;
+      --green-soft: rgba(22, 163, 74, 0.1);
+      --blue: #2563eb;
+      --orange: #d97706;
+      --sidebar: #151923;
+      --sidebar-soft: #1f2633;
+      --sidebar-text: #f4f4f5;
+      --sidebar-muted: #a1a1aa;
+      --shadow: 0 12px 30px rgba(17, 24, 39, 0.09);
+      --radius: 16px;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", Arial, sans-serif;
+    }
+
+    button,
+    input,
+    select {
+      font-family: inherit;
+    }
+
+    .shell {
+      min-height: 100vh;
+      display: grid;
+      grid-template-columns: 280px minmax(0, 1fr);
+    }
+
+    .sidebar {
+      background: var(--sidebar);
+      color: var(--sidebar-text);
+      padding: 18px 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 18px;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 2px 2px 16px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    }
+
+    .brand-mark {
+      width: 38px;
+      height: 38px;
+      border-radius: 9px;
+      background: var(--brand);
+      display: grid;
+      place-items: center;
+      font-weight: 900;
+      color: #fff;
+      box-shadow: 0 10px 18px rgba(166, 29, 42, 0.26);
+    }
+
+    .brand-title {
+      font-size: 16px;
+      font-weight: 850;
+      letter-spacing: 0.02em;
+    }
+
+    .brand-sub {
+      margin-top: 2px;
+      color: var(--sidebar-muted);
+      font-size: 12px;
+    }
+
+    .side-section {
+      display: flex;
+      flex-direction: column;
+      gap: 9px;
+    }
+
+    .side-head {
+      margin: 0 2px 2px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      color: var(--sidebar-muted);
+      font-size: 13px;
+    }
+
+    .side-refresh {
+      height: 30px;
+      padding: 0 9px;
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: 8px;
+      color: var(--sidebar-text);
+      background: rgba(255, 255, 255, 0.04);
+      cursor: pointer;
+    }
+
+    .side-card {
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      background: rgba(255, 255, 255, 0.045);
+      border-radius: 12px;
+      padding: 11px 12px;
+      cursor: pointer;
+      transition: 0.16s ease;
+    }
+
+    .side-card:hover {
+      background: rgba(255, 255, 255, 0.075);
+    }
+
+    .side-card.active {
+      border-color: rgba(239, 68, 68, 0.7);
+      background: rgba(166, 29, 42, 0.18);
+    }
+
+    .side-title {
+      font-size: 13px;
+      font-weight: 750;
+      line-height: 1.35;
+    }
+
+    .side-meta {
+      margin-top: 5px;
+      color: var(--sidebar-muted);
+      font-size: 12px;
+      line-height: 1.35;
+    }
+
+    .main {
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      background: rgba(243, 244, 246, 0.88);
+      backdrop-filter: blur(14px);
+      border-bottom: 1px solid var(--line);
+      padding: 16px 22px;
+    }
+
+    .top-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 18px;
+    }
+
+    .eyebrow {
+      color: var(--brand);
+      font-size: 12px;
+      font-weight: 900;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }
+
+    h1 {
+      margin: 4px 0 0;
+      font-size: 21px;
+      line-height: 1.28;
+      letter-spacing: -0.01em;
+    }
+
+    .top-actions {
+      display: flex;
+      gap: 9px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+
+    .btn {
+      border: 1px solid var(--line);
+      background: var(--panel);
+      color: var(--text);
+      border-radius: 10px;
+      padding: 9px 13px;
+      font-size: 13px;
+      cursor: pointer;
+      box-shadow: 0 1px 2px rgba(0, 0, 0, 0.03);
+    }
+
+    .btn.primary {
+      background: var(--brand);
+      color: #fff;
+      border-color: var(--brand);
+    }
+
+    .btn.primary:hover {
+      background: var(--brand-dark);
+    }
+
+    .content {
+      padding: 18px 22px 28px;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 480px;
+      gap: 18px;
+    }
+
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+    }
+
+    .summary {
+      grid-column: 1 / -1;
+      display: grid;
+      grid-template-columns: 1.2fr repeat(4, minmax(120px, 0.55fr));
+      gap: 12px;
+    }
+
+    .metric {
+      padding: 15px 16px;
+    }
+
+    .metric-label {
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .metric-value {
+      margin-top: 6px;
+      font-size: 22px;
+      font-weight: 850;
+      line-height: 1.1;
+    }
+
+    .metric-sub {
+      margin-top: 6px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .metric-main {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 14px;
+    }
+
+    .ring {
+      width: 66px;
+      height: 66px;
+      border-radius: 999px;
+      background: conic-gradient(var(--brand) 0 25%, var(--line) 25% 100%);
+      display: grid;
+      place-items: center;
+      flex: 0 0 auto;
+    }
+
+    .ring::after {
+      content: "25%";
+      width: 50px;
+      height: 50px;
+      border-radius: 999px;
+      background: var(--panel);
+      color: var(--brand);
+      display: grid;
+      place-items: center;
+      font-size: 14px;
+      font-weight: 900;
+    }
+
+    .left-stack,
+    .right-stack {
+      display: grid;
+      gap: 18px;
+      align-content: start;
+    }
+
+    .card-head {
+      padding: 16px 18px 10px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .card-title {
+      font-size: 15px;
+      font-weight: 850;
+    }
+
+    .card-sub {
+      margin-top: 3px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
+    }
+
+    .config-grid {
+      padding: 8px 18px 18px;
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 11px;
+    }
+
+    .field label {
+      display: block;
+      margin-bottom: 6px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .field input,
+    .field select {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 10px 10px;
+      background: var(--panel-soft);
+      color: var(--text);
+      outline: none;
+    }
+
+    .field input:focus,
+    .field select:focus {
+      border-color: rgba(166, 29, 42, 0.4);
+      box-shadow: 0 0 0 3px rgba(166, 29, 42, 0.08);
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      border-radius: 999px;
+      padding: 5px 9px;
+      font-size: 12px;
+      border: 1px solid var(--line);
+      color: var(--muted);
+      background: var(--panel);
+      white-space: nowrap;
+    }
+
+    .badge.running {
+      color: var(--brand);
+      background: var(--brand-soft);
+      border-color: rgba(166, 29, 42, 0.16);
+    }
+
+    .badge.done {
+      color: var(--green);
+      background: var(--green-soft);
+      border-color: rgba(22, 163, 74, 0.18);
+    }
+
+    .pipeline {
+      padding: 8px 14px 16px;
+      display: grid;
+      gap: 8px;
+    }
+
+    .step {
+      display: grid;
+      grid-template-columns: 34px minmax(0, 1fr) auto;
+      gap: 12px;
+      align-items: center;
+      padding: 12px;
+      border-radius: 12px;
+      border: 1px solid var(--line);
+      background: var(--panel-soft);
+    }
+
+    .step-index {
+      width: 30px;
+      height: 30px;
+      border-radius: 9px;
+      background: #eef2ff;
+      color: var(--blue);
+      display: grid;
+      place-items: center;
+      font-size: 12px;
+      font-weight: 850;
+    }
+
+    .step.done .step-index {
+      background: var(--green-soft);
+      color: var(--green);
+    }
+
+    .step.running {
+      border-color: rgba(166, 29, 42, 0.26);
+      background: var(--brand-soft);
+    }
+
+    .step.running .step-index {
+      background: var(--brand);
+      color: #fff;
+    }
+
+    .step-title {
+      font-size: 14px;
+      font-weight: 760;
+    }
+
+    .step-desc {
+      margin-top: 3px;
+      color: var(--muted);
+      font-size: 12px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .video-card {
+      overflow: hidden;
+    }
+
+    .video-toolbar {
+      padding: 14px 14px 10px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+
+    .seg {
+      display: flex;
+      gap: 6px;
+      padding: 4px;
+      border: 1px solid var(--line);
+      background: var(--panel-soft);
+      border-radius: 11px;
+    }
+
+    .seg button {
+      border: 0;
+      background: transparent;
+      color: var(--muted);
+      padding: 7px 10px;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 12px;
+    }
+
+    .seg button.active {
+      background: var(--brand);
+      color: #fff;
+    }
+
+    .fake-video {
+      margin: 0 14px 14px;
+      aspect-ratio: 16 / 9;
+      border-radius: 14px;
+      overflow: hidden;
+      position: relative;
+      display: grid;
+      place-items: center;
+      color: #fff;
+      background:
+        linear-gradient(0deg, rgba(0, 0, 0, 0.46), rgba(0, 0, 0, 0.1)),
+        radial-gradient(circle at 61% 33%, #d8b39f 0 8%, transparent 18%),
+        radial-gradient(circle at 56% 46%, #1e293b 0 11%, transparent 23%),
+        linear-gradient(135deg, #334155, #cbd5e1 52%, #64748b);
+    }
+
+    .fake-video::before {
+      content: "F";
+      position: absolute;
+      left: 18px;
+      top: 18px;
+      width: 48px;
+      height: 34px;
+      border-radius: 8px;
+      background: rgba(166, 29, 42, 0.92);
+      display: grid;
+      place-items: center;
+      font-weight: 900;
+      letter-spacing: 0.06em;
+    }
+
+    .fake-video::after {
+      content: "日本修订武器三原则  大幅放宽武器出口";
+      position: absolute;
+      left: 18px;
+      right: 18px;
+      bottom: 20px;
+      background: rgba(166, 29, 42, 0.94);
+      border-radius: 9px;
+      padding: 10px 12px;
+      font-weight: 850;
+      letter-spacing: 0.03em;
+      text-align: center;
+    }
+
+    .artifact-list {
+      padding: 0 14px 14px;
+      display: grid;
+      gap: 8px;
+    }
+
+    .artifact {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 11px;
+      border: 1px solid var(--line);
+      background: var(--panel-soft);
+      border-radius: 10px;
+      font-size: 13px;
+    }
+
+    .artifact span:last-child {
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .log {
+      padding: 14px;
+      background: #111827;
+      color: #cbd5e1;
+      border-radius: 0 0 var(--radius) var(--radius);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+      line-height: 1.7;
+      max-height: 178px;
+      overflow: auto;
+    }
+
+    @media (max-width: 1280px) {
+      .shell {
+        grid-template-columns: 240px minmax(0, 1fr);
+      }
+
+      .content {
+        grid-template-columns: 1fr;
+      }
+
+      .right-stack {
+        grid-template-columns: 1fr 1fr;
+      }
+
+      .summary {
+        grid-template-columns: repeat(2, 1fr);
+      }
+    }
+
+    @media (max-width: 860px) {
+      .shell {
+        grid-template-columns: 1fr;
+      }
+
+      .sidebar {
+        display: none;
+      }
+
+      .top-row {
+        align-items: flex-start;
+        flex-direction: column;
+      }
+
+      .top-actions {
+        justify-content: flex-start;
+      }
+
+      .config-grid,
+      .summary,
+      .right-stack {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark">F</div>
+        <div>
+          <div class="brand-title">智能拆条工作台</div>
+          <div class="brand-sub">断点续跑 · 高光识别 · 程序导出</div>
+        </div>
+      </div>
+
+      <section class="side-section">
+        <div class="side-head">
+          <span>视频素材</span>
+          <button class="side-refresh">↻</button>
+        </div>
+
+        <div class="side-card">
+          <div class="side-title">中国一季度劳动力市场平稳.mp4</div>
+          <div class="side-meta">38.82 MB · 2026-04-23 14:02</div>
+        </div>
+
+        <div class="side-card">
+          <div class="side-title">中国工信部一季度工业数据.mp4</div>
+          <div class="side-meta">110.49 MB · 2026-04-23 14:02</div>
+        </div>
+
+        <div class="side-card">
+          <div class="side-title">俄乌战场混乱局势.mp4</div>
+          <div class="side-meta">208.01 MB · 2026-04-23 02:05</div>
+        </div>
+
+        <div class="side-card active">
+          <div class="side-title">日本军费政策调整与武器出口解禁.mp4</div>
+          <div class="side-meta">55.04 MB · 2026-04-23 14:09</div>
+        </div>
+
+        <div class="side-card">
+          <div class="side-title">美伊冲突中局势排兵.mp4</div>
+          <div class="side-meta">596.96 MB · 2026-04-23 14:13</div>
+        </div>
+      </section>
+
+      <section class="side-section">
+        <div class="side-head">
+          <span>任务队列</span>
+          <button class="side-refresh">↻</button>
+        </div>
+
+        <div class="side-card active">
+          <div class="side-title">日本军费政策调整_ai_voiceover</div>
+          <div class="side-meta">running · 25% · 4/16</div>
+        </div>
+
+        <div class="side-card">
+          <div class="side-title">美伊冲突_highlight_reassembly</div>
+          <div class="side-meta">finished · 100%</div>
+        </div>
+      </section>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div class="top-row">
+          <div>
+            <div class="eyebrow">PHOENIX NEWSCLIP AGENT</div>
+            <h1>日本军费政策调整与武器出口解禁_ai_voiceover_20260528_105744</h1>
+          </div>
+
+          <div class="top-actions">
+            <button class="btn">⟳ 刷新</button>
+            <button class="btn">Ⅱ 暂停</button>
+            <button class="btn primary">▶ 开始分析</button>
+          </div>
+        </div>
+      </header>
+
+      <section class="content">
+        <section class="summary">
+          <div class="metric card metric-main">
+            <div>
+              <div class="metric-label">当前运行进度</div>
+              <div class="metric-value">4 / 16</div>
+              <div class="metric-sub">成功 4 · 跳过 0 · 失败 0</div>
+            </div>
+            <div class="ring"></div>
+          </div>
+
+          <div class="metric card">
+            <div class="metric-label">运行状态</div>
+            <div class="metric-value">Running</div>
+            <div class="metric-sub">任务正在执行</div>
+          </div>
+
+          <div class="metric card">
+            <div class="metric-label">目标时长</div>
+            <div class="metric-value">30s</div>
+            <div class="metric-sub">允许详述最长 60 秒</div>
+          </div>
+
+          <div class="metric card">
+            <div class="metric-label">画面比例</div>
+            <div class="metric-value">16:9</div>
+            <div class="metric-sub">横版新闻视频</div>
+          </div>
+
+          <div class="metric card">
+            <div class="metric-label">当前步骤</div>
+            <div class="metric-value">ASR</div>
+            <div class="metric-sub">语音转文字处理中</div>
+          </div>
+        </section>
+
+        <section class="left-stack">
+          <article class="card">
+            <div class="card-head">
+              <div>
+                <div class="card-title">任务参数</div>
+                <div class="card-sub">常用参数直接展示，高级参数后续可折叠，避免顶部输入框过多。</div>
+              </div>
+              <span class="badge">高级参数</span>
+            </div>
+
+            <div class="config-grid">
+              <div class="field">
+                <label>生产模式</label>
+                <select>
+                  <option>AI 配音解说视频</option>
+                </select>
+              </div>
+
+              <div class="field">
+                <label>运行范围</label>
+                <select>
+                  <option>完整流程：分析 → 成片</option>
+                </select>
+              </div>
+
+              <div class="field">
+                <label>画面比例</label>
+                <select>
+                  <option>16:9</option>
+                </select>
+              </div>
+
+              <div class="field">
+                <label>目标时长</label>
+                <input value="30" />
+              </div>
+
+              <div class="field">
+                <label>Chunk 秒数</label>
+                <input value="60" />
+              </div>
+
+              <div class="field">
+                <label>抽帧间隔</label>
+                <input value="10" />
+              </div>
+
+              <div class="field">
+                <label>允许详述</label>
+                <select>
+                  <option>最长 60 秒</option>
+                </select>
+              </div>
+
+              <div class="field">
+                <label>TTS</label>
+                <select>
+                  <option>必须成功</option>
+                </select>
+              </div>
+            </div>
+          </article>
+
+          <article class="card">
+            <div class="card-head">
+              <div>
+                <div class="card-title">AI 处理流程</div>
+                <div class="card-sub">将原来的技术表格改成流程卡片，用户优先看状态，路径信息放在二级详情里。</div>
+              </div>
+              <button class="btn">仅重跑当前步骤</button>
+            </div>
+
+            <div class="pipeline">
+              <div class="step done">
+                <div class="step-index">✓</div>
+                <div>
+                  <div class="step-title">读取视频信息</div>
+                  <div class="step-desc">输出 metadata/1/video_metadata.json</div>
+                </div>
+                <span class="badge done">成功</span>
+              </div>
+
+              <div class="step done">
+                <div class="step-index">✓</div>
+                <div>
+                  <div class="step-title">提取音频</div>
+                  <div class="step-desc">输出 preprocess/audio/1/audio.wav</div>
+                </div>
+                <span class="badge done">成功</span>
+              </div>
+
+              <div class="step done">
+                <div class="step-index">✓</div>
+                <div>
+                  <div class="step-title">抽取关键帧</div>
+                  <div class="step-desc">输出 preprocess/frames/1/frames.json</div>
+                </div>
+                <span class="badge done">成功</span>
+              </div>
+
+              <div class="step done">
+                <div class="step-index">✓</div>
+                <div>
+                  <div class="step-title">切分分片段</div>
+                  <div class="step-desc">输出 preprocess/chunks/1/chunks.json</div>
+                </div>
+                <span class="badge done">成功</span>
+              </div>
+
+              <div class="step running">
+                <div class="step-index">5</div>
+                <div>
+                  <div class="step-title">语音转文字</div>
+                  <div class="step-desc">正在识别音频内容，并合并到时间线。</div>
+                </div>
+                <span class="badge running">运行中</span>
+              </div>
+
+              <div class="step">
+                <div class="step-index">6</div>
+                <div>
+                  <div class="step-title">画面识别</div>
+                  <div class="step-desc">等待关键帧视觉理解。</div>
+                </div>
+                <span class="badge">等待中</span>
+              </div>
+
+              <div class="step">
+                <div class="step-index">7</div>
+                <div>
+                  <div class="step-title">理解新闻</div>
+                  <div class="step-desc">等待新闻主题、人物、冲突点总结。</div>
+                </div>
+                <span class="badge">等待中</span>
+              </div>
+
+              <div class="step">
+                <div class="step-index">8</div>
+                <div>
+                  <div class="step-title">生成文案与配音</div>
+                  <div class="step-desc">等待脚本生成、TTS 合成和最终剪辑。</div>
+                </div>
+                <span class="badge">等待中</span>
+              </div>
+            </div>
+          </article>
+        </section>
+
+        <aside class="right-stack">
+          <article class="card video-card">
+            <div class="video-toolbar">
+              <div>
+                <div class="card-title">视频预览</div>
+                <div class="card-sub">这里只保留“最新成片”和“原片”，去掉高光选项。</div>
+              </div>
+
+              <div class="seg">
+                <button class="active">最新成片</button>
+                <button>原片</button>
+              </div>
+            </div>
+
+            <div class="fake-video">Preview Monitor</div>
+          </article>
+
+          <article class="card">
+            <div class="card-head">
+              <div>
+                <div class="card-title">输出产物</div>
+                <div class="card-sub">普通用户看结果，开发人员再展开路径。</div>
+              </div>
+              <button class="btn">复制</button>
+            </div>
+
+            <div class="artifact-list">
+              <div class="artifact">
+                <strong>manifest.json</strong>
+                <span>5.6 KB</span>
+              </div>
+              <div class="artifact">
+                <strong>video_metadata.json</strong>
+                <span>2.1 KB</span>
+              </div>
+              <div class="artifact">
+                <strong>audio.wav</strong>
+                <span>12.8 MB</span>
+              </div>
+              <div class="artifact">
+                <strong>chunks.json</strong>
+                <span>18.4 KB</span>
+              </div>
+            </div>
+          </article>
+
+          <article class="card">
+            <div class="card-head">
+              <div>
+                <div class="card-title">运行日志</div>
+                <div class="card-sub">底部文件内容区建议默认收起，需要调试时再展开。</div>
+              </div>
+            </div>
+
+            <div class="log">
+              [10:58:10] video metadata loaded<br />
+              [10:58:11] audio extracted successfully<br />
+              [10:58:26] frames/chunks generated<br />
+              [10:59:03] ASR task started<br />
+              [10:59:41] processing chunk 03 / 12 ...
+            </div>
+          </article>
+        </aside>
+      </section>
+    </main>
+  </div>
+</body>
+</html>

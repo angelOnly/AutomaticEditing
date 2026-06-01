@@ -1,0 +1,148 @@
+[llm]
+llm_vision_timeout = 120
+llm_text_timeout = 180
+llm_max_retries = 3
+text_llm_max_tokens = 16000
+vision_llm_provider = "doubao"
+
+# 豆包视觉大模型配置
+vision_doubao_model_name = "ep-20260526134210-fq62r"
+vision_doubao_fallback_models = ["ep-20260526134210-fq62r"]
+vision_doubao_api_key = "bdddff7f-5bf7-4502-a976-418036e15591"
+vision_doubao_base_url = "https://ark.cn-beijing.volces.com/api/v3"
+
+# Qwen视觉大模型配置（保留备用）
+vision_openai_model_name = "qwen3.5-122b-a10b"
+# 备选大模型，由于指定的视觉大模型可能额度不够，需要调用其他备选来完成
+vision_openai_fallback_models = ["qwen3.6-flash-2026-04-16", "qwen3.6-35b-a3b", "qwen3.5-plus", "qwen3.5-plus-2026-02-15", "qwen3.5-122b-a10b", "qwen3.5-397b-a17b", "qwen3.5-35b-a3b", "qwen3.5-27b"]
+vision_openai_api_key = "sk-983ffed9edda4c30aa22b9fcedbd9511"
+vision_openai_base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+
+# 文本大模型默认使用豆包；如需切回 DashScope/Qwen/DeepSeek，将这里改成 "openai"
+text_llm_provider = "doubao"
+text_openai_model_name = "deepseek-v4-pro"
+text_openai_fallback_models = ["deepseek-v4-pro", "qwen3.6-flash", "qwen3.6-flash-2026-04-16"]
+text_openai_api_key = "sk-983ffed9edda4c30aa22b9fcedbd9511"
+text_openai_base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+
+# 豆包文本大模型配置（备用）
+text_doubao_model_name = "ep-20260526134210-fq62r"
+text_doubao_fallback_models = ["ep-20260526134210-fq62r"]
+text_doubao_api_key = "bdddff7f-5bf7-4502-a976-418036e15591"
+text_doubao_base_url = "https://ark.cn-beijing.volces.com/api/v3"
+
+
+# 文字转语言
+[omnivoice]
+model_path = "E:\\ai\\skills\\AutomaticEditing\\models\\OmniVoice"
+reference_audio = "E:\\ai\\skills\\AutomaticEditing\\tts_ref\\664925840_0_13s.mp3"
+reference_text = "问一下啊，今天所有来到我直播间，宝贝现在不要离开直播间。因为身上这个小黑裙是你们家衣柜里没有过的类型，没有过的风格。我知道宝贝，你们家都有裙子，夏天谁家没有小裙子，对不对？"
+speed = 0.85
+
+# 音频转文字
+[funasr]
+asr_model_path = "E:\\ai\\skills\\AutomaticEditing\\models\\iic"
+
+# 工作流与网页默认配置
+[workflow]
+# 默认画面比例：新闻素材优先保持原横屏；需要竖屏短视频时再手动改 9:16
+default_aspect_ratio = "16:9"
+default_chunk_seconds = 60
+default_frame_interval = 10
+vision_max_workers = 3
+vision_max_frames_per_chunk = 6
+# 可选：all / only_analysis / skip_render / render_only
+default_run_mode = "all"
+
+[llm_input]
+max_asr_chars_per_chunk = 320
+max_visual_chars_per_chunk = 160
+max_screen_text_items = 5
+max_people_items = 5
+max_candidate_clips_for_edit_plan = 8
+candidate_neighbor_chunks = 1
+
+[short_video]
+default_target_seconds = 30
+quick_news_min_seconds = 20
+quick_news_max_seconds = 30
+normal_min_seconds = 28
+normal_max_seconds = 35
+context_max_seconds = 45
+complex_max_seconds = 60
+hard_max_without_confirmation = 60
+allow_long_video_default = true
+max_long_video_seconds = 90
+
+[voiceover]
+chars_per_second = 4.2
+default_original_audio_volume = 0.0
+evidence_original_audio_volume = 1.0
+background_original_audio_volume = 0.08
+voiceover_volume = 1.0
+tts_required_by_default = true
+ai_voiceover_disable_original_audio = true
+ai_voiceover_allow_model_original_audio = false
+allow_original_audio_evidence = false
+ai_voiceover_min_ratio = 0.80
+ai_voiceover_original_audio_max_seconds = 6
+ai_voiceover_original_audio_max_ratio = 0.15
+ai_voiceover_original_audio_single_max_seconds = 4
+original_audio_value_threshold = 7
+ambience_original_audio_min_seconds = 2
+ambience_original_audio_max_seconds = 3
+evidence_original_audio_min_seconds = 6
+evidence_original_audio_max_seconds = 8
+core_quote_original_audio_min_seconds = 8
+core_quote_original_audio_max_seconds = 12
+core_quote_original_audio_max_ratio = 0.25
+suppress_unplanned_original_audio = true
+compact_voiceover_default = true
+segment_aligned_only_for_evidence = true
+inter_sentence_gap_seconds = 0.28
+max_inter_sentence_gap_seconds = 0.8
+max_total_silence_ratio = 0.15
+subtitle_follow_actual_tts = true
+tts_actual_chars_per_second = 5.2
+compact_min_target_ratio = 0.65
+compact_duration_tolerance_seconds = 1.0
+compact_severe_short_ratio = 0.65
+long_source_threshold_seconds = 600
+long_source_min_total_output_seconds = 90
+long_source_preferred_total_output_seconds = 150
+long_source_min_video_count = 2
+
+[subtitle]
+mode = "sentence"
+max_chars_per_line_16_9 = 22
+max_chars_per_line_9_16 = 14
+max_lines = 1
+min_cue_seconds = 1.0
+max_cue_seconds = 4.0
+prefer_clause_split = true
+font_size_16_9 = 24
+font_size_9_16 = 20
+margin_v_16_9 = 25
+margin_v_9_16 = 120
+outline = 3
+shadow = 0
+primary_colour = "&H00000000"
+outline_colour = "&H00FFFFFF"
+
+# python环境
+[reassembly]
+default_output_mode = "single"
+default_sort_mode = "editorial"
+default_target_seconds = 90
+min_clip_seconds = 5.0
+max_clip_seconds = 45.0
+max_clip_count = 8
+merge_gap_seconds = 2.0
+boundary_pre_roll_seconds = 0.5
+boundary_post_roll_seconds = 1.0
+keep_original_audio = true
+generate_subtitles_default = false
+export_individual_clips_default = false
+risk_block_threshold = "high"
+
+# conda activate comfy_5090_313_auto

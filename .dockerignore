@@ -1,0 +1,8 @@
+*
+
+!docker/
+!docker/**
+!models/
+!models/**
+!tts_ref/
+!tts_ref/**

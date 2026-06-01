@@ -1,0 +1,755 @@
+from __future__ import annotations
+
+import os
+import shutil
+import subprocess
+import sys
+import uuid
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+
+from newsclip_agent.config import load_config
+from newsclip_agent.utils import ensure_dir, read_json, relpath, write_json
+
+
+ROOT = Path(__file__).resolve().parent
+OUTPUTS_DIR = ROOT / "outputs"
+VIDEOS_DIR = ROOT / "videos"
+STATIC_DIR = ROOT / "web_static"
+RUNNER = ROOT / "run_pipeline.py"
+
+app = FastAPI(title="凤凰新闻视频智能拆条工作台")
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+JOBS: dict[str, dict[str, Any]] = {}
+PROJECT_CONFIG = load_config(ROOT / "config.toml")
+WORKFLOW_DEFAULTS = PROJECT_CONFIG.workflow
+SHORT_VIDEO_DEFAULTS = PROJECT_CONFIG.short_video
+VOICEOVER_DEFAULTS = PROJECT_CONFIG.voiceover
+
+
+class RunRequest(BaseModel):
+    input_video: str | None = None
+    task_id: str | None = None
+    rerun: str | None = None
+    rerun_from: str | None = None
+    chunk: str | None = None
+    failed_only: bool = False
+    mode: str = "normal"
+    use_version: list[str] = Field(default_factory=list)
+    chunk_seconds: int = int(WORKFLOW_DEFAULTS.get("default_chunk_seconds", 60))
+    frame_interval: int = int(WORKFLOW_DEFAULTS.get("default_frame_interval", 5))
+    aspect_ratio: str = str(WORKFLOW_DEFAULTS.get("default_aspect_ratio", "16:9"))
+    only_analysis: bool = False
+    skip_tts: bool = False
+    skip_render: bool = False
+    target_duration_seconds: int = int(SHORT_VIDEO_DEFAULTS.get("default_target_seconds", 30))
+    target_duration_mode: str = "fixed"
+    allow_long_video: bool = bool(SHORT_VIDEO_DEFAULTS.get("allow_long_video_default", False))
+    require_tts: bool = bool(VOICEOVER_DEFAULTS.get("tts_required_by_default", True))
+    audio_policy: str = "ai_voiceover"
+    allow_original_audio_evidence: bool = False
+    production_mode: str = "ai_voiceover"
+    reassembly_output_mode: str = "single"
+    reassembly_sort_mode: str = "editorial"
+    reassembly_target_seconds: int | None = None
+    reassembly_max_clip_count: int = 8
+    reassembly_export_individual_clips: bool = False
+    reuse_from_task_id: str | None = None
+
+
+@app.get("/", response_class=HTMLResponse)
+def index() -> HTMLResponse:
+    return HTMLResponse(
+        (STATIC_DIR / "index.html").read_text(encoding="utf-8"),
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.get("/api/health")
+def health() -> dict[str, Any]:
+    return {"ok": True, "time": datetime.now().isoformat(timespec="seconds")}
+
+
+@app.get("/api/config")
+def get_config() -> dict[str, Any]:
+    return {
+        "workflow": {
+            "default_aspect_ratio": WORKFLOW_DEFAULTS.get("default_aspect_ratio", "16:9"),
+            "default_chunk_seconds": int(WORKFLOW_DEFAULTS.get("default_chunk_seconds", 60)),
+            "default_frame_interval": int(WORKFLOW_DEFAULTS.get("default_frame_interval", 5)),
+            "default_run_mode": WORKFLOW_DEFAULTS.get("default_run_mode", "all"),
+        },
+        "short_video": {
+            "default_target_seconds": int(SHORT_VIDEO_DEFAULTS.get("default_target_seconds", 30)),
+            "hard_max_without_confirmation": int(SHORT_VIDEO_DEFAULTS.get("hard_max_without_confirmation", 60)),
+            "allow_long_video_default": bool(SHORT_VIDEO_DEFAULTS.get("allow_long_video_default", False)),
+        },
+        "voiceover": {
+            "tts_required_by_default": bool(VOICEOVER_DEFAULTS.get("tts_required_by_default", True)),
+            "allow_original_audio_evidence": bool(VOICEOVER_DEFAULTS.get("allow_original_audio_evidence", False)),
+        },
+    }
+
+
+@app.get("/api/videos")
+def list_videos() -> list[dict[str, Any]]:
+    if not VIDEOS_DIR.exists():
+        return []
+    videos = []
+    for path in sorted(VIDEOS_DIR.glob("*")):
+        if path.suffix.lower() not in {".mp4", ".mov", ".mkv", ".m4v", ".avi"}:
+            continue
+        videos.append(
+            {
+                "name": path.name,
+                "path": relpath(path, ROOT),
+                "size_mb": round(path.stat().st_size / 1024 / 1024, 2),
+                "updated_at": datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds"),
+            }
+        )
+    return videos
+
+
+@app.get("/api/videos/preview")
+def preview_video(path: str):
+    file_path = _resolve_input_video(path)
+    return FileResponse(str(file_path))
+
+
+@app.post("/api/videos/upload")
+async def upload_video(file: UploadFile = File(...)) -> dict[str, Any]:
+    suffix = Path(file.filename or "").suffix.lower()
+    if suffix not in {".mp4", ".mov", ".mkv", ".m4v", ".avi"}:
+        raise HTTPException(400, "unsupported video type")
+    ensure_dir(VIDEOS_DIR)
+    target = _unique_video_path(_safe_filename(file.filename or f"video{suffix}"))
+    try:
+        with target.open("wb") as out:
+            while chunk := await file.read(1024 * 1024):
+                out.write(chunk)
+    finally:
+        await file.close()
+    return {
+        "name": target.name,
+        "path": relpath(target, ROOT),
+        "size_mb": round(target.stat().st_size / 1024 / 1024, 2),
+        "updated_at": datetime.fromtimestamp(target.stat().st_mtime).isoformat(timespec="seconds"),
+    }
+
+
+@app.delete("/api/videos")
+def delete_video(path: str) -> dict[str, Any]:
+    file_path = _resolve_input_video(path)
+    file_path.unlink()
+    return {"ok": True, "deleted": relpath(file_path, ROOT)}
+
+
+@app.get("/api/tasks")
+def list_tasks() -> list[dict[str, Any]]:
+    if not OUTPUTS_DIR.exists():
+        return []
+    tasks = []
+    for task_dir in sorted([p for p in OUTPUTS_DIR.iterdir() if p.is_dir()], key=lambda p: p.stat().st_mtime, reverse=True):
+        manifest = read_json(task_dir / "manifest.json", {})
+        if not manifest:
+            continue
+        steps = manifest.get("steps", {})
+        done = sum(1 for s in steps.values() if s.get("status") in {"success", "partial_success", "skipped"})
+        stale = sum(1 for s in steps.values() if s.get("status") == "stale")
+        failed = sum(1 for s in steps.values() if s.get("status") == "failed")
+        tasks.append(
+            {
+                "task_id": task_dir.name,
+                "source_video": manifest.get("source_video", ""),
+                "updated_at": manifest.get("updated_at", ""),
+                "created_at": manifest.get("created_at", ""),
+                "done_steps": done,
+                "stale_steps": stale,
+                "failed_steps": failed,
+                "step_count": len(steps),
+            }
+        )
+    return tasks
+
+
+@app.delete("/api/tasks/{task_id}")
+def delete_task(task_id: str) -> dict[str, Any]:
+    for job in JOBS.values():
+        if job.get("task_id") == task_id and _refresh_job(job["job_id"]).get("status") == "running":
+            raise HTTPException(409, "task is running")
+    task_dir = _task_dir(task_id)
+    shutil.rmtree(task_dir)
+    return {"ok": True, "deleted": task_id}
+
+
+@app.get("/api/tasks/{task_id}/manifest")
+def get_manifest(task_id: str) -> dict[str, Any]:
+    task_dir = _task_dir(task_id)
+    manifest = read_json(task_dir / "manifest.json", None)
+    if manifest is None:
+        raise HTTPException(404, "manifest.json not found")
+    _hydrate_manifest_options(task_dir, manifest)
+    return manifest
+
+
+@app.get("/api/tasks/{task_id}/tree")
+def get_task_tree(task_id: str) -> list[dict[str, Any]]:
+    task_dir = _task_dir(task_id)
+    files = []
+    for path in sorted(task_dir.rglob("*")):
+        if path.is_file():
+            files.append(
+                {
+                    "path": relpath(path, task_dir),
+                    "size_kb": round(path.stat().st_size / 1024, 1),
+                    "updated_at": datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds"),
+                }
+            )
+    return files[:2000]
+
+
+@app.get("/api/tasks/{task_id}/file")
+def get_task_file(task_id: str, path: str):
+    task_dir = _task_dir(task_id)
+    file_path = _safe_child(task_dir, path)
+    if not file_path.exists() or not file_path.is_file():
+        raise HTTPException(404, "file not found")
+    suffix = file_path.suffix.lower()
+    if suffix in {".json"}:
+        return JSONResponse(read_json(file_path, {}))
+    if suffix in {".txt", ".srt", ".log", ".md"}:
+        return PlainTextResponse(file_path.read_text(encoding="utf-8", errors="replace"))
+    if suffix in {".mp4", ".mov", ".mkv", ".wav", ".mp3", ".jpg", ".jpeg", ".png"}:
+        return FileResponse(str(file_path))
+    return PlainTextResponse(file_path.read_text(encoding="utf-8", errors="replace"))
+
+
+@app.get("/api/tasks/{task_id}/preview")
+def preview_source(task_id: str):
+    manifest = get_manifest(task_id)
+    source = manifest.get("source_video")
+    if not source:
+        raise HTTPException(404, "source video missing")
+    file_path = _resolve_task_source(_task_dir(task_id), source)
+    return FileResponse(str(file_path))
+
+
+@app.get("/api/tasks/{task_id}/latest-video")
+def latest_video(task_id: str) -> dict[str, Any]:
+    task_dir = _task_dir(task_id)
+    latest = _find_latest_draft_video(task_dir)
+    if not latest:
+        return {"exists": False, "file": "", "url": ""}
+    return {
+        "exists": True,
+        "file": relpath(latest, task_dir),
+        "url": f"/api/tasks/{task_id}/file?path={relpath(latest, task_dir)}",
+    }
+
+
+@app.get("/api/tasks/{task_id}/drafts")
+def list_draft_videos(task_id: str) -> list[dict[str, Any]]:
+    task_dir = _task_dir(task_id)
+    drafts = _list_draft_videos(task_dir)
+    return [
+        {
+            "file": relpath(path, task_dir),
+            "url": f"/api/tasks/{task_id}/file?path={relpath(path, task_dir)}",
+            "name": path.name,
+            "type": "highlight_reassembly_draft" if "reassembly_drafts" in path.parts else "ai_voiceover_draft",
+            "size_mb": round(path.stat().st_size / 1024 / 1024, 2),
+            "updated_at": datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds"),
+        }
+        for path in drafts
+    ]
+
+
+@app.post("/api/run")
+def run_pipeline(req: RunRequest) -> dict[str, Any]:
+    if req.production_mode == "highlight_reassembly":
+        req.audio_policy = "original"
+        req.require_tts = False
+        req.skip_tts = True
+        req.allow_original_audio_evidence = True
+    else:
+        req.audio_policy = "ai_voiceover"
+        req.allow_original_audio_evidence = False
+    _prepare_mode_switched_run(req)
+    task_id = _resolve_run_task_id(req)
+    task_dir = ensure_dir(OUTPUTS_DIR / task_id)
+    _seed_reusable_outputs(req, task_id, task_dir)
+    job_id = f"job_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+    log_dir = ensure_dir(task_dir / "web_jobs")
+    log_path = log_dir / f"{job_id}.log"
+
+    cmd = [
+        sys.executable,
+        "-u",
+        str(RUNNER),
+        "--task-id",
+        task_id,
+        "--chunk-seconds",
+        str(req.chunk_seconds),
+        "--frame-interval",
+        str(req.frame_interval),
+        "--aspect-ratio",
+        req.aspect_ratio,
+        "--target-duration",
+        str(req.target_duration_seconds),
+        "--audio-policy",
+        req.audio_policy,
+        "--production-mode",
+        req.production_mode,
+    ]
+    if req.production_mode == "highlight_reassembly":
+        cmd.extend(["--reassembly-output-mode", req.reassembly_output_mode])
+        cmd.extend(["--reassembly-sort-mode", req.reassembly_sort_mode])
+        cmd.extend(["--reassembly-max-clip-count", str(req.reassembly_max_clip_count)])
+        if req.reassembly_target_seconds:
+            cmd.extend(["--reassembly-target-seconds", str(req.reassembly_target_seconds)])
+        if req.reassembly_export_individual_clips:
+            cmd.append("--reassembly-export-individual-clips")
+    if req.input_video:
+        input_path = _resolve_input_video(req.input_video)
+        cmd.extend(["--input", str(input_path)])
+    if req.rerun:
+        cmd.extend(["--rerun", req.rerun])
+    if req.rerun_from:
+        cmd.extend(["--rerun-from", req.rerun_from])
+    if req.chunk:
+        cmd.extend(["--chunk", req.chunk])
+    if req.failed_only:
+        cmd.append("--failed-only")
+    if req.mode:
+        cmd.extend(["--mode", req.mode])
+    for version_spec in req.use_version:
+        if version_spec.strip():
+            cmd.extend(["--use-version", version_spec.strip()])
+    if req.only_analysis:
+        cmd.append("--only-analysis")
+    if req.skip_tts:
+        cmd.append("--skip-tts")
+    if req.skip_render:
+        cmd.append("--skip-render")
+    if req.allow_long_video:
+        cmd.append("--allow-long-video")
+    if req.require_tts:
+        cmd.append("--require-tts")
+    else:
+        cmd.append("--no-require-tts")
+
+    _save_web_run_options(task_dir, req)
+
+    log_file = log_path.open("w", encoding="utf-8", errors="replace")
+    log_file.write(" ".join(cmd) + "\n\n")
+    log_file.flush()
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONUNBUFFERED"] = "1"
+    process = subprocess.Popen(
+        cmd,
+        cwd=str(ROOT),
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=env,
+        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+    )
+    JOBS[job_id] = {
+        "job_id": job_id,
+        "task_id": task_id,
+        "pid": process.pid,
+        "cmd": cmd,
+        "log": relpath(log_path, ROOT),
+        "log_path": str(log_path),
+        "started_at": datetime.now().isoformat(timespec="seconds"),
+        "status": "running",
+        "returncode": None,
+        "process": process,
+        "log_file": log_file,
+    }
+    write_json(task_dir / "last_web_job.json", {k: v for k, v in JOBS[job_id].items() if k not in {"process", "log_file"}})
+    return _public_job(JOBS[job_id])
+
+
+def _save_web_run_options(task_dir: Path, req: RunRequest) -> None:
+    manifest_path = task_dir / "manifest.json"
+    manifest = read_json(manifest_path, {})
+    web_options = req.model_dump()
+    web_options["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    manifest["last_web_run_options"] = web_options
+    if manifest:
+        write_json(manifest_path, manifest)
+
+
+REUSABLE_MODE_SWITCH_STEPS = (
+    "metadata",
+    "audio_extract",
+    "frame_extract",
+    "chunk_build",
+    "asr",
+    "vision",
+    "timeline",
+    "video_understanding",
+    "highlight_detection",
+)
+
+
+def _seed_reusable_outputs(req: RunRequest, task_id: str, task_dir: Path) -> None:
+    if not req.reuse_from_task_id or (task_dir / "manifest.json").exists():
+        return
+
+    source_task_dir = _task_dir(req.reuse_from_task_id)
+    source_manifest = read_json(source_task_dir / "manifest.json", {})
+    source_steps = source_manifest.get("steps", {})
+    copied_steps: dict[str, Any] = {}
+    copied_versions: dict[str, str] = {}
+
+    for step in REUSABLE_MODE_SWITCH_STEPS:
+        step_info = source_steps.get(step) or {}
+        if step_info.get("status") not in {"success", "partial_success"}:
+            continue
+        output = step_info.get("output")
+        if not output:
+            continue
+        source_output = source_task_dir / output
+        if not source_output.exists():
+            continue
+        source_copy_root = source_output.parent
+        target_copy_root = task_dir / relpath(source_copy_root, source_task_dir)
+        _copy_reusable_path(source_copy_root, target_copy_root)
+        copied_steps[step] = step_info
+        if step_info.get("version"):
+            copied_versions[step] = step_info["version"]
+
+    if not copied_steps:
+        return
+
+    source_video = Path(req.input_video).resolve() if req.input_video else _existing_task_source_video(source_task_dir, source_manifest)
+    source_video_ref = relpath(source_video, task_dir)
+    now = datetime.now().isoformat(timespec="seconds")
+    write_json(
+        task_dir / "task.json",
+        {
+            "task_id": task_id,
+            "created_at": now,
+            "source_video_original": str(source_video),
+            "source_video": source_video_ref,
+            "reused_from_task_id": req.reuse_from_task_id,
+        },
+    )
+    write_json(
+        task_dir / "manifest.json",
+        {
+            "task_id": task_id,
+            "created_at": now,
+            "updated_at": now,
+            "source_video": source_video_ref,
+            "source_video_original": str(source_video),
+            "current_versions": copied_versions,
+            "steps": copied_steps,
+            "reused_from_task_id": req.reuse_from_task_id,
+            "reused_steps": list(copied_steps),
+        },
+    )
+
+
+def _copy_reusable_path(source: Path, target: Path) -> None:
+    if target.exists():
+        return
+    ensure_dir(target.parent)
+    if source.is_dir():
+        shutil.copytree(source, target)
+    else:
+        shutil.copy2(source, target)
+
+
+@app.get("/api/jobs")
+def list_jobs() -> list[dict[str, Any]]:
+    return [_refresh_job(job_id) for job_id in sorted(JOBS, reverse=True)]
+
+
+@app.get("/api/jobs/{job_id}")
+def get_job(job_id: str) -> dict[str, Any]:
+    if job_id not in JOBS:
+        raise HTTPException(404, "job not found")
+    return _refresh_job(job_id)
+
+
+@app.get("/api/jobs/{job_id}/log")
+def get_job_log(job_id: str) -> PlainTextResponse:
+    if job_id not in JOBS:
+        raise HTTPException(404, "job not found")
+    job = _refresh_job(job_id)
+    path = Path(job["log_path"])
+    if not path.exists():
+        return PlainTextResponse("")
+    return PlainTextResponse(path.read_text(encoding="utf-8", errors="replace")[-80_000:])
+
+
+def _refresh_job(job_id: str) -> dict[str, Any]:
+    job = JOBS[job_id]
+    process = job.get("process")
+    if process and job["status"] == "running":
+        code = process.poll()
+        if code is not None:
+            job["returncode"] = code
+            job["status"] = "success" if code == 0 else "failed"
+            job["finished_at"] = datetime.now().isoformat(timespec="seconds")
+            log_file = job.get("log_file")
+            if log_file:
+                log_file.close()
+            job["user_message"] = _extract_user_message_from_log(Path(job["log_path"]))
+            write_json(OUTPUTS_DIR / job["task_id"] / "last_web_job.json", {k: v for k, v in job.items() if k not in {"process", "log_file"}})
+    elif Path(job.get("log_path", "")).exists():
+        job["user_message"] = _extract_user_message_from_log(Path(job["log_path"]))
+    return _public_job(job)
+
+
+def _extract_user_message_from_log(path: Path) -> str:
+    if not path.exists() or not path.is_file():
+        return ""
+    text = path.read_text(encoding="utf-8", errors="replace")
+    marker = "运行失败："
+    if marker in text:
+        tail = text.rsplit(marker, 1)[-1].strip()
+        tail = tail.split("可在任务表中查看失败步骤", 1)[0].strip()
+        return tail
+    runtime_marker = "RuntimeError:"
+    if runtime_marker in text:
+        tail = text.rsplit(runtime_marker, 1)[-1].strip()
+        lines = [line.strip() for line in tail.splitlines() if line.strip()]
+        return "\n".join(lines[-4:])
+    return ""
+
+
+def _hydrate_manifest_options(task_dir: Path, manifest: dict[str, Any]) -> None:
+    if manifest.get("last_run_options") or manifest.get("last_web_run_options"):
+        return
+    options: dict[str, Any] = {}
+    cut_output = manifest.get("steps", {}).get("cut_plan", {}).get("output")
+    if cut_output:
+        cut_plan = read_json(task_dir / cut_output, {})
+        videos = cut_plan.get("output_videos", [])
+        if videos and videos[0].get("aspect_ratio"):
+            options["aspect_ratio"] = videos[0]["aspect_ratio"]
+    if not options:
+        return
+    options.setdefault("chunk_seconds", int(WORKFLOW_DEFAULTS.get("default_chunk_seconds", 60)))
+    options.setdefault("frame_interval", int(WORKFLOW_DEFAULTS.get("default_frame_interval", 5)))
+    options["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    manifest["last_run_options"] = options
+
+
+def _find_latest_draft_video(task_dir: Path) -> Path | None:
+    drafts = _list_draft_videos(task_dir)
+    return drafts[0] if drafts else None
+
+
+def _list_draft_videos(task_dir: Path) -> list[Path]:
+    render_indexes = sorted(
+        list((task_dir / "edit" / "drafts").glob("v*/render_outputs.json"))
+        + list((task_dir / "edit" / "reassembly_drafts").glob("v*/reassembly_render_outputs.json")),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    ordered: list[Path] = []
+    seen: set[Path] = set()
+    for index in render_indexes:
+        data = read_json(index, {})
+        for item in data.get("outputs", []):
+            file_value = item.get("file")
+            if not file_value:
+                continue
+            path = (task_dir / file_value).resolve()
+            if path.exists() and path.is_file() and path not in seen:
+                ordered.append(path)
+                seen.add(path)
+    candidates = [
+        p
+        for root in [task_dir / "edit" / "drafts", task_dir / "edit" / "reassembly_drafts"]
+        for p in root.rglob("*.mp4")
+        if "_clips" not in p.parts and p.is_file()
+    ]
+    for path in sorted(candidates, key=lambda p: p.stat().st_mtime, reverse=True):
+        resolved = path.resolve()
+        if resolved not in seen:
+            ordered.append(resolved)
+            seen.add(resolved)
+    return ordered
+
+
+def _public_job(job: dict[str, Any]) -> dict[str, Any]:
+    return {k: v for k, v in job.items() if k not in {"process", "log_file"}}
+
+
+def _task_dir(task_id: str) -> Path:
+    task_dir = _safe_child(OUTPUTS_DIR, task_id)
+    if not task_dir.exists():
+        raise HTTPException(404, "task not found")
+    return task_dir
+
+
+def _safe_child(root: Path, child: str) -> Path:
+    root = root.resolve()
+    path = (root / child).resolve()
+    if root != path and root not in path.parents:
+        raise HTTPException(400, "invalid path")
+    return path
+
+
+def _resolve_input_video(input_video: str) -> Path:
+    raw = Path(input_video)
+    if raw.is_absolute():
+        path = raw.resolve()
+    else:
+        path = (ROOT / raw).resolve()
+    if not path.exists() or not path.is_file():
+        raise HTTPException(404, "input video not found")
+    if ROOT != path and ROOT not in path.parents:
+        raise HTTPException(400, "input must be inside project directory")
+    return path
+
+
+def _safe_filename(name: str) -> str:
+    filename = Path(name).name.strip()
+    if not filename:
+        return f"video_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4"
+    return "".join(ch if ch not in '<>:"/\\|?*' and ord(ch) >= 32 else "_" for ch in filename)
+
+
+def _unique_video_path(filename: str) -> Path:
+    path = _safe_child(VIDEOS_DIR, filename)
+    if not path.exists():
+        return path
+    stem = path.stem
+    suffix = path.suffix
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    for index in range(1, 1000):
+        candidate = _safe_child(VIDEOS_DIR, f"{stem}_{stamp}_{index}{suffix}")
+        if not candidate.exists():
+            return candidate
+    raise HTTPException(409, "could not create unique filename")
+
+
+def _resolve_task_source(task_dir: Path, source: str) -> Path:
+    raw = Path(source)
+    if raw.is_absolute():
+        path = raw.resolve()
+    else:
+        path = (task_dir / raw).resolve()
+    root = ROOT.resolve()
+    task_root = task_dir.resolve()
+    if not path.exists() or not path.is_file():
+        raise HTTPException(404, "source video not found")
+    if root not in path.parents and task_root not in path.parents and path != root and path != task_root:
+        raise HTTPException(400, "invalid source path")
+    return path
+
+
+def _prepare_mode_switched_run(req: RunRequest) -> None:
+    if req.input_video or req.rerun or req.rerun_from or not req.task_id:
+        return
+
+    source_task_id = req.task_id.strip()
+    if not source_task_id:
+        return
+    task_dir = _task_dir(source_task_id)
+    manifest = read_json(task_dir / "manifest.json", {})
+    current_mode = _task_id_production_mode(source_task_id) or _manifest_production_mode(manifest)
+    if current_mode == req.production_mode:
+        return
+
+    req.input_video = str(_existing_task_source_video(task_dir, manifest))
+    req.task_id = _with_mode_suffix(source_task_id, req.production_mode)
+    req.reuse_from_task_id = source_task_id
+
+
+def _task_id_production_mode(task_id: str) -> str | None:
+    if any(alias in task_id for alias in _mode_aliases("highlight_reassembly")):
+        return "highlight_reassembly"
+    if any(alias in task_id for alias in _mode_aliases("ai_voiceover")):
+        return "ai_voiceover"
+    return None
+
+
+def _manifest_production_mode(manifest: dict[str, Any]) -> str:
+    for key in ("last_web_run_options", "last_run_options"):
+        mode = (manifest.get(key) or {}).get("production_mode")
+        if mode in {"ai_voiceover", "highlight_reassembly"}:
+            return mode
+    return "ai_voiceover"
+
+
+def _existing_task_source_video(task_dir: Path, manifest: dict[str, Any]) -> Path:
+    task = read_json(task_dir / "task.json", {})
+    original = task.get("source_video_original")
+    if original and Path(original).exists():
+        return Path(original).resolve()
+    source = manifest.get("source_video")
+    if not source:
+        raise HTTPException(400, "existing task source video missing")
+    return _resolve_task_source(task_dir, source)
+
+
+def _resolve_run_task_id(req: RunRequest) -> str:
+    task_id = (req.task_id or "").strip()
+    if req.input_video:
+        if not task_id:
+            return _make_task_id(req.input_video, req.production_mode)
+        return _with_mode_suffix(task_id, req.production_mode)
+    return task_id or _make_task_id(req.input_video, req.production_mode)
+
+
+def _make_task_id(input_video: str | None, production_mode: str = "ai_voiceover") -> str:
+    prefix = "task"
+    if input_video:
+        name = Path(input_video).stem
+        safe = "".join(ch if ch.isalnum() else "_" for ch in name).strip("_")
+        prefix = safe[:24] or "task"
+    return f"{prefix}_{_mode_slug(production_mode)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+
+def _with_mode_suffix(task_id: str, production_mode: str) -> str:
+    mode = _mode_slug(production_mode)
+    desired_aliases = _mode_aliases(production_mode)
+    if any(f"_{alias}_" in task_id or task_id.endswith(f"_{alias}") for alias in desired_aliases):
+        return task_id
+
+    for alias in _all_mode_aliases():
+        marker = f"_{alias}_"
+        if marker in task_id:
+            return task_id.replace(marker, f"_{mode}_", 1)
+        suffix = f"_{alias}"
+        if task_id.endswith(suffix):
+            return f"{task_id[: -len(suffix)]}_{mode}"
+
+    parts = task_id.rsplit("_", 2)
+    if len(parts) == 3 and len(parts[1]) == 8 and len(parts[2]) in {4, 6} and parts[1].isdigit() and parts[2].isdigit():
+        time_part = parts[2] if len(parts[2]) == 6 else f"{parts[2]}{datetime.now().strftime('%S')}"
+        return f"{parts[0]}_{mode}_{parts[1]}_{time_part}"
+    return f"{task_id}_{mode}"
+
+
+def _mode_slug(production_mode: str) -> str:
+    return "视频重组" if production_mode == "highlight_reassembly" else "AI配音解说"
+
+
+def _mode_aliases(production_mode: str) -> tuple[str, ...]:
+    if production_mode == "highlight_reassembly":
+        return ("highlight_reassembly", "视频重组")
+    return ("ai_voiceover", "AI配音解说")
+
+
+def _all_mode_aliases() -> tuple[str, ...]:
+    return _mode_aliases("ai_voiceover") + _mode_aliases("highlight_reassembly")
