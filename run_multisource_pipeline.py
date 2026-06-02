@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -9,12 +10,26 @@ from typing import Any
 from newsclip_agent.config import load_config
 from newsclip_agent.multisource import MultiSourceItem, build_multi_source_video
 from newsclip_agent.pipeline import main as pipeline_main
+from newsclip_agent.resource_locks import file_slot_lock
 from newsclip_agent.remote_ucms import download_ucms_video, load_remote_ucms_config
 from newsclip_agent.utils import ensure_dir, read_json, relpath, write_json
 
 
 ROOT = Path(__file__).resolve().parent
 OUTPUTS_DIR = ROOT / "outputs"
+COMMON_OUTPUTS_DIR = OUTPUTS_DIR / "__common__"
+
+COMMON_REUSABLE_STEPS = [
+    "source_prepare",
+    "metadata",
+    "audio_extract",
+    "frame_extract",
+    "chunk_build",
+    "asr",
+    "vision",
+    "timeline",
+    "timeline_digest",
+]
 
 
 def parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, list[str]]:
@@ -30,6 +45,14 @@ def main(argv: list[str] | None = None) -> int:
     task_dir = ensure_dir(OUTPUTS_DIR / args.task_id)
     request_path = Path(args.source_request).resolve()
     request = read_json(request_path, {})
+
+    common_task_id = str(request.get("common_task_id") or "").strip()
+    if common_task_id:
+        common_dir = ensure_dir(COMMON_OUTPUTS_DIR / common_task_id)
+        _ensure_common_analysis(common_dir=common_dir, request=request, args=args)
+        _copy_common_outputs_to_task(common_dir=common_dir, task_dir=task_dir, request=request)
+        return _run_mode_specific_pipeline(args=args, passthrough=passthrough, task_dir=task_dir, request=request)
+
     _mark_source_prepare(task_dir, "running", request=request)
     try:
         config = load_config(ROOT / "config.toml")
@@ -60,6 +83,161 @@ def main(argv: list[str] | None = None) -> int:
         *passthrough,
     ]
     return pipeline_main(pipeline_args)
+
+
+def _ensure_common_analysis(*, common_dir: Path, request: dict[str, Any], args: argparse.Namespace) -> None:
+    ensure_dir(common_dir)
+    lock_name = f"common_source_{common_dir.name}"
+    with file_slot_lock(lock_name, slots=1):
+        if _common_analysis_ready(common_dir):
+            print(f"Reuse common analysis outputs: {common_dir}")
+            return
+
+        print(f"Start common analysis: {common_dir}")
+        _mark_source_prepare(common_dir, "running", request=request)
+        try:
+            config = load_config(ROOT / "config.toml")
+            sources = _resolve_sources(request, config)
+            multi_source_config = config.raw.get("multi_source", {})
+            built = build_multi_source_video(
+                sources=sources,
+                task_dir=common_dir,
+                root_dir=ROOT,
+                aspect_ratio=str(request.get("aspect_ratio") or args.aspect_ratio),
+                fps=int(multi_source_config.get("fps", 25)),
+                sample_rate=int(multi_source_config.get("sample_rate", 48000)),
+            )
+            _mark_source_prepare(common_dir, "success", request=request, built=built)
+        except Exception as exc:
+            _mark_source_prepare(common_dir, "failed", request=request, error=str(exc))
+            raise
+
+        pipeline_args = [
+            "--task-id",
+            common_dir.name,
+            "--outputs-dir",
+            str(common_dir.parent),
+            "--input",
+            str(built["input_video"]),
+            "--source-manifest",
+            str(built["source_manifest"]),
+            "--aspect-ratio",
+            str(request.get("aspect_ratio") or args.aspect_ratio),
+            "--chunk-seconds",
+            str(request.get("chunk_seconds") or 60),
+            "--frame-interval",
+            str(request.get("frame_interval") or 10),
+            "--mode",
+            str(request.get("mode") or "normal"),
+            "--production-mode",
+            "ai_voiceover",
+            "--common-only",
+        ]
+        result = pipeline_main(pipeline_args)
+        if result != 0:
+            raise RuntimeError(f"common analysis failed with return code {result}")
+
+        if not _common_analysis_ready(common_dir):
+            raise RuntimeError("common analysis finished but timeline_digest is not ready")
+
+
+def _common_analysis_ready(common_dir: Path) -> bool:
+    manifest = read_json(common_dir / "manifest.json", {})
+    steps = manifest.get("steps", {})
+    return all(steps.get(step, {}).get("status") in {"success", "partial_success", "skipped"} for step in COMMON_REUSABLE_STEPS)
+
+
+def _copy_common_outputs_to_task(*, common_dir: Path, task_dir: Path, request: dict[str, Any]) -> None:
+    ensure_dir(task_dir)
+    copied_dirs = ["input", "metadata", "preprocess", "asr", "vision", "timeline"]
+    for name in copied_dirs:
+        src = common_dir / name
+        if not src.exists():
+            continue
+        dst = task_dir / name
+        if dst.exists():
+            shutil.rmtree(dst)
+        shutil.copytree(src, dst)
+    ensure_dir(task_dir / "input")
+    write_json(task_dir / "input" / "source_request.json", request)
+
+    common_manifest = read_json(common_dir / "manifest.json", {})
+    manifest = read_json(task_dir / "manifest.json", {})
+    now = datetime.now().isoformat(timespec="seconds")
+    manifest["task_id"] = task_dir.name
+    manifest.setdefault("created_at", now)
+    manifest["updated_at"] = now
+    for key in ("source_video", "source_mode", "source_manifest", "source_videos"):
+        if key in common_manifest:
+            manifest[key] = common_manifest[key]
+    manifest["common_task_id"] = common_dir.name
+    manifest["common_source_key"] = request.get("common_source_key", "")
+    manifest["reused_common_steps"] = COMMON_REUSABLE_STEPS
+    manifest.setdefault("steps", {})
+    for step in COMMON_REUSABLE_STEPS:
+        status = dict((common_manifest.get("steps") or {}).get(step, {}))
+        if status:
+            status["reused_from"] = relpath(common_dir, ROOT)
+            manifest["steps"][step] = status
+    write_json(task_dir / "manifest.json", manifest)
+
+
+def _run_mode_specific_pipeline(
+    *,
+    args: argparse.Namespace,
+    passthrough: list[str],
+    task_dir: Path,
+    request: dict[str, Any],
+) -> int:
+    production_mode = str(request.get("production_mode") or _production_mode_from_passthrough(passthrough) or "ai_voiceover")
+    start_step = "video_understanding" if production_mode == "highlight_reassembly" else "content_analysis"
+    source_video = _resolve_task_manifest_path(task_dir, "source_video")
+    source_manifest = _resolve_task_manifest_path(task_dir, "source_manifest")
+    pipeline_args = [
+        "--task-id",
+        args.task_id,
+        "--input",
+        str(source_video),
+        "--source-manifest",
+        str(source_manifest),
+        "--aspect-ratio",
+        str(request.get("aspect_ratio") or args.aspect_ratio),
+        "--rerun-from",
+        start_step,
+        *_strip_passthrough_rerun(passthrough),
+    ]
+    return pipeline_main(pipeline_args)
+
+
+def _resolve_task_manifest_path(task_dir: Path, key: str) -> Path:
+    manifest = read_json(task_dir / "manifest.json", {})
+    value = str(manifest.get(key) or "").strip()
+    if not value:
+        raise RuntimeError(f"manifest.{key} is missing")
+    path = Path(value)
+    return path if path.is_absolute() else task_dir / path
+
+
+def _production_mode_from_passthrough(passthrough: list[str]) -> str:
+    for index, item in enumerate(passthrough):
+        if item == "--production-mode" and index + 1 < len(passthrough):
+            return passthrough[index + 1]
+    return ""
+
+
+def _strip_passthrough_rerun(passthrough: list[str]) -> list[str]:
+    stripped: list[str] = []
+    skip_next = False
+    options_with_values = {"--rerun", "--rerun-from"}
+    for item in passthrough:
+        if skip_next:
+            skip_next = False
+            continue
+        if item in options_with_values:
+            skip_next = True
+            continue
+        stripped.append(item)
+    return stripped
 
 
 def _resolve_sources(request: dict[str, Any], config: Any) -> list[MultiSourceItem]:

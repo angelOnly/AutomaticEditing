@@ -33,6 +33,7 @@ from newsclip_agent.utils import ensure_dir, read_json, relpath, write_json
 
 ROOT = Path(__file__).resolve().parent
 OUTPUTS_DIR = ROOT / "outputs"
+COMMON_OUTPUTS_DIR = OUTPUTS_DIR / "__common__"
 VIDEOS_DIR = ROOT / "videos"
 STATIC_DIR = ROOT / "web_static"
 RUNNER = ROOT / "run_pipeline.py"
@@ -410,7 +411,15 @@ def list_tasks() -> list[dict[str, Any]]:
         return []
     tasks = []
     seen_task_ids: set[str] = set()
-    for task_dir in sorted([p for p in OUTPUTS_DIR.iterdir() if p.is_dir()], key=lambda p: p.stat().st_mtime, reverse=True):
+    for task_dir in sorted(
+        [
+            p
+            for p in OUTPUTS_DIR.iterdir()
+            if p.is_dir() and p.name != "__common__" and not p.name.startswith("common_")
+        ],
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    ):
         manifest = read_json(task_dir / "manifest.json", {})
         steps = manifest.get("steps", {})
         source_request_exists = (task_dir / "input" / "source_request.json").exists()
@@ -432,6 +441,8 @@ def list_tasks() -> list[dict[str, Any]]:
                 "failed_steps": failed,
                 "step_count": len(steps) or (1 if source_request_exists else 0),
                 "job_status": job_status,
+                "common_task_id": manifest.get("common_task_id", ""),
+                "reused_common_steps": manifest.get("reused_common_steps", []),
             }
         )
     for job in sorted(
@@ -485,11 +496,20 @@ def get_manifest(task_id: str) -> dict[str, Any]:
             "source_mode": "multi_source_pending",
             "source_manifest": "",
             "source_videos": [],
+            "common_task_id": source_request.get("common_task_id", ""),
+            "common_source_key": source_request.get("common_source_key", ""),
             "last_web_run_options": {
-                "production_mode": "ai_voiceover",
+                "production_mode": source_request.get(
+                    "production_mode",
+                    _task_id_production_mode(task_id) or "ai_voiceover",
+                ),
                 "output_mode": source_request.get("output_mode", "single"),
                 "max_output_videos": source_request.get("max_output_videos", 1),
+                "min_output_video_seconds": source_request.get("min_output_video_seconds", 30),
+                "max_output_video_seconds": source_request.get("max_output_video_seconds", 90),
                 "aspect_ratio": source_request.get("aspect_ratio", "16:9"),
+                "common_task_id": source_request.get("common_task_id", ""),
+                "common_source_key": source_request.get("common_source_key", ""),
             },
             "steps": {
                 "source_prepare": {
@@ -550,6 +570,10 @@ def list_source_videos(task_id: str) -> list[dict[str, Any]]:
     manifest = get_manifest(task_id)
     sources: list[dict[str, Any]] = []
     source = manifest.get("source_video")
+    if not source:
+        pending_previews = _source_request_preview_items(task_dir, task_id)
+        if pending_previews:
+            return pending_previews
     if source:
         sources.append(
             {
@@ -557,6 +581,7 @@ def list_source_videos(task_id: str) -> list[dict[str, Any]]:
                 "file": source,
                 "url": f"/api/tasks/{task_id}/file?path={source}",
                 "source_index": 0,
+                "source_type": "concat" if manifest.get("source_mode") == "multi_source_concat_proxy" else "single",
             }
         )
     for index, item in enumerate(manifest.get("source_videos") or [], start=1):
@@ -571,12 +596,24 @@ def list_source_videos(task_id: str) -> list[dict[str, Any]]:
                 url = f"/api/videos/preview?path={relpath(original_path, ROOT)}"
             except HTTPException:
                 url = ""
+        remote = item.get("remote_video") or item.get("remote") or {}
+        if not url and isinstance(remote, dict):
+            url = (
+                remote.get("preview_url")
+                or remote.get("media_low_url")
+                or remote.get("mediaLow")
+                or remote.get("media_high_url")
+                or remote.get("mediaHigh")
+                or remote.get("download_url")
+                or ""
+            )
         sources.append(
             {
                 "label": item.get("display_name") or f"原始素材 {index}",
                 "file": file_ref or original,
                 "url": url,
                 "source_index": item.get("source_index", index),
+                "source_type": item.get("source_type", ""),
                 "source_id": item.get("source_id", ""),
                 "duration_seconds": item.get("duration_seconds"),
                 "virtual_start": item.get("virtual_start", ""),
@@ -635,14 +672,21 @@ def run_pipeline(req: RunRequest) -> dict[str, Any]:
     if len(raw_source_items) > 1:
         _validate_source_request_items(raw_source_items)
         fingerprint = _source_request_fingerprint(req, raw_source_items)
+        common_source_key = _common_source_key(req, raw_source_items)
+        common_task_id = f"common_{common_source_key}"
         input_name_for_task = _display_source_request_name(raw_source_items)
         task_id = _normalize_new_task_id(req.task_id, input_name_for_task, req.production_mode, fingerprint)
+        task_id = _with_mode_suffix(task_id, req.production_mode)
         task_dir = ensure_dir(OUTPUTS_DIR / task_id)
         source_request_path = task_dir / "input" / "source_request.json"
         ensure_dir(source_request_path.parent)
         write_json(
             source_request_path,
             {
+                "task_id": task_id,
+                "production_mode": req.production_mode,
+                "common_source_key": common_source_key,
+                "common_task_id": common_task_id,
                 "source_items": raw_source_items,
                 "force_remote_download": req.force_remote_download,
                 "output_mode": req.output_mode,
@@ -650,6 +694,9 @@ def run_pipeline(req: RunRequest) -> dict[str, Any]:
                 "min_output_video_seconds": req.min_output_video_seconds,
                 "max_output_video_seconds": req.max_output_video_seconds,
                 "aspect_ratio": req.aspect_ratio,
+                "chunk_seconds": req.chunk_seconds,
+                "frame_interval": req.frame_interval,
+                "mode": req.mode,
                 "created_at": datetime.now().isoformat(timespec="seconds"),
             },
         )
@@ -667,6 +714,7 @@ def run_pipeline(req: RunRequest) -> dict[str, Any]:
             task_id = _make_task_id_from_fingerprint(input_name_for_task, req.production_mode, fingerprint)
         else:
             task_id = _resolve_run_task_id(req)
+        task_id = _with_mode_suffix(task_id, req.production_mode)
         task_dir = ensure_dir(OUTPUTS_DIR / task_id)
     elif not raw_source_items:
         input_path = _prepare_run_input_video(req)
@@ -676,6 +724,7 @@ def run_pipeline(req: RunRequest) -> dict[str, Any]:
             task_id = _make_task_id_from_fingerprint(input_name_for_task, req.production_mode, fingerprint)
         else:
             task_id = _resolve_run_task_id(req)
+        task_id = _with_mode_suffix(task_id, req.production_mode)
         task_dir = ensure_dir(OUTPUTS_DIR / task_id)
     if req.remote_video:
         write_json(
@@ -1330,6 +1379,65 @@ def _resolve_task_source(task_dir: Path, source: str) -> Path:
     return path
 
 
+def _source_request_preview_items(task_dir: Path, task_id: str) -> list[dict[str, Any]]:
+    request = read_json(task_dir / "input" / "source_request.json", {})
+    items = request.get("source_items") or []
+    previews: list[dict[str, Any]] = []
+
+    for index, item in enumerate(items, start=1):
+        if not isinstance(item, dict):
+            continue
+        source_type = str(item.get("source_type") or item.get("type") or "local")
+        if source_type in {"local", "video"}:
+            path_value = item.get("path") or item.get("input_video")
+            if not path_value:
+                continue
+            try:
+                path = _resolve_input_video(str(path_value))
+            except HTTPException:
+                continue
+            file_ref = relpath(path, ROOT)
+            previews.append(
+                {
+                    "label": item.get("display_name") or path.name,
+                    "file": file_ref,
+                    "url": f"/api/videos/preview?path={file_ref}",
+                    "source_index": index,
+                    "source_type": "local",
+                }
+            )
+            continue
+        if source_type in {"remote", "remote_ucms"}:
+            remote = item.get("remote_video") or item
+            if not isinstance(remote, dict):
+                continue
+            url = (
+                remote.get("preview_url")
+                or remote.get("media_low_url")
+                or remote.get("mediaLow")
+                or remote.get("media_high_url")
+                or remote.get("mediaHigh")
+                or remote.get("download_url")
+            )
+            if not url:
+                continue
+            previews.append(
+                {
+                    "label": item.get("display_name")
+                    or remote.get("display_name")
+                    or remote.get("name")
+                    or remote.get("title")
+                    or f"远程素材 {index}",
+                    "file": remote.get("name") or remote.get("remote_id") or remote.get("id") or "",
+                    "url": url,
+                    "source_index": index,
+                    "source_type": "remote_ucms",
+                }
+            )
+
+    return previews
+
+
 def _prepare_mode_switched_run(req: RunRequest) -> None:
     if _collect_source_items(req) or req.rerun or req.rerun_from or not req.task_id:
         return
@@ -1473,6 +1581,33 @@ def _source_request_fingerprint(req: RunRequest, items: list[dict[str, Any]]) ->
         "target_duration_seconds": req.target_duration_seconds,
         "reassembly_target_seconds": req.reassembly_target_seconds,
         "reassembly_max_clip_count": req.reassembly_max_clip_count,
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _common_source_key(req: RunRequest, items: list[dict[str, Any]]) -> str:
+    payload_items: list[dict[str, Any]] = []
+    for index, item in enumerate(items, start=1):
+        if not isinstance(item, dict):
+            continue
+        source_type = str(item.get("source_type") or item.get("type") or "local")
+        if source_type in {"local", "video"}:
+            path_value = item.get("path") or item.get("input_video")
+            path = _resolve_input_video(str(path_value))
+            payload_items.append({"order": index, "source_type": "local", **_video_fingerprint(path)})
+            continue
+        if source_type in {"remote", "remote_ucms"}:
+            remote_video = item.get("remote_video") or item
+            payload_items.append({"order": index, "source_type": "remote_ucms", "remote": _remote_video_fingerprint(remote_video)})
+            continue
+        payload_items.append({"order": index, "source_type": source_type, "raw": item})
+    payload = {
+        "sources": payload_items,
+        "aspect_ratio": req.aspect_ratio,
+        "chunk_seconds": req.chunk_seconds,
+        "frame_interval": req.frame_interval,
+        "mode": req.mode,
     }
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]

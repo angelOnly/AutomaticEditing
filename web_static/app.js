@@ -82,6 +82,7 @@ const state = {
   selectedRemoteVideo: null,
   sourceBasket: [],
   selectedTask: null,
+  previewMode: "draft",
   manifest: null,
   activeJob: null,
   logTimer: null,
@@ -129,6 +130,7 @@ async function api(path, options = {}) {
 function init() {
   fillStepSelect();
   bindEvents();
+  syncPreviewTabs();
   renderSourceBasket();
   loadConfig().then(refreshAll);
   startAutoRefresh();
@@ -306,6 +308,7 @@ function bindEvents() {
     playSourceVideo();
   });
   $("openDraft").addEventListener("click", () => {
+    setPreviewMode("draft");
     if (state.drafts.length) {
       renderDraftList();
       playDraft(state.drafts[0]);
@@ -867,7 +870,7 @@ async function loadManifest(taskId, options = {}) {
   state.manifest = manifest;
   if (restoreControls) restoreRunControls(manifest);
   renderManifest();
-  if (refreshDrafts) await loadLatestDraft(taskId, { updatePreview });
+  if (refreshDrafts || updatePreview) await refreshPreviewForCurrentMode(taskId, { updatePreview });
   if (adoptJob) await adoptRunningJob(taskId);
 }
 
@@ -875,35 +878,67 @@ async function loadLatestDraft(taskId, options = {}) {
   const { updatePreview = true } = options;
   const drafts = await api(`/api/tasks/${taskId}/drafts`);
   state.drafts = drafts;
-  renderDraftList();
   state.latestDraft = drafts[0] || { exists: false, file: "", url: "" };
+  if (state.previewMode !== "draft") return;
+  renderDraftList();
   if (!updatePreview) return;
   if (drafts.length) {
     playDraft(drafts[0]);
   } else {
-    playSourceVideo();
-    $("fileViewer").textContent = "当前任务还没有生成粗剪视频，正在预览源视频。";
+    $("fileViewer").textContent = "当前任务还没有生成粗剪视频。";
   }
 }
 
-function playSourceVideo() {
+async function refreshPreviewForCurrentMode(taskId = state.selectedTask, options = {}) {
+  const { updatePreview = true } = options;
+  syncPreviewTabs();
+  if (state.previewMode === "source") {
+    if (updatePreview) await playSourceVideo();
+    return;
+  }
+  if (taskId) await loadLatestDraft(taskId, { updatePreview });
+}
+
+function setPreviewMode(mode) {
+  state.previewMode = mode === "source" ? "source" : "draft";
+  syncPreviewTabs();
+}
+
+function syncPreviewTabs() {
+  $("openSource")?.classList.toggle("active", state.previewMode === "source");
+  $("openSource")?.classList.toggle("primary", state.previewMode === "source");
+  $("openDraft")?.classList.toggle("active", state.previewMode === "draft");
+  $("openDraft")?.classList.toggle("primary", state.previewMode === "draft");
+}
+
+async function playSourceVideo() {
+  setPreviewMode("source");
   if (state.selectedTask) {
-    loadSourceVideos(state.selectedTask);
+    await loadSourceVideos(state.selectedTask);
   } else if (state.sourceBasket.length) {
     const sources = state.sourceBasket.map(sourceBasketPreviewItem);
     const previewItems = renderSourceVideoList(sources);
     playSourceItem(previewItems[previewItems.length - 1] || previewItems[0]);
   } else if (state.selectedRemoteVideo) {
-    const url = state.selectedRemoteVideo.preview_url || state.selectedRemoteVideo.media_low_url || state.selectedRemoteVideo.media_high_url;
+    const url =
+      state.selectedRemoteVideo.preview_url ||
+      state.selectedRemoteVideo.media_low_url ||
+      state.selectedRemoteVideo.mediaLow ||
+      state.selectedRemoteVideo.media_high_url ||
+      state.selectedRemoteVideo.mediaHigh;
     if (url) {
       $("videoPreview").src = url;
       $("videoPreview").load();
       $("fileViewer").textContent = "正在预览远程原片。";
+    } else {
+      $("fileViewer").textContent = "该远程素材没有可预览地址。";
     }
   } else if (state.selectedVideo) {
     $("videoPreview").src = `/api/videos/preview?path=${encodeURIComponent(state.selectedVideo.path)}`;
     $("videoPreview").load();
     $("fileViewer").textContent = "正在预览原片。";
+  } else {
+    $("fileViewer").textContent = "请先选择一个原片或任务。";
   }
 }
 
@@ -914,7 +949,7 @@ function sourceBasketPreviewItem(item, index) {
     return {
       label: item.display_name || remote.display_name || remote.name || `远程素材 ${sourceIndex}`,
       file: remote.name || remote.remote_id || "",
-      url: remote.preview_url || remote.media_low_url || remote.media_high_url || "",
+      url: remote.preview_url || remote.media_low_url || remote.mediaLow || remote.media_high_url || remote.mediaHigh || "",
       source_index: sourceIndex,
     };
   }
@@ -928,6 +963,7 @@ function sourceBasketPreviewItem(item, index) {
 
 async function loadSourceVideos(taskId) {
   const sources = await api(`/api/tasks/${taskId}/source-videos`).catch(() => []);
+  if (state.previewMode !== "source") return;
   if (!sources.length) {
     $("videoPreview").src = `/api/tasks/${taskId}/preview`;
     $("videoPreview").load();
@@ -940,7 +976,12 @@ async function loadSourceVideos(taskId) {
 
 function renderSourceVideoList(sources) {
   const box = $("draftList");
-  const items = sources.map((source, index) => ({ ...source, list_index: index }));
+  if (!box) return [];
+  const items = (sources || []).filter((source) => source?.url).map((source, index) => ({ ...source, list_index: index }));
+  if (!items.length) {
+    box.innerHTML = `<div class="empty-row">当前任务还没有可预览的原片，可能还在准备多源素材。</div>`;
+    return [];
+  }
   box.innerHTML = items
     .map(
       (source, index) => `<button class="draft-item source-item ${index === 0 ? "active" : ""}" data-index="${index}">
@@ -956,7 +997,11 @@ function renderSourceVideoList(sources) {
 }
 
 function playSourceItem(source) {
-  if (!source?.url) return;
+  if (!source?.url) {
+    $("fileViewer").textContent = "该原片没有可预览地址。";
+    return;
+  }
+  setPreviewMode("source");
   $("videoPreview").src = source.url;
   $("videoPreview").load();
   $("fileViewer").textContent = `正在预览原片：\n${source.label || source.file}`;
@@ -969,6 +1014,7 @@ function playSourceItem(source) {
 
 function renderDraftList() {
   const box = $("draftList");
+  if (!box) return;
   if (!state.drafts.length) {
     box.textContent = "当前任务还没有生成粗剪视频。";
     return;
@@ -988,6 +1034,7 @@ function renderDraftList() {
 
 function playDraft(draft) {
   if (!draft?.url) return;
+  setPreviewMode("draft");
   $("videoPreview").src = draft.url;
   $("videoPreview").load();
   $("fileViewer").textContent = `正在预览粗剪成片：\n${draft.file}`;

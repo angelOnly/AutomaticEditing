@@ -166,6 +166,7 @@ class RunOptions:
     skip_tts: bool = False
     skip_render: bool = False
     only_analysis: bool = False
+    common_only: bool = False
     target_duration_seconds: int | None = None
     output_mode: str = "single"
     max_output_videos: int = 1
@@ -197,6 +198,8 @@ class PipelineRunner:
             self.options.reassembly_target_seconds = int(self.config.raw.get("reassembly", {}).get("default_target_seconds", 90))
         if self.options.audio_policy == "original":
             self.options.require_tts = False
+        if self.options.common_only:
+            self.options.production_mode = "ai_voiceover"
         self.root = self.config.root_dir
         self.outputs_dir = (self.root / options.outputs_dir).resolve()
         self.task_id = options.task_id or self._new_task_id()
@@ -392,6 +395,18 @@ class PipelineRunner:
             if self.options.rerun_from not in step_order:
                 raise ValueError(f"未知步骤: {self.options.rerun_from}")
             return step_order[step_order.index(self.options.rerun_from) :]
+        if self.options.common_only:
+            common_steps = [
+                "metadata",
+                "audio_extract",
+                "frame_extract",
+                "chunk_build",
+                "asr",
+                "vision",
+                "timeline",
+                "timeline_digest",
+            ]
+            return [step for step in common_steps if step in step_order]
         return step_order
 
     def _active_step_order(self) -> list[str]:
@@ -3005,6 +3020,7 @@ def parse_args(argv: list[str] | None = None) -> RunOptions:
     parser.add_argument("--aspect-ratio", default=default_workflow.get("default_aspect_ratio", "16:9"), choices=["9:16", "16:9"])
     parser.add_argument("--skip-tts", action="store_true")
     parser.add_argument("--skip-render", action="store_true")
+    parser.add_argument("--common-only", action="store_true", help="Run only source-independent reusable analysis steps.")
     parser.add_argument("--only-analysis", action="store_true", help="只跑到风险审核，不生成配音和视频")
     parser.add_argument("--target-duration", type=int, default=int(default_config.short_video.get("default_target_seconds", 30)), dest="target_duration_seconds")
     parser.add_argument("--output-mode", choices=["single", "multiple"], default="single")
