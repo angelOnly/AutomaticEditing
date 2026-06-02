@@ -167,6 +167,10 @@ class RunOptions:
     skip_render: bool = False
     only_analysis: bool = False
     target_duration_seconds: int | None = None
+    output_mode: str = "single"
+    max_output_videos: int = 1
+    min_output_video_seconds: int = 30
+    max_output_video_seconds: int = 90
     allow_long_video: bool = False
     require_tts: bool = True
     voice_id: str | None = None
@@ -255,6 +259,9 @@ class PipelineRunner:
                 self.manifest["source_videos"] = source_manifest.get("sources", self.manifest.get("source_videos", []))
                 self.manifest["source_manifest"] = relpath(Path(self.options.source_manifest), self.task_dir)
                 self._save_manifest()
+            elif self.manifest.get("source_mode", "single_source") == "single_source":
+                self.manifest.setdefault("steps", {}).setdefault("source_prepare", {"status": "skipped", "reason": "single_source"})
+                self._save_manifest()
             return
         if not self.options.input:
             raise ValueError("首次运行必须提供 --input，断点续跑可只提供 --task-id")
@@ -287,7 +294,9 @@ class PipelineRunner:
             "source_manifest": task["source_manifest"],
             "source_videos": task["source_videos"],
             "current_versions": {},
-            "steps": {},
+            "steps": {
+                "source_prepare": {"status": "skipped", "reason": "single_source"}
+            } if not self.options.source_manifest else {},
         }
         self._save_manifest()
 
@@ -319,6 +328,10 @@ class PipelineRunner:
             "skip_tts": self.options.skip_tts,
             "skip_render": self.options.skip_render,
             "target_duration_seconds": self.options.target_duration_seconds,
+            "output_mode": self.options.output_mode,
+            "max_output_videos": self.options.max_output_videos,
+            "min_output_video_seconds": self.options.min_output_video_seconds,
+            "max_output_video_seconds": self.options.max_output_video_seconds,
             "allow_long_video": self.options.allow_long_video,
             "require_tts": self.options.require_tts,
             "voice_id": self.options.voice_id,
@@ -843,6 +856,9 @@ class PipelineRunner:
             "timeline": self._load_step_json("timeline"),
             "video_analysis": self._load_step_json("video_understanding"),
             "candidate_clips": self._load_step_json("highlight_detection"),
+            "source_mode": self.manifest.get("source_mode", "single_source"),
+            "source_videos": self.manifest.get("source_videos", []),
+            "source_manifest": self.manifest.get("source_manifest", ""),
         })
 
     def step_short_video_planning(self) -> None:
@@ -868,6 +884,9 @@ class PipelineRunner:
             "timeline_digest": self._load_step_json("timeline_digest"),
             "duration_strategy": self._duration_strategy_payload(),
             "run_options": self._run_options_payload(),
+            "source_mode": self.manifest.get("source_mode", "single_source"),
+            "source_videos": self.manifest.get("source_videos", []),
+            "source_manifest": self.manifest.get("source_manifest", ""),
         })
         result = self._normalize_short_video_split_decision(result)
         write_json(self.task_dir / self._step_output("short_video_edit_plan"), result)
@@ -1004,6 +1023,16 @@ class PipelineRunner:
         scripts = [x for x in edit_plan.get("scripts", []) if isinstance(x, dict)]
         if len(scripts) <= 1:
             return edit_plan
+        options = getattr(self, "options", None)
+        output_mode = getattr(options, "output_mode", "single")
+        if output_mode == "multiple":
+            normalized = dict(edit_plan)
+            max_count = max(2, min(int(getattr(options, "max_output_videos", 5) or 5), 10))
+            normalized["scripts"] = scripts[:max_count]
+            normalized["recommended_video_count"] = len(normalized["scripts"])
+            normalized["auto_merge_applied"] = False
+            normalized["output_mode_respected"] = "multiple"
+            return normalized
         if not self._should_merge_short_video_scripts(scripts):
             return edit_plan
 
@@ -1231,6 +1260,10 @@ class PipelineRunner:
             "require_tts": self.options.require_tts,
             "voice_id": self.options.voice_id,
             "production_mode": self.options.production_mode,
+            "output_mode": self.options.output_mode,
+            "max_output_videos": self.options.max_output_videos,
+            "min_output_video_seconds": self.options.min_output_video_seconds,
+            "max_output_video_seconds": self.options.max_output_video_seconds,
         }
 
     def _run_options_payload_minimal(self) -> dict[str, Any]:
@@ -1240,6 +1273,8 @@ class PipelineRunner:
             "audio_policy": self.options.audio_policy,
             "voice_id": self.options.voice_id,
             "production_mode": self.options.production_mode,
+            "output_mode": self.options.output_mode,
+            "max_output_videos": self.options.max_output_videos,
         }
 
     def _resolve_voice_config(self) -> dict[str, Any]:
@@ -1273,6 +1308,8 @@ class PipelineRunner:
     def _reassembly_options_payload(self) -> dict[str, Any]:
         return {
             "output_mode": self.options.reassembly_output_mode,
+            "requested_output_mode": self.options.output_mode,
+            "max_output_videos": self.options.max_output_videos,
             "sort_mode": self.options.reassembly_sort_mode,
             "target_seconds": self.options.reassembly_target_seconds,
             "min_clip_seconds": self.options.reassembly_min_clip_seconds,
@@ -2970,6 +3007,10 @@ def parse_args(argv: list[str] | None = None) -> RunOptions:
     parser.add_argument("--skip-render", action="store_true")
     parser.add_argument("--only-analysis", action="store_true", help="只跑到风险审核，不生成配音和视频")
     parser.add_argument("--target-duration", type=int, default=int(default_config.short_video.get("default_target_seconds", 30)), dest="target_duration_seconds")
+    parser.add_argument("--output-mode", choices=["single", "multiple"], default="single")
+    parser.add_argument("--max-output-videos", type=int, default=1)
+    parser.add_argument("--min-output-video-seconds", type=int, default=30)
+    parser.add_argument("--max-output-video-seconds", type=int, default=90)
     parser.add_argument("--allow-long-video", action="store_true", default=bool(default_config.short_video.get("allow_long_video_default", False)))
     parser.add_argument("--require-tts", action="store_true", default=bool(default_config.voiceover.get("tts_required_by_default", True)))
     parser.add_argument("--no-require-tts", action="store_false", dest="require_tts")
@@ -2985,11 +3026,16 @@ def parse_args(argv: list[str] | None = None) -> RunOptions:
     parser.add_argument("--reassembly-max-clip-count", type=int, default=8)
     parser.add_argument("--reassembly-export-individual-clips", action="store_true")
     args = parser.parse_args(argv)
+    if args.output_mode == "single":
+        args.max_output_videos = 1
+    else:
+        args.max_output_videos = max(2, min(int(args.max_output_videos or 5), 10))
     if args.production_mode == "highlight_reassembly":
         args.audio_policy = "original"
         args.skip_tts = True
         args.require_tts = False
         args.allow_original_audio_evidence = True
+        args.reassembly_output_mode = "multiple" if args.output_mode == "multiple" else "single"
     if args.skip_tts or args.audio_policy == "original":
         args.require_tts = False
     return RunOptions(**vars(args))

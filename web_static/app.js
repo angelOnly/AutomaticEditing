@@ -1,4 +1,5 @@
 ﻿const AI_VOICEOVER_STEPS = [
+  "source_prepare",
   "metadata",
   "audio_extract",
   "frame_extract",
@@ -18,6 +19,7 @@
 ];
 
 const HIGHLIGHT_REASSEMBLY_STEPS = [
+  "source_prepare",
   "metadata",
   "audio_extract",
   "frame_extract",
@@ -35,6 +37,7 @@ const HIGHLIGHT_REASSEMBLY_STEPS = [
 let STEPS = AI_VOICEOVER_STEPS;
 
 const STEP_LABELS = {
+  source_prepare: "准备多源素材",
   metadata: "读取视频信息",
   audio_extract: "提取音频",
   frame_extract: "抽取关键帧",
@@ -265,9 +268,9 @@ function bindEvents() {
   });
   $("refreshTasks").addEventListener("click", loadTasks);
   $("refreshAll").addEventListener("click", refreshAll);
-  $("runSelected").addEventListener("click", runSelected);
-  $("rerunOne").addEventListener("click", () => rerun(false));
-  $("rerunFrom").addEventListener("click", () => rerun(true));
+  $("runSelected").addEventListener("click", () => runSelected().catch(handleRunError));
+  $("rerunOne").addEventListener("click", () => rerun(false).catch(handleRunError));
+  $("rerunFrom").addEventListener("click", () => rerun(true).catch(handleRunError));
   $("audioPolicy").addEventListener("change", () => {
     $("audioPolicy").value = "ai_voiceover";
     $("allowOriginalAudioEvidence").checked = false;
@@ -278,6 +281,10 @@ function bindEvents() {
   });
   $("requireTtsSelect")?.addEventListener("change", () => {
     $("requireTts").checked = $("requireTtsSelect").value === "true";
+  });
+  $("outputMode")?.addEventListener("change", () => {
+    syncOutputModeControls();
+    updateSummaryControls();
   });
   $("previewVoice")?.addEventListener("click", previewSelectedVoice);
   document.querySelectorAll(".mode-option").forEach((button) => {
@@ -299,7 +306,10 @@ function bindEvents() {
     playSourceVideo();
   });
   $("openDraft").addEventListener("click", () => {
-    if (state.drafts.length) playDraft(state.drafts[0]);
+    if (state.drafts.length) {
+      renderDraftList();
+      playDraft(state.drafts[0]);
+    }
     else if (state.latestDraft?.exists) playDraft(state.latestDraft);
     else alert("当前任务还没有生成粗剪视频。");
   });
@@ -324,7 +334,7 @@ function onProductionModeChange() {
   });
   $("reassemblyOutputModeWrap")?.classList.add("hidden");
   $("reassemblySortModeWrap")?.classList.add("hidden");
-  $("reassemblyOutputMode").value = "single";
+  $("reassemblyOutputMode").value = $("outputMode")?.value === "multiple" ? "multiple" : "single";
   $("reassemblySortMode").value = "editorial";
   $("audioPolicy").value = isReassembly ? "original" : "ai_voiceover";
   $("requireTts").checked = !isReassembly && Boolean(state.defaults.tts_required_by_default);
@@ -337,6 +347,7 @@ function onProductionModeChange() {
   if (isReassembly && Number($("targetDuration").value || 0) < 60) $("targetDuration").value = 90;
   if (!isReassembly && Number($("targetDuration").value || 0) > 60) $("targetDuration").value = state.defaults.default_target_seconds || 30;
   syncFriendlyControls();
+  syncOutputModeControls();
   updateSummaryControls();
   fillStepSelect();
   renderManifest();
@@ -377,6 +388,12 @@ function syncModePicker() {
 
 function updateSummaryControls() {
   if ($("metricAspect")) $("metricAspect").textContent = $("aspectRatio")?.value || state.defaults.default_aspect_ratio || "16:9";
+}
+
+function syncOutputModeControls() {
+  const outputMode = $("outputMode")?.value || "single";
+  $("maxOutputVideosWrap")?.classList.toggle("hidden", outputMode !== "multiple");
+  if ($("reassemblyOutputMode")) $("reassemblyOutputMode").value = outputMode === "multiple" ? "multiple" : "single";
 }
 
 function updateChunkInputState() {
@@ -453,8 +470,7 @@ async function loadVideos() {
       applyDefaultControls();
       clearTaskPanels();
       updateActiveTitleForSources();
-      $("videoPreview").src = `/api/videos/preview?path=${encodeURIComponent(video.path)}`;
-      $("videoPreview").load();
+      playSourceVideo();
       loadVideos();
       renderRemoteVideos();
       loadTasks();
@@ -536,6 +552,7 @@ function addLocalSourceToBasket(video) {
   state.selectedRemoteVideo = null;
   renderSourceBasket();
   updateActiveTitleForSources();
+  playSourceVideo();
 }
 
 function addRemoteSourceToBasket(video) {
@@ -557,6 +574,7 @@ function addRemoteSourceToBasket(video) {
   state.selectedVideo = null;
   renderSourceBasket();
   updateActiveTitleForSources();
+  playSourceVideo();
 }
 
 function renderSourceBasket() {
@@ -870,9 +888,11 @@ async function loadLatestDraft(taskId, options = {}) {
 
 function playSourceVideo() {
   if (state.selectedTask) {
-    $("videoPreview").src = `/api/tasks/${state.selectedTask}/preview`;
-    $("videoPreview").load();
-    $("fileViewer").textContent = "正在预览原片。";
+    loadSourceVideos(state.selectedTask);
+  } else if (state.sourceBasket.length) {
+    const sources = state.sourceBasket.map(sourceBasketPreviewItem);
+    const previewItems = renderSourceVideoList(sources);
+    playSourceItem(previewItems[previewItems.length - 1] || previewItems[0]);
   } else if (state.selectedRemoteVideo) {
     const url = state.selectedRemoteVideo.preview_url || state.selectedRemoteVideo.media_low_url || state.selectedRemoteVideo.media_high_url;
     if (url) {
@@ -885,7 +905,66 @@ function playSourceVideo() {
     $("videoPreview").load();
     $("fileViewer").textContent = "正在预览原片。";
   }
+}
+
+function sourceBasketPreviewItem(item, index) {
+  const sourceIndex = index + 1;
+  if (item.source_type === "remote_ucms") {
+    const remote = item.remote_video || {};
+    return {
+      label: item.display_name || remote.display_name || remote.name || `远程素材 ${sourceIndex}`,
+      file: remote.name || remote.remote_id || "",
+      url: remote.preview_url || remote.media_low_url || remote.media_high_url || "",
+      source_index: sourceIndex,
+    };
+  }
+  return {
+    label: item.display_name || item.path || `本地素材 ${sourceIndex}`,
+    file: item.path || "",
+    url: `/api/videos/preview?path=${encodeURIComponent(item.path || "")}`,
+    source_index: sourceIndex,
+  };
+}
+
+async function loadSourceVideos(taskId) {
+  const sources = await api(`/api/tasks/${taskId}/source-videos`).catch(() => []);
+  if (!sources.length) {
+    $("videoPreview").src = `/api/tasks/${taskId}/preview`;
+    $("videoPreview").load();
+    $("fileViewer").textContent = "正在预览原片。";
+    return;
+  }
+  const previewItems = renderSourceVideoList(sources);
+  playSourceItem(previewItems[0]);
+}
+
+function renderSourceVideoList(sources) {
+  const box = $("draftList");
+  const items = sources.map((source, index) => ({ ...source, list_index: index }));
+  box.innerHTML = items
+    .map(
+      (source, index) => `<button class="draft-item source-item ${index === 0 ? "active" : ""}" data-index="${index}">
+        <strong>${escapeHtml(source.label || source.file || `原始素材 ${index + 1}`)}</strong>
+        <span>${escapeHtml(source.virtual_start && source.virtual_end ? `${source.virtual_start} - ${source.virtual_end}` : source.file || "原片")}</span>
+      </button>`,
+    )
+    .join("");
+  document.querySelectorAll(".source-item").forEach((item) => {
+    item.addEventListener("click", () => playSourceItem(items[Number(item.dataset.index)]));
+  });
+  return items;
+}
+
+function playSourceItem(source) {
+  if (!source?.url) return;
+  $("videoPreview").src = source.url;
+  $("videoPreview").load();
+  $("fileViewer").textContent = `正在预览原片：\n${source.label || source.file}`;
   document.querySelectorAll(".draft-item").forEach((item) => item.classList.remove("active"));
+  document.querySelectorAll(".source-item").forEach((item) => {
+    const current = Number(item.dataset.index || 0);
+    item.classList.toggle("active", current === Number(source.list_index || 0));
+  });
 }
 
 function renderDraftList() {
@@ -928,9 +1007,11 @@ function restoreRunControls(manifest) {
   if (typeof opts.allow_long_video === "boolean") $("allowLongVideo").checked = opts.allow_long_video;
   if (typeof opts.require_tts === "boolean") $("requireTts").checked = opts.require_tts;
   $("productionMode").value = opts.production_mode || "ai_voiceover";
+  if ($("outputMode")) $("outputMode").value = opts.output_mode || (opts.reassembly_output_mode === "multiple" ? "multiple" : "single");
+  if ($("maxOutputVideos")) $("maxOutputVideos").value = opts.max_output_videos || 5;
   $("audioPolicy").value = opts.production_mode === "highlight_reassembly" ? "original" : "ai_voiceover";
   $("allowOriginalAudioEvidence").checked = opts.production_mode === "highlight_reassembly";
-  $("reassemblyOutputMode").value = "single";
+  $("reassemblyOutputMode").value = $("outputMode")?.value === "multiple" ? "multiple" : "single";
   $("reassemblySortMode").value = "editorial";
   if (opts.reassembly_max_clip_count) $("reassemblyMaxClipCount").value = opts.reassembly_max_clip_count;
   if (opts.voice_id && $("voiceSelect")) $("voiceSelect").value = opts.voice_id;
@@ -939,6 +1020,7 @@ function restoreRunControls(manifest) {
   if (typeof opts.require_tts === "boolean" && $("productionMode").value !== "highlight_reassembly") $("requireTts").checked = opts.require_tts;
   $("runMode").value = "all";
   syncFriendlyControls();
+  syncOutputModeControls();
   updateSummaryControls();
 }
 
@@ -1208,26 +1290,7 @@ async function runSelected() {
   const req = baseRunRequest();
   const mode = $("runMode").value;
   req.task_id = taskId || null;
-  if (mode === "render_only") {
-    const existingTaskId = state.selectedTask || taskId;
-    if (!existingTaskId) {
-      alert("继续生成粗剪视频需要先选择已有任务，因为它依赖已经生成的 cut_plan。");
-      return;
-    }
-    const manifest = await api(`/api/tasks/${existingTaskId}/manifest`).catch(() => null);
-    const cutStepName = req.production_mode === "highlight_reassembly" ? "reassembly_cut_plan" : "cut_plan";
-    const cutPlan = manifest?.steps?.[cutStepName] || {};
-    if (!["success", "partial_success"].includes(cutPlan.status)) {
-      alert(`当前任务还不能生成粗剪视频：${cutStepName} 状态是 ${cutPlan.status || "missing"}。请先运行到 ${cutStepName} 成功。`);
-      return;
-    }
-    req.task_id = existingTaskId;
-    req.input_video = null;
-    req.rerun_from = cutStepName;
-    state.selectedTask = existingTaskId;
-    state.selectedVideo = null;
-    state.selectedRemoteVideo = null;
-  } else if (state.sourceBasket.length) {
+  if (state.sourceBasket.length) {
     req.source_items = state.sourceBasket.map((item) => {
       if (item.source_type === "remote_ucms") {
         return {
@@ -1247,6 +1310,27 @@ async function runSelected() {
     req.input_video = null;
     req.remote_video = null;
     req.task_id = taskId || null;
+    req.rerun = null;
+    req.rerun_from = null;
+  } else if (mode === "render_only") {
+    const existingTaskId = state.selectedTask || taskId;
+    if (!existingTaskId) {
+      alert("继续生成粗剪视频需要先选择已有任务，因为它依赖已经生成的 cut_plan。");
+      return;
+    }
+    const manifest = await api(`/api/tasks/${existingTaskId}/manifest`).catch(() => null);
+    const cutStepName = req.production_mode === "highlight_reassembly" ? "reassembly_cut_plan" : "cut_plan";
+    const cutPlan = manifest?.steps?.[cutStepName] || {};
+    if (!["success", "partial_success"].includes(cutPlan.status)) {
+      alert(`当前任务还不能生成粗剪视频：${cutStepName} 状态是 ${cutPlan.status || "missing"}。请先运行到 ${cutStepName} 成功。`);
+      return;
+    }
+    req.task_id = existingTaskId;
+    req.input_video = null;
+    req.rerun_from = cutStepName;
+    state.selectedTask = existingTaskId;
+    state.selectedVideo = null;
+    state.selectedRemoteVideo = null;
   } else if (state.selectedVideo) {
     req.input_video = state.selectedVideo.path;
     req.remote_video = null;
@@ -1263,6 +1347,7 @@ async function runSelected() {
     alert("请选择一个本地视频、远程素材或已有任务。");
     return;
   }
+  setRunControlsBusy(true);
   const job = await api("/api/run", { method: "POST", body: JSON.stringify(req) });
   afterJobStarted(job);
 }
@@ -1286,8 +1371,17 @@ async function rerun(fromStep) {
   }
   const chunk = $("chunkInput").value.trim();
   if (chunk && step === "vision") req.chunk = chunk;
+  setRunControlsBusy(true);
   const job = await api("/api/run", { method: "POST", body: JSON.stringify(req) });
   afterJobStarted(job);
+}
+
+function handleRunError(error) {
+  setRunControlsBusy(false);
+  const message = cleanError(error);
+  updateJobMessage(message);
+  $("logViewer").textContent = `任务提交失败：${message}`;
+  alert(`任务提交失败：${message}`);
 }
 
 function baseRunRequest() {
@@ -1295,9 +1389,12 @@ function baseRunRequest() {
   const targetDuration = Number($("targetDuration").value || state.defaults.default_target_seconds || 30);
   const allowLongVideo = $("allowLongVideo").checked;
   const productionMode = $("productionMode").value;
+  const outputMode = $("outputMode")?.value || "single";
   return {
     production_mode: productionMode,
-    reassembly_output_mode: $("reassemblyOutputMode").value,
+    output_mode: outputMode,
+    max_output_videos: outputMode === "multiple" ? Number($("maxOutputVideos")?.value || 5) : 1,
+    reassembly_output_mode: productionMode === "highlight_reassembly" ? (outputMode === "multiple" ? "multiple" : "single") : "single",
     reassembly_sort_mode: $("reassemblySortMode").value,
     reassembly_target_seconds: productionMode === "highlight_reassembly" ? targetDuration : null,
     reassembly_max_clip_count: Number($("reassemblyMaxClipCount").value || 8),
@@ -1328,8 +1425,14 @@ function afterJobStarted(job) {
   updateTaskSubtitle(job.task_id);
   $("metricJob").textContent = jobStatusLabel(job.status || "pending");
   updateJobMessage(job.message || "");
+  if (!job.job_id && job.status === "success") {
+    $("metricJob").textContent = "已完成";
+    $("logViewer").textContent = job.message || "相同任务已完成，已复用结果。";
+    loadManifest(job.task_id, { updatePreview: true }).catch(() => {});
+    loadTree().catch(() => {});
+    return;
+  }
   if (job.deduplicated) {
-    alert(job.message || "该任务正在执行，已切换到现有任务。");
     $("logViewer").textContent = job.message || "已切换到现有任务。";
   } else {
     updateProgress(0, STEPS.length, 0, 0, 0);
@@ -1337,8 +1440,10 @@ function afterJobStarted(job) {
     $("logViewer").textContent = "任务已提交，等待日志输出...";
   }
   if (state.activeJob) startJobPolling();
-  refreshActiveTaskSnapshot(job.task_id);
-  if (state.activeJob) refreshJobAndLog();
+  refreshActiveTaskSnapshot(job.task_id).catch(() => {});
+  if (state.activeJob) refreshJobAndLog().catch((error) => {
+    $("logViewer").textContent = `任务已提交，但刷新日志失败：${cleanError(error)}`;
+  });
 }
 
 function startJobPolling() {
@@ -1349,7 +1454,7 @@ function startJobPolling() {
 function setRunControlsBusy(isBusy) {
   ["runSelected", "rerunOne", "rerunFrom"].forEach((id) => {
     const button = $(id);
-    if (button) button.disabled = false;
+    if (button) button.disabled = Boolean(isBusy);
   });
 }
 
@@ -1456,7 +1561,7 @@ function clearTaskPanels() {
 }
 
 function syncSuggestedTaskIdForMode() {
-  const selectedName = state.selectedVideo?.name || state.selectedRemoteVideo?.name;
+  const selectedName = currentSuggestedTaskName();
   if (!selectedName || state.selectedTask) return;
   const input = $("taskIdInput");
   const value = input.value.trim();
@@ -1464,6 +1569,14 @@ function syncSuggestedTaskIdForMode() {
     input.value = suggestedTaskId(selectedName, $("productionMode").value);
     updateTaskSubtitle();
   }
+}
+
+function currentSuggestedTaskName() {
+  if (state.sourceBasket.length) {
+    const first = state.sourceBasket[0]?.display_name || "多源素材";
+    return state.sourceBasket.length === 1 ? first : `多源剪辑（${state.sourceBasket.length}段）`;
+  }
+  return state.selectedVideo?.name || state.selectedRemoteVideo?.name || "";
 }
 
 function updateTaskSubtitle(taskId = $("taskIdInput")?.value?.trim()) {

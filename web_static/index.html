@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>凤凰智剪</title>
     <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
-    <link rel="stylesheet" href="/static/styles.css?v=20260528_1120" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260601_multisource" />
   </head>
   <body>
     <div class="app-shell">
@@ -219,6 +219,17 @@
                     <option value="false">允许跳过</option>
                   </select>
                 </label>
+                <label class="select-like">
+                  <span>输出方式</span>
+                  <select id="outputMode">
+                    <option value="single" selected>生成一个视频</option>
+                    <option value="multiple">生成多个视频</option>
+                  </select>
+                </label>
+                <label id="maxOutputVideosWrap" class="select-like hidden">
+                  <span>最多成片数</span>
+                  <input id="maxOutputVideos" type="number" min="2" max="10" value="5" />
+                </label>
                 <label id="voiceSelectWrap" class="select-like">
                   <span>配音音色</span>
                   <select id="voiceSelect">
@@ -347,6 +358,6 @@
       </main>
     </div>
 
-    <script src="/static/app.js?v=20260528_1225"></script>
+    <script src="/static/app.js?v=20260601_multisource"></script>
   </body>
 </html>

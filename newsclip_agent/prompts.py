@@ -20,6 +20,28 @@ COMMON_JSON_OUTPUT_RULES = """
 9. 输出必须能被 json.loads 直接解析。"""
 
 
+MULTI_OUTPUT_PROGRAM_SPLIT_POLICY = """
+
+多结果输出策略：
+1. 必须读取 run_options.output_mode 和 run_options.max_output_videos。
+2. output_mode == "single" 时，只能输出 1 条完整视频，优先选择最核心主线做综合片。
+3. output_mode == "multiple" 时，可以输出 2 到 max_output_videos 条视频；每条都必须能独立发布，不能为了凑数量拆成碎片。
+4. 多条视频之间应尽量避免重复使用同一组 source_clip_ids；如果必须复用，必须说明新闻逻辑。
+5. 多条拆分应按事件、观点、人物阶段、知识点或历史节点分配素材，禁止把同一新闻链拆成多个低完整度短片。
+"""
+
+
+MULTI_SOURCE_BOUNDARY_POLICY = """
+
+多视频源边界策略：
+1. 如果输入包含 source_videos 或 source_manifest，当前 timeline 是多个源拼接后的虚拟时间轴。
+2. 不要把两个源之间的自然拼接边界误判为同一镜头内的跳切。
+3. 每条成片可以跨源选择片段，但必须保证叙事连续，避免从前一个源的半句话切到后一个源的半句话。
+4. 如果一条视频跨多个源，必须在 reason 或 split_reason 中说明跨源组合的新闻逻辑。
+5. 多条视频输出时，优先按事件、观点、人物阶段或历史节点分配源片段，避免所有视频都重复使用同一开头。
+"""
+
+
 ORIGINAL_AUDIO_VALUE_POLICY = """
 
 原声价值策略：
@@ -452,7 +474,7 @@ RISK_REVIEW_PROMPT = NEWS_BACKGROUND + AI_VOICEOVER_ORIGINAL_AUDIO_POLICY + ORIG
 }"""
 
 
-HIGHLIGHT_REASSEMBLY_PROMPT = NEWS_BACKGROUND + COMMON_JSON_OUTPUT_RULES + """
+HIGHLIGHT_REASSEMBLY_PROMPT = NEWS_BACKGROUND + MULTI_OUTPUT_PROGRAM_SPLIT_POLICY + MULTI_SOURCE_BOUNDARY_POLICY + COMMON_JSON_OUTPUT_RULES + """
 
 你是一名新闻短视频总编辑。当前任务不是生成 AI 解说，不要改写新闻文案，也不要规划 TTS。
 你的任务是从候选高光片段中选择可以直接使用原声的片段，按新闻编辑逻辑重组成一条或多条原声高光视频。
@@ -575,7 +597,7 @@ CONTENT_ANALYSIS_PROMPT = NEWS_BACKGROUND + VISUAL_EVIDENCE_POLICY + COMMON_JSON
 }"""
 
 
-SHORT_VIDEO_EDIT_PLAN_PROMPT = NEWS_BACKGROUND + SHORT_VIDEO_DURATION_POLICY + VOICEOVER_TIMING_POLICY + VISUAL_EVIDENCE_POLICY + COMMON_JSON_OUTPUT_RULES + """
+SHORT_VIDEO_EDIT_PLAN_PROMPT = NEWS_BACKGROUND + SHORT_VIDEO_DURATION_POLICY + VOICEOVER_TIMING_POLICY + VISUAL_EVIDENCE_POLICY + MULTI_OUTPUT_PROGRAM_SPLIT_POLICY + MULTI_SOURCE_BOUNDARY_POLICY + COMMON_JSON_OUTPUT_RULES + """
 
 你是新闻短视频剪辑导演。请根据 content_analysis 和 timeline_digest，一次性生成短视频规划和镜头脚本。
 

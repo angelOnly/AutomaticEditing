@@ -36,6 +36,7 @@ OUTPUTS_DIR = ROOT / "outputs"
 VIDEOS_DIR = ROOT / "videos"
 STATIC_DIR = ROOT / "web_static"
 RUNNER = ROOT / "run_pipeline.py"
+MULTI_SOURCE_RUNNER = ROOT / "run_multisource_pipeline.py"
 
 app = FastAPI(title="凤凰新闻视频智能拆条工作台")
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
@@ -86,6 +87,10 @@ class RunRequest(BaseModel):
     skip_render: bool = False
     target_duration_seconds: int = int(SHORT_VIDEO_DEFAULTS.get("default_target_seconds", 30))
     target_duration_mode: str = "fixed"
+    output_mode: str = "single"
+    max_output_videos: int = 1
+    min_output_video_seconds: int = 30
+    max_output_video_seconds: int = 90
     allow_long_video: bool = bool(SHORT_VIDEO_DEFAULTS.get("allow_long_video_default", False))
     require_tts: bool = bool(VOICEOVER_DEFAULTS.get("tts_required_by_default", True))
     voice_id: str | None = None
@@ -407,9 +412,10 @@ def list_tasks() -> list[dict[str, Any]]:
     seen_task_ids: set[str] = set()
     for task_dir in sorted([p for p in OUTPUTS_DIR.iterdir() if p.is_dir()], key=lambda p: p.stat().st_mtime, reverse=True):
         manifest = read_json(task_dir / "manifest.json", {})
-        if not manifest:
-            continue
         steps = manifest.get("steps", {})
+        source_request_exists = (task_dir / "input" / "source_request.json").exists()
+        if not manifest and not source_request_exists:
+            continue
         done = sum(1 for s in steps.values() if s.get("status") in {"success", "partial_success", "skipped"})
         stale = sum(1 for s in steps.values() if s.get("status") == "stale")
         failed = sum(1 for s in steps.values() if s.get("status") == "failed")
@@ -419,12 +425,12 @@ def list_tasks() -> list[dict[str, Any]]:
             {
                 "task_id": task_dir.name,
                 "source_video": manifest.get("source_video", ""),
-                "updated_at": manifest.get("updated_at", ""),
+                "updated_at": manifest.get("updated_at", datetime.fromtimestamp(task_dir.stat().st_mtime).isoformat(timespec="seconds")),
                 "created_at": manifest.get("created_at", ""),
                 "done_steps": done,
                 "stale_steps": stale,
                 "failed_steps": failed,
-                "step_count": len(steps),
+                "step_count": len(steps) or (1 if source_request_exists else 0),
                 "job_status": job_status,
             }
         )
@@ -468,7 +474,30 @@ def get_manifest(task_id: str) -> dict[str, Any]:
     task_dir = _task_dir(task_id)
     manifest = read_json(task_dir / "manifest.json", None)
     if manifest is None:
-        raise HTTPException(404, "manifest.json not found")
+        source_request = read_json(task_dir / "input" / "source_request.json", None)
+        if source_request is None:
+            raise HTTPException(404, "manifest.json not found")
+        manifest = {
+            "task_id": task_id,
+            "created_at": source_request.get("created_at", ""),
+            "updated_at": datetime.fromtimestamp(task_dir.stat().st_mtime).isoformat(timespec="seconds"),
+            "source_video": "",
+            "source_mode": "multi_source_pending",
+            "source_manifest": "",
+            "source_videos": [],
+            "last_web_run_options": {
+                "production_mode": "ai_voiceover",
+                "output_mode": source_request.get("output_mode", "single"),
+                "max_output_videos": source_request.get("max_output_videos", 1),
+                "aspect_ratio": source_request.get("aspect_ratio", "16:9"),
+            },
+            "steps": {
+                "source_prepare": {
+                    "status": "pending",
+                    "source_count": len(source_request.get("source_items") or []),
+                }
+            },
+        }
     _hydrate_manifest_options(task_dir, manifest)
     return manifest
 
@@ -515,6 +544,48 @@ def preview_source(task_id: str):
     return FileResponse(str(file_path))
 
 
+@app.get("/api/tasks/{task_id}/source-videos")
+def list_source_videos(task_id: str) -> list[dict[str, Any]]:
+    task_dir = _task_dir(task_id)
+    manifest = get_manifest(task_id)
+    sources: list[dict[str, Any]] = []
+    source = manifest.get("source_video")
+    if source:
+        sources.append(
+            {
+                "label": "拼接原片" if manifest.get("source_mode") == "multi_source_concat_proxy" else "原片",
+                "file": source,
+                "url": f"/api/tasks/{task_id}/file?path={source}",
+                "source_index": 0,
+            }
+        )
+    for index, item in enumerate(manifest.get("source_videos") or [], start=1):
+        if not isinstance(item, dict):
+            continue
+        file_ref = item.get("normalized_file") or ""
+        url = f"/api/tasks/{task_id}/file?path={file_ref}" if file_ref else ""
+        original = item.get("original_path") or ""
+        if not url and original:
+            try:
+                original_path = _resolve_input_video(str(original))
+                url = f"/api/videos/preview?path={relpath(original_path, ROOT)}"
+            except HTTPException:
+                url = ""
+        sources.append(
+            {
+                "label": item.get("display_name") or f"原始素材 {index}",
+                "file": file_ref or original,
+                "url": url,
+                "source_index": item.get("source_index", index),
+                "source_id": item.get("source_id", ""),
+                "duration_seconds": item.get("duration_seconds"),
+                "virtual_start": item.get("virtual_start", ""),
+                "virtual_end": item.get("virtual_end", ""),
+            }
+        )
+    return sources
+
+
 @app.get("/api/tasks/{task_id}/latest-video")
 def latest_video(task_id: str) -> dict[str, Any]:
     task_dir = _task_dir(task_id)
@@ -547,6 +618,7 @@ def list_draft_videos(task_id: str) -> list[dict[str, Any]]:
 
 @app.post("/api/run")
 def run_pipeline(req: RunRequest) -> dict[str, Any]:
+    _normalize_output_options(req)
     if req.production_mode == "highlight_reassembly":
         req.audio_policy = "original"
         req.require_tts = False
@@ -556,26 +628,35 @@ def run_pipeline(req: RunRequest) -> dict[str, Any]:
         req.audio_policy = "ai_voiceover"
         req.allow_original_audio_evidence = False
     _prepare_mode_switched_run(req)
-    source_items = _resolve_run_sources(req)
+    raw_source_items = _collect_source_items(req)
+    source_items: list[MultiSourceItem] = []
     source_manifest_path: Path | None = None
-    if len(source_items) > 1:
-        fingerprint = _multi_source_fingerprint(req, source_items)
-        input_name_for_task = _display_multi_source_name(source_items)
-        task_id = req.task_id.strip() if req.task_id else _make_task_id_from_fingerprint(input_name_for_task, req.production_mode, fingerprint)
+    source_request_path: Path | None = None
+    if len(raw_source_items) > 1:
+        _validate_source_request_items(raw_source_items)
+        fingerprint = _source_request_fingerprint(req, raw_source_items)
+        input_name_for_task = _display_source_request_name(raw_source_items)
+        task_id = _normalize_new_task_id(req.task_id, input_name_for_task, req.production_mode, fingerprint)
         task_dir = ensure_dir(OUTPUTS_DIR / task_id)
-        multi_source_config = PROJECT_CONFIG.raw.get("multi_source", {})
-        built = build_multi_source_video(
-            sources=source_items,
-            task_dir=task_dir,
-            root_dir=ROOT,
-            aspect_ratio=req.aspect_ratio,
-            fps=int(multi_source_config.get("fps", 25)),
-            sample_rate=int(multi_source_config.get("sample_rate", 48000)),
+        source_request_path = task_dir / "input" / "source_request.json"
+        ensure_dir(source_request_path.parent)
+        write_json(
+            source_request_path,
+            {
+                "source_items": raw_source_items,
+                "force_remote_download": req.force_remote_download,
+                "output_mode": req.output_mode,
+                "max_output_videos": req.max_output_videos,
+                "min_output_video_seconds": req.min_output_video_seconds,
+                "max_output_video_seconds": req.max_output_video_seconds,
+                "aspect_ratio": req.aspect_ratio,
+                "created_at": datetime.now().isoformat(timespec="seconds"),
+            },
         )
-        input_path = Path(built["input_video"])
-        source_manifest_path = Path(built["source_manifest"])
-        req.input_video = str(input_path)
-    elif source_items:
+        input_path = None
+    else:
+        source_items = _resolve_run_sources(req)
+    if source_items:
         input_path = source_items[0].path
         req.input_video = str(input_path)
         if source_items[0].source_type == "remote_ucms":
@@ -587,7 +668,7 @@ def run_pipeline(req: RunRequest) -> dict[str, Any]:
         else:
             task_id = _resolve_run_task_id(req)
         task_dir = ensure_dir(OUTPUTS_DIR / task_id)
-    else:
+    elif not raw_source_items:
         input_path = _prepare_run_input_video(req)
         fingerprint = _run_fingerprint(req, input_path) if input_path else ""
         input_name_for_task = _display_input_name(req)
@@ -633,7 +714,7 @@ def run_pipeline(req: RunRequest) -> dict[str, Any]:
     log_dir = ensure_dir(task_dir / "web_jobs")
     log_path = log_dir / f"{job_id}.log"
 
-    cmd = _build_run_command(req, task_id, input_path, source_manifest_path)
+    cmd = _build_run_command(req, task_id, input_path, source_manifest_path, source_request_path)
     _save_web_run_options(task_dir, req)
 
     with JOB_LOCK:
@@ -671,11 +752,13 @@ def _build_run_command(
     task_id: str,
     input_path: Path | None = None,
     source_manifest_path: Path | None = None,
+    source_request_path: Path | None = None,
 ) -> list[str]:
+    runner = MULTI_SOURCE_RUNNER if source_request_path else RUNNER
     cmd = [
         sys.executable,
         "-u",
-        str(RUNNER),
+        str(runner),
         "--task-id",
         task_id,
         "--chunk-seconds",
@@ -690,6 +773,14 @@ def _build_run_command(
         req.audio_policy,
         "--production-mode",
         req.production_mode,
+        "--output-mode",
+        req.output_mode,
+        "--max-output-videos",
+        str(req.max_output_videos),
+        "--min-output-video-seconds",
+        str(req.min_output_video_seconds),
+        "--max-output-video-seconds",
+        str(req.max_output_video_seconds),
     ]
     if req.voice_id:
         cmd.extend(["--voice-id", req.voice_id])
@@ -705,6 +796,8 @@ def _build_run_command(
         cmd.extend(["--input", str(input_path)])
     if source_manifest_path:
         cmd.extend(["--source-manifest", str(source_manifest_path)])
+    if source_request_path:
+        cmd.extend(["--source-request", str(source_request_path)])
     if req.rerun:
         cmd.extend(["--rerun", req.rerun])
     if req.rerun_from:
@@ -1108,6 +1201,35 @@ def _collect_source_items(req: RunRequest) -> list[dict[str, Any]]:
     return items
 
 
+def _normalize_output_options(req: RunRequest) -> None:
+    if req.output_mode not in {"single", "multiple"}:
+        req.output_mode = "single"
+    if req.output_mode == "single":
+        req.max_output_videos = 1
+    else:
+        req.max_output_videos = max(2, min(int(req.max_output_videos or 5), 10))
+    req.min_output_video_seconds = max(5, int(req.min_output_video_seconds or 30))
+    req.max_output_video_seconds = max(req.min_output_video_seconds, int(req.max_output_video_seconds or 90))
+    if req.production_mode == "highlight_reassembly":
+        req.reassembly_output_mode = "multiple" if req.output_mode == "multiple" else "single"
+
+
+def _validate_source_request_items(items: list[dict[str, Any]]) -> None:
+    for index, item in enumerate(items, start=1):
+        source_type = str(item.get("source_type") or item.get("type") or "local")
+        if source_type in {"local", "video"}:
+            path_value = item.get("path") or item.get("input_video")
+            if not path_value:
+                raise HTTPException(400, f"source_items[{index}].path is required")
+            _resolve_input_video(str(path_value))
+        elif source_type in {"remote", "remote_ucms"}:
+            remote_video = item.get("remote_video") or item
+            if not isinstance(remote_video, dict):
+                raise HTTPException(400, f"source_items[{index}].remote_video is required")
+        else:
+            raise HTTPException(400, f"unsupported source_type: {source_type}")
+
+
 def _resolve_run_sources(req: RunRequest) -> list[MultiSourceItem]:
     raw_items = _collect_source_items(req)
     if not raw_items:
@@ -1209,7 +1331,7 @@ def _resolve_task_source(task_dir: Path, source: str) -> Path:
 
 
 def _prepare_mode_switched_run(req: RunRequest) -> None:
-    if req.input_video or req.rerun or req.rerun_from or not req.task_id:
+    if _collect_source_items(req) or req.rerun or req.rerun_from or not req.task_id:
         return
 
     source_task_id = req.task_id.strip()
@@ -1285,6 +1407,14 @@ def _run_fingerprint(req: RunRequest, input_path: Path | None) -> str:
         "video": _video_fingerprint(input_path) if input_path else None,
         "remote": _remote_video_fingerprint(req.remote_video),
         "production_mode": req.production_mode,
+        "output_mode": req.output_mode,
+        "max_output_videos": req.max_output_videos,
+        "aspect_ratio": req.aspect_ratio,
+        "chunk_seconds": req.chunk_seconds,
+        "frame_interval": req.frame_interval,
+        "target_duration_seconds": req.target_duration_seconds,
+        "reassembly_target_seconds": req.reassembly_target_seconds,
+        "reassembly_max_clip_count": req.reassembly_max_clip_count,
     }
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
@@ -1304,7 +1434,14 @@ def _multi_source_fingerprint(req: RunRequest, sources: list[MultiSourceItem]) -
             for item in sources
         ],
         "production_mode": req.production_mode,
+        "output_mode": req.output_mode,
+        "max_output_videos": req.max_output_videos,
         "aspect_ratio": req.aspect_ratio,
+        "chunk_seconds": req.chunk_seconds,
+        "frame_interval": req.frame_interval,
+        "target_duration_seconds": req.target_duration_seconds,
+        "reassembly_target_seconds": req.reassembly_target_seconds,
+        "reassembly_max_clip_count": req.reassembly_max_clip_count,
     }
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
@@ -1313,6 +1450,39 @@ def _multi_source_fingerprint(req: RunRequest, sources: list[MultiSourceItem]) -
 def _display_multi_source_name(sources: list[MultiSourceItem]) -> str:
     first = sources[0].display_name or sources[0].path.stem
     return f"multi_{len(sources)}_{first}"
+
+
+def _source_request_fingerprint(req: RunRequest, items: list[dict[str, Any]]) -> str:
+    payload_items = []
+    for index, item in enumerate(items, start=1):
+        source_type = str(item.get("source_type") or item.get("type") or "local")
+        if source_type in {"local", "video"}:
+            path = _resolve_input_video(str(item.get("path") or item.get("input_video")))
+            payload_items.append({"order": index, "source_type": "local", **_video_fingerprint(path)})
+        else:
+            remote_video = item.get("remote_video") or item
+            payload_items.append({"order": index, "source_type": "remote_ucms", "remote": _remote_video_fingerprint(remote_video)})
+    payload = {
+        "sources": payload_items,
+        "production_mode": req.production_mode,
+        "output_mode": req.output_mode,
+        "max_output_videos": req.max_output_videos,
+        "aspect_ratio": req.aspect_ratio,
+        "chunk_seconds": req.chunk_seconds,
+        "frame_interval": req.frame_interval,
+        "target_duration_seconds": req.target_duration_seconds,
+        "reassembly_target_seconds": req.reassembly_target_seconds,
+        "reassembly_max_clip_count": req.reassembly_max_clip_count,
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _display_source_request_name(items: list[dict[str, Any]]) -> str:
+    first = items[0] if items else {}
+    remote = first.get("remote_video") if isinstance(first.get("remote_video"), dict) else first
+    name = first.get("display_name") or first.get("path") or remote.get("name") or remote.get("id") or "source"
+    return f"multi_{len(items)}_{Path(str(name)).stem}"
 
 
 def _remote_video_fingerprint(remote_video: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -1337,6 +1507,13 @@ def _make_task_id_from_fingerprint(input_video: str | None, production_mode: str
         safe = "".join(ch if ch.isalnum() else "_" for ch in name).strip("_")
         prefix = safe[:24] or "task"
     return f"{prefix}_{_mode_slug(production_mode)}_{fingerprint}"
+
+
+def _normalize_new_task_id(task_id: str | None, input_name: str | None, production_mode: str, fingerprint: str) -> str:
+    task_id = (task_id or "").strip()
+    if not task_id:
+        return _make_task_id_from_fingerprint(input_name, production_mode, fingerprint)
+    return _with_mode_suffix(task_id, production_mode)
 
 
 def _with_mode_suffix(task_id: str, production_mode: str) -> str:

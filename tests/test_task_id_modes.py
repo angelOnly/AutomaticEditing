@@ -46,6 +46,34 @@ def test_existing_task_reruns_keep_selected_task_id() -> None:
     assert _resolve_run_task_id(req) == "example_20260527_1615"
 
 
+def test_new_multisource_request_with_task_id_does_not_switch_mode() -> None:
+    req = RunRequest(
+        task_id="new_multisource_task",
+        source_items=[
+            {"source_type": "local", "path": "videos/a.mp4"},
+            {"source_type": "local", "path": "videos/b.mp4"},
+        ],
+        production_mode="highlight_reassembly",
+    )
+
+    _prepare_mode_switched_run(req)
+
+    assert req.task_id == "new_multisource_task"
+    assert req.input_video is None
+
+
+def test_new_multisource_task_id_mode_suffix_is_normalized() -> None:
+    task_id = web_app._normalize_new_task_id(
+        "多源剪辑_2段_AI配音解说_20260602_115300",
+        "多源剪辑（2段）",
+        "highlight_reassembly",
+        "abcdef1234567890",
+    )
+
+    assert "视频重组" in task_id
+    assert "AI配音解说" not in task_id
+
+
 def test_mode_specific_task_id_is_replaced_when_mode_changes() -> None:
     task_id = "example_AI配音解说_20260527_161530"
 
