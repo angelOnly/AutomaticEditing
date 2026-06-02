@@ -52,11 +52,12 @@ def test_tts_segments_to_srt_generates_multiple_single_line_cues(tmp_path: Path)
 
     srt = runner._tts_segments_to_srt(segments)
     text_lines = text_lines_from_srt(srt)
+    max_chars = runner._subtitle_max_chars_per_line()
 
     assert "00:00:00" in srt
     assert "\n2\n" in srt
     assert len(text_lines) >= 3
-    assert all(len(line) <= 22 for line in text_lines)
+    assert all(len(line) <= max_chars for line in text_lines)
 
 
 def test_subtitle_segment_mode_keeps_legacy_single_block(tmp_path: Path) -> None:

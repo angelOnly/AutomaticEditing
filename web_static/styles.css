@@ -455,6 +455,17 @@ h3 {
   background: #f3f6fa;
 }
 
+.button.danger {
+  background: #dc2626;
+  border-color: #dc2626;
+  color: #fff;
+}
+
+.button.danger:hover:not(:disabled) {
+  background: #b91c1c;
+  border-color: #b91c1c;
+}
+
 .button:disabled {
   opacity: 0.55;
   cursor: not-allowed;

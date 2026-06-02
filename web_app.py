@@ -4,6 +4,7 @@ import os
 import hashlib
 import json
 import shutil
+import signal
 import subprocess
 import sys
 import uuid
@@ -488,6 +489,10 @@ def get_manifest(task_id: str) -> dict[str, Any]:
         source_request = read_json(task_dir / "input" / "source_request.json", None)
         if source_request is None:
             raise HTTPException(404, "manifest.json not found")
+        production_mode = source_request.get(
+            "production_mode",
+            _task_id_production_mode(task_id) or "ai_voiceover",
+        )
         manifest = {
             "task_id": task_id,
             "created_at": source_request.get("created_at", ""),
@@ -496,18 +501,25 @@ def get_manifest(task_id: str) -> dict[str, Any]:
             "source_mode": "multi_source_pending",
             "source_manifest": "",
             "source_videos": [],
+            "production_mode": production_mode,
             "common_task_id": source_request.get("common_task_id", ""),
             "common_source_key": source_request.get("common_source_key", ""),
             "last_web_run_options": {
-                "production_mode": source_request.get(
-                    "production_mode",
-                    _task_id_production_mode(task_id) or "ai_voiceover",
-                ),
+                "production_mode": production_mode,
                 "output_mode": source_request.get("output_mode", "single"),
                 "max_output_videos": source_request.get("max_output_videos", 1),
                 "min_output_video_seconds": source_request.get("min_output_video_seconds", 30),
                 "max_output_video_seconds": source_request.get("max_output_video_seconds", 90),
                 "aspect_ratio": source_request.get("aspect_ratio", "16:9"),
+                "chunk_seconds": source_request.get(
+                    "chunk_seconds",
+                    int(WORKFLOW_DEFAULTS.get("default_chunk_seconds", 60)),
+                ),
+                "frame_interval": source_request.get(
+                    "frame_interval",
+                    int(WORKFLOW_DEFAULTS.get("default_frame_interval", 10)),
+                ),
+                "mode": source_request.get("mode", "normal"),
                 "common_task_id": source_request.get("common_task_id", ""),
                 "common_source_key": source_request.get("common_source_key", ""),
             },
@@ -875,6 +887,26 @@ def _build_run_command(
     return cmd
 
 
+def _terminate_process_tree(pid: int) -> None:
+    if pid <= 0:
+        return
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        return
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except Exception:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+
 def _start_job(job: dict[str, Any]) -> None:
     log_path = Path(job["log_path"])
     log_file = log_path.open("a", encoding="utf-8", errors="replace")
@@ -894,6 +926,7 @@ def _start_job(job: dict[str, Any]) -> None:
         errors="replace",
         env=env,
         creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        start_new_session=(os.name != "nt"),
     )
     job.update(
         {
@@ -1057,6 +1090,57 @@ def get_job_log(job_id: str) -> PlainTextResponse:
     if not path.exists():
         return PlainTextResponse("")
     return PlainTextResponse(path.read_text(encoding="utf-8", errors="replace")[-80_000:])
+
+
+@app.delete("/api/jobs/{job_id}")
+def cancel_job(job_id: str) -> dict[str, Any]:
+    if job_id not in JOBS:
+        raise HTTPException(404, "job not found")
+
+    with JOB_LOCK:
+        job = JOBS[job_id]
+        status = job.get("status")
+        if status == "pending":
+            try:
+                PENDING_JOB_IDS.remove(job_id)
+            except ValueError:
+                pass
+            job["status"] = "cancelled"
+            job["returncode"] = -9
+            job["finished_at"] = datetime.now().isoformat(timespec="seconds")
+            job["user_message"] = "任务已取消。"
+            _persist_job(job)
+            _schedule_jobs()
+            return _public_job(job)
+
+        if status != "running":
+            return _public_job(job)
+
+        pid = int(job.get("pid") or 0)
+        _terminate_process_tree(pid)
+        process = job.get("process")
+        if process:
+            try:
+                process.wait(timeout=3)
+            except Exception:
+                pass
+
+        log_file = job.get("log_file")
+        if log_file:
+            try:
+                log_file.write("\n=== job cancelled by user ===\n")
+                log_file.flush()
+                log_file.close()
+            except Exception:
+                pass
+
+        job["status"] = "cancelled"
+        job["returncode"] = -9
+        job["finished_at"] = datetime.now().isoformat(timespec="seconds")
+        job["user_message"] = "任务已手动终止。"
+        _persist_job(job)
+        _schedule_jobs()
+        return _public_job(job)
 
 
 def _refresh_job(job_id: str, schedule_next: bool = True) -> dict[str, Any]:

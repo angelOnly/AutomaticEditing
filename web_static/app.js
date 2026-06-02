@@ -7,10 +7,9 @@
   "asr",
   "vision",
   "timeline",
-  "video_understanding",
-  "highlight_detection",
-  "short_video_planning",
-  "editing_script",
+  "timeline_digest",
+  "content_analysis",
+  "short_video_edit_plan",
   "voiceover_script",
   "tts",
   "subtitles",
@@ -27,6 +26,7 @@ const HIGHLIGHT_REASSEMBLY_STEPS = [
   "asr",
   "vision",
   "timeline",
+  "timeline_digest",
   "video_understanding",
   "highlight_detection",
   "highlight_reassembly_plan",
@@ -45,6 +45,9 @@ const STEP_LABELS = {
   asr: "语音转文字",
   vision: "画面识别",
   timeline: "合并时间线",
+  timeline_digest: "压缩分析时间线",
+  content_analysis: "内容分析",
+  short_video_edit_plan: "短视频剪辑规划",
   video_understanding: "理解整条新闻",
   highlight_detection: "识别高光片段",
   short_video_planning: "规划短视频",
@@ -68,6 +71,7 @@ const STATUS_LABELS = {
   failed: "失败",
   running: "运行中",
   queued: "排队中",
+  cancelled: "已取消",
 };
 
 const PRODUCTION_MODE_NAMES = {
@@ -270,6 +274,9 @@ function bindEvents() {
   });
   $("refreshTasks").addEventListener("click", loadTasks);
   $("refreshAll").addEventListener("click", refreshAll);
+  $("stopJob")?.addEventListener("click", () => cancelActiveJob().catch((error) => {
+    updateJobMessage(`终止任务失败：${cleanError(error)}`);
+  }));
   $("runSelected").addEventListener("click", () => runSelected().catch(handleRunError));
   $("rerunOne").addEventListener("click", () => rerun(false).catch(handleRunError));
   $("rerunFrom").addEventListener("click", () => rerun(true).catch(handleRunError));
@@ -1503,6 +1510,35 @@ function setRunControlsBusy(isBusy) {
     const button = $(id);
     if (button) button.disabled = Boolean(isBusy);
   });
+  updateStopJobButton();
+}
+
+function updateStopJobButton() {
+  const button = $("stopJob");
+  if (!button) return;
+  const active = Boolean(state.activeJob);
+  button.classList.toggle("hidden", !active);
+  button.disabled = !active;
+}
+
+async function cancelActiveJob() {
+  if (!state.activeJob) return;
+  const jobId = state.activeJob;
+  const button = $("stopJob");
+  if (button) button.disabled = true;
+  const job = await api(`/api/jobs/${jobId}`, { method: "DELETE" });
+  state.activeJob = null;
+  if (state.logTimer) {
+    clearInterval(state.logTimer);
+    state.logTimer = null;
+  }
+  setRunControlsBusy(false);
+  updateStopJobButton();
+  $("metricJob").textContent = jobStatusLabel(job.status);
+  updateJobMessage(job.user_message || "任务已取消。");
+  await refreshActiveTaskSnapshot(job.task_id).catch(() => {});
+  await refreshLog().catch(() => {});
+  await loadTasks().catch(() => {});
 }
 
 async function refreshJobAndLog() {
@@ -1513,6 +1549,7 @@ async function refreshJobAndLog() {
   } catch (error) {
     state.activeJob = null;
     setRunControlsBusy(false);
+    updateStopJobButton();
     $("metricJob").textContent = "空闲";
     updateJobMessage("上一次运行状态已失效，可能是服务重启后浏览器保留了旧任务锁。现在可以重新启动任务。");
     if (state.logTimer) {
@@ -1530,6 +1567,7 @@ async function refreshJobAndLog() {
     state.logTimer = null;
     state.activeJob = null;
     setRunControlsBusy(false);
+    updateStopJobButton();
     await loadTasks();
     await loadManifest(job.task_id).catch(() => {});
     await loadTree().catch(() => {});

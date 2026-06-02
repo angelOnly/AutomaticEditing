@@ -176,8 +176,9 @@ VISION_CHUNK_PROMPT = """你是一名凤凰卫视新闻视频画面分析编辑�
 
 
 VIDEO_UNDERSTANDING_PROMPT = NEWS_BACKGROUND + """
+请只读取输入中的 timeline_digest，不要要求或依赖完整 merged_timeline。
 
-你是一名新闻主编，请根据 merged_timeline 理解整条视频内容，输出 JSON：
+你是一名新闻主编，请根据 timeline_digest 理解整条视频内容，输出 JSON：
 {
   "main_topic": "",
   "video_type": "",
@@ -191,8 +192,9 @@ VIDEO_UNDERSTANDING_PROMPT = NEWS_BACKGROUND + """
 
 
 HIGHLIGHT_DETECTION_PROMPT = NEWS_BACKGROUND + VISUAL_EVIDENCE_POLICY + ORIGINAL_AUDIO_VALUE_POLICY + COMMON_JSON_OUTPUT_RULES + """
+请根据 timeline_digest 和 video_analysis 识别候选高光片段，不要要求完整 merged_timeline。
 
-你是一名凤凰卫视新闻短视频主编。请从完整新闻时间轴中找出所有适合剪成短视频的候选片段。
+你是一名凤凰卫视新闻短视频主编。请从压缩后的新闻时间轴摘要中找出所有适合剪成短视频的候选片段。
 
 候选片段必须满足至少以下条件之一：核心新闻事实、最新进展、现场画面或记者连线、权威表态、发布会交锋、嘉宾关键解读、清晰数据或时间线、较强短视频开头价值。
 
@@ -475,6 +477,7 @@ RISK_REVIEW_PROMPT = NEWS_BACKGROUND + AI_VOICEOVER_ORIGINAL_AUDIO_POLICY + ORIG
 
 
 HIGHLIGHT_REASSEMBLY_PROMPT = NEWS_BACKGROUND + MULTI_OUTPUT_PROGRAM_SPLIT_POLICY + MULTI_SOURCE_BOUNDARY_POLICY + COMMON_JSON_OUTPUT_RULES + """
+请根据 timeline_digest、video_analysis 和 candidate_clips 进行重组规划，不要要求完整 timeline。
 
 你是一名新闻短视频总编辑。当前任务不是生成 AI 解说，不要改写新闻文案，也不要规划 TTS。
 你的任务是从候选高光片段中选择可以直接使用原声的片段，按新闻编辑逻辑重组成一条或多条原声高光视频。

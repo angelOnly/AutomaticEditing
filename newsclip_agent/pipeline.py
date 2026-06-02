@@ -112,8 +112,8 @@ DEPENDENCIES = {
     "timeline_digest": ["timeline"],
     "content_analysis": ["timeline_digest"],
     "short_video_edit_plan": ["content_analysis", "timeline_digest"],
-    "video_understanding": ["timeline"],
-    "highlight_detection": ["timeline", "video_understanding"],
+    "video_understanding": ["timeline_digest"],
+    "highlight_detection": ["timeline_digest", "video_understanding"],
     "short_video_planning": ["highlight_detection", "video_understanding"],
     "editing_script": ["short_video_planning", "highlight_detection", "timeline"],
     "voiceover_script": ["short_video_edit_plan"],
@@ -122,7 +122,7 @@ DEPENDENCIES = {
     "subtitles": ["voiceover_script", "tts"],
     "cut_plan": ["short_video_edit_plan", "voiceover_script", "subtitles", "tts"],
     "render": ["cut_plan"],
-    "highlight_reassembly_plan": ["highlight_detection", "video_understanding", "timeline"],
+    "highlight_reassembly_plan": ["highlight_detection", "video_understanding", "timeline_digest"],
     "reassembly_cut_plan": ["highlight_reassembly_plan"],
     "reassembly_render": ["reassembly_cut_plan"],
 }
@@ -151,6 +151,7 @@ class RunOptions:
     resume: bool = True
     rerun: str | None = None
     rerun_from: str | None = None
+    stop_after: str | None = None
     chunk: str | None = None
     failed_only: bool = False
     mode: str = "normal"
@@ -238,12 +239,16 @@ class PipelineRunner:
                     continue
                 handler = getattr(self, f"step_{step}")
                 started = time.perf_counter()
+                self._mark_running(step)
                 try:
                     handler()
                 except Exception as exc:
                     self._mark_failed(step, self._user_facing_error_message(exc), elapsed_seconds=round(time.perf_counter() - started, 3))
                     raise
                 self.manifest.setdefault("steps", {}).setdefault(step, {})["elapsed_seconds"] = round(time.perf_counter() - started, 3)
+                self._save_manifest()
+            if self.manifest.get("status") not in {"failed", "action_required"}:
+                self.manifest["status"] = "success"
                 self._save_manifest()
         finally:
             if self.options.release_asr_after_task and self._asr_engine is not None:
@@ -390,12 +395,12 @@ class PipelineRunner:
         if self.options.rerun:
             if self.options.rerun not in step_order:
                 raise ValueError(f"未知步骤: {self.options.rerun}")
-            return [self.options.rerun]
-        if self.options.rerun_from:
+            selected = [self.options.rerun]
+        elif self.options.rerun_from:
             if self.options.rerun_from not in step_order:
                 raise ValueError(f"未知步骤: {self.options.rerun_from}")
-            return step_order[step_order.index(self.options.rerun_from) :]
-        if self.options.common_only:
+            selected = step_order[step_order.index(self.options.rerun_from) :]
+        elif self.options.common_only:
             common_steps = [
                 "metadata",
                 "audio_extract",
@@ -406,8 +411,15 @@ class PipelineRunner:
                 "timeline",
                 "timeline_digest",
             ]
-            return [step for step in common_steps if step in step_order]
-        return step_order
+            selected = [step for step in common_steps if step in step_order]
+        else:
+            selected = step_order
+
+        if self.options.stop_after:
+            if self.options.stop_after not in selected:
+                raise ValueError(f"未知 stop_after 步骤或不在本次执行范围内: {self.options.stop_after}")
+            selected = selected[: selected.index(self.options.stop_after) + 1]
+        return selected
 
     def _active_step_order(self) -> list[str]:
         if self.options.production_mode == "highlight_reassembly":
@@ -483,6 +495,16 @@ class PipelineRunner:
             "reason": reason,
             "updated_at": now_iso(),
             "can_rerun": True,
+        }
+        self._save_manifest()
+
+    def _mark_running(self, step: str) -> None:
+        self.manifest["status"] = "running"
+        self.manifest.setdefault("steps", {})[step] = {
+            "step_name": step,
+            "status": "running",
+            "updated_at": now_iso(),
+            "can_rerun": False,
         }
         self._save_manifest()
 
@@ -855,12 +877,12 @@ class PipelineRunner:
 
     def step_video_understanding(self) -> None:
         self._run_text_agent("video_understanding", {
-            "merged_timeline": self._load_step_json("timeline"),
+            "timeline_digest": self._load_step_json("timeline_digest"),
         })
 
     def step_highlight_detection(self) -> None:
         self._run_text_agent("highlight_detection", {
-            "merged_timeline": self._load_step_json("timeline"),
+            "timeline_digest": self._load_step_json("timeline_digest"),
             "video_analysis": self._load_step_json("video_understanding"),
         })
 
@@ -868,7 +890,7 @@ class PipelineRunner:
         self._run_text_agent("highlight_reassembly_plan", {
             "run_options": self._run_options_payload(),
             "reassembly_options": self._reassembly_options_payload(),
-            "timeline": self._load_step_json("timeline"),
+            "timeline_digest": self._load_step_json("timeline_digest"),
             "video_analysis": self._load_step_json("video_understanding"),
             "candidate_clips": self._load_step_json("highlight_detection"),
             "source_mode": self.manifest.get("source_mode", "single_source"),
@@ -1183,8 +1205,11 @@ class PipelineRunner:
     def _log_llm_input_size(self, step: str, input_data: dict[str, Any]) -> None:
         text = json.dumps(input_data, ensure_ascii=False)
         print(f"LLM input size [{step}]: {len(text)} chars")
-        if len(text) > 10000:
-            print(f"warning: {step} input exceeds 10000 chars; check digest compaction")
+        limit = int(self.config.raw.get("llm_input", {}).get("max_text_agent_input_chars", 60000) or 60000)
+        if len(text) > limit:
+            raise RuntimeError(
+                f"LLM input size [{step}] exceeds max_text_agent_input_chars={limit}; 应改用 timeline_digest"
+            )
 
     def _run_text_agent(self, step: str, input_data: dict[str, Any]) -> dict[str, Any]:
         if self.llm_text is None:
@@ -3010,6 +3035,7 @@ def parse_args(argv: list[str] | None = None) -> RunOptions:
     parser.add_argument("--model", help="本次重跑指定模型")
     parser.add_argument("--prompt-version", help="本次重跑指定 Prompt 版本标记")
     parser.add_argument("--use-version", action="append", help="指定当前使用版本，例如 vision=v2")
+    parser.add_argument("--stop-after", choices=ALL_STEP_ORDER, default=None)
     default_config = load_config("config.toml")
     default_workflow = default_config.workflow
     parser.add_argument("--chunk-seconds", type=int, default=int(default_workflow.get("default_chunk_seconds", 60)))
