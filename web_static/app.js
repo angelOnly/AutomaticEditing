@@ -646,6 +646,7 @@ function updateSourceBasketItem(id, action) {
   }
   renderSourceBasket();
   updateActiveTitleForSources();
+  playSourceVideo().catch((error) => console.warn("素材预览刷新失败", error));
 }
 
 function moveSourceBefore(sourceId, targetId) {
@@ -658,6 +659,7 @@ function moveSourceBefore(sourceId, targetId) {
   state.sourceBasket.splice(nextTo, 0, item);
   renderSourceBasket();
   updateActiveTitleForSources();
+  playSourceVideo().catch((error) => console.warn("素材预览刷新失败", error));
 }
 
 function bindSourceDropZone() {
@@ -700,7 +702,28 @@ function updateActiveTitleForSources() {
 }
 
 function makeSourceId() {
-  return crypto.randomUUID ? crypto.randomUUID() : `src_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+  const cryptoObj = globalThis.crypto || globalThis.msCrypto;
+
+  if (cryptoObj && typeof cryptoObj.randomUUID === "function") {
+    return cryptoObj.randomUUID();
+  }
+
+  if (cryptoObj && typeof cryptoObj.getRandomValues === "function") {
+    const bytes = new Uint8Array(16);
+    cryptoObj.getRandomValues(bytes);
+
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+
+    const hex = [...bytes].map((byte) => byte.toString(16).padStart(2, "0"));
+    return `src_${hex.slice(0, 4).join("")}-${hex.slice(4, 6).join("")}-${hex
+      .slice(6, 8)
+      .join("")}-${hex.slice(8, 10).join("")}-${hex.slice(10, 16).join("")}`;
+  }
+
+  return `src_${Date.now()}_${Math.random().toString(16).slice(2)}_${Math.random()
+    .toString(16)
+    .slice(2)}`;
 }
 
 function renderRemoteError(error) {
@@ -1010,12 +1033,12 @@ function syncPreviewTabs() {
 
 async function playSourceVideo() {
   setPreviewMode("source");
-  if (state.selectedTask) {
-    await loadSourceVideos(state.selectedTask);
-  } else if (state.sourceBasket.length) {
+  if (state.sourceBasket.length) {
     const sources = state.sourceBasket.map(sourceBasketPreviewItem);
     const previewItems = renderSourceVideoList(sources);
     playSourceItem(previewItems[previewItems.length - 1] || previewItems[0]);
+  } else if (state.selectedTask) {
+    await loadSourceVideos(state.selectedTask);
   } else if (state.selectedRemoteVideo) {
     const url =
       state.selectedRemoteVideo.preview_url ||
@@ -1035,6 +1058,8 @@ async function playSourceVideo() {
     $("videoPreview").load();
     $("fileViewer").textContent = "正在预览原片。";
   } else {
+    renderSourceVideoList([]);
+    $("videoPreview").removeAttribute("src");
     $("fileViewer").textContent = "请先选择一个原片或任务。";
   }
 }
