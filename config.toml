@@ -54,7 +54,7 @@ enabled = true
 
 # 音频转文字
 [funasr]
-asr_model_path = ""models/iic""
+asr_model_path = "models/iic"
 
 # 工作流与网页默认配置
 [workflow]
