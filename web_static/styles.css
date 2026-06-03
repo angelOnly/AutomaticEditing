@@ -380,6 +380,20 @@ button {
   white-space: nowrap;
 }
 
+.task-child-status.success {
+  color: #16a34a;
+}
+
+.task-child-status.running,
+.task-child-status.pending {
+  color: #2563eb;
+}
+
+.task-child-status.failed,
+.task-child-status.cancelled {
+  color: #b91c1c;
+}
+
 .task-group.job-running,
 .task-child.job-running {
   border-color: rgba(239, 68, 68, 0.78);

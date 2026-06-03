@@ -87,6 +87,7 @@ const state = {
   sourceBasket: [],
   selectedTask: null,
   previewMode: "draft",
+  previewIntent: "auto",
   manifest: null,
   activeJob: null,
   logTimer: null,
@@ -313,16 +314,18 @@ function bindEvents() {
   $("refreshLog").addEventListener("click", refreshLog);
   $("copyViewer").addEventListener("click", () => navigator.clipboard.writeText($("fileViewer").textContent));
   $("openSource").addEventListener("click", () => {
+    state.previewIntent = "user-source";
     playSourceVideo();
   });
   $("openDraft").addEventListener("click", () => {
+    state.previewIntent = "user-draft";
     setPreviewMode("draft");
     if (state.drafts.length) {
       renderDraftList();
       playDraft(state.drafts[0]);
     }
     else if (state.latestDraft?.exists) playDraft(state.latestDraft);
-    else alert("当前任务还没有生成粗剪视频。");
+    else renderDraftList();
   });
   $("confirmLongVideo").addEventListener("click", confirmLongVideo);
 }
@@ -480,12 +483,7 @@ async function loadVideos() {
     item.innerHTML = `<strong>${escapeHtml(video.name)}</strong><span>${video.size_mb} MB · ${video.updated_at}</span>`;
     item.addEventListener("click", () => {
       addLocalSourceToBasket(video);
-      state.selectedTask = null;
-      state.manifest = null;
-      applyDefaultControls();
-      clearTaskPanels();
       updateActiveTitleForSources();
-      playSourceVideo();
       loadVideos();
       renderRemoteVideos();
       loadTasks();
@@ -541,7 +539,7 @@ function renderRemoteVideos() {
     item.innerHTML = `<strong>${escapeHtml(title)}</strong>`;
     item.addEventListener("click", () => {
       addRemoteSourceToBasket(video);
-      selectRemoteVideo(video);
+      renderRemoteVideos();
     });
     box.appendChild(item);
   });
@@ -565,31 +563,39 @@ function addLocalSourceToBasket(video) {
   });
   state.selectedVideo = video;
   state.selectedRemoteVideo = null;
+  state.selectedTask = null;
+  state.manifest = null;
+  state.previewIntent = "basket";
+  state.previewMode = "source";
   renderSourceBasket();
   updateActiveTitleForSources();
-  playSourceVideo();
+  clearTaskPanels({ keepPreview: true });
+  playSourceVideo().catch((error) => console.warn("素材预览刷新失败", error));
 }
 
 function addRemoteSourceToBasket(video) {
   const key = video.remote_id || String(video.id || video.name || "");
-  if (
-    state.sourceBasket.some(
+  const exists = state.sourceBasket.some(
       (item) => item.source_type === "remote_ucms" && (item.remote_video.remote_id || item.remote_video.id || item.remote_video.name) === key
-    )
-  ) {
-    return;
+  );
+  if (!exists) {
+    state.sourceBasket.push({
+      id: makeSourceId(),
+      source_type: "remote_ucms",
+      remote_video: video,
+      display_name: video.display_name || video.name || "远程素材",
+    });
   }
-  state.sourceBasket.push({
-    id: makeSourceId(),
-    source_type: "remote_ucms",
-    remote_video: video,
-    display_name: video.display_name || video.name || "远程素材",
-  });
   state.selectedRemoteVideo = video;
   state.selectedVideo = null;
+  state.selectedTask = null;
+  state.manifest = null;
+  state.previewIntent = "basket";
+  state.previewMode = "source";
   renderSourceBasket();
   updateActiveTitleForSources();
-  playSourceVideo();
+  clearTaskPanels({ keepPreview: true });
+  playSourceVideo().catch((error) => console.warn("素材预览刷新失败", error));
 }
 
 function renderSourceBasket() {
@@ -644,6 +650,8 @@ function updateSourceBasketItem(id, action) {
     state.selectedVideo = null;
     state.selectedRemoteVideo = null;
   }
+  state.previewIntent = "basket";
+  state.previewMode = "source";
   renderSourceBasket();
   updateActiveTitleForSources();
   playSourceVideo().catch((error) => console.warn("素材预览刷新失败", error));
@@ -657,6 +665,8 @@ function moveSourceBefore(sourceId, targetId) {
   const [item] = state.sourceBasket.splice(from, 1);
   const nextTo = state.sourceBasket.findIndex((candidate) => candidate.id === targetId);
   state.sourceBasket.splice(nextTo, 0, item);
+  state.previewIntent = "basket";
+  state.previewMode = "source";
   renderSourceBasket();
   updateActiveTitleForSources();
   playSourceVideo().catch((error) => console.warn("素材预览刷新失败", error));
@@ -794,15 +804,12 @@ async function loadTasks() {
       child.className = `task-child ${state.selectedTask === task.task_id ? "active" : ""} ${task.job_status ? `job-${task.job_status}` : ""}`;
       child.type = "button";
 
-      const childBadge = task.job_status
-        ? `<em class="task-job-badge ${escapeAttr(task.job_status)}">${escapeHtml(jobStatusLabel(task.job_status))}</em>`
-        : "";
       const modeTitle = task.mode_title || productionModeName(task.production_mode);
+      const status = taskChildStatus(task);
 
       child.innerHTML = `
         <span class="task-child-mode">${escapeHtml(modeTitle)}</span>
-        <span class="task-child-status">${task.done_steps}/${task.step_count} · 失败 ${task.failed_steps}</span>
-        ${childBadge}
+        <span class="task-child-status ${escapeAttr(status.className)}">${escapeHtml(status.label)} · ${escapeHtml(status.detail)}</span>
       `;
 
       child.addEventListener("click", async (event) => {
@@ -811,6 +818,7 @@ async function loadTasks() {
         state.selectedVideo = null;
         state.selectedRemoteVideo = null;
         state.sourceBasket = [];
+        state.previewIntent = "auto";
         renderSourceBasket();
         $("taskIdInput").value = task.task_id;
         $("activeTitle").textContent = `${group.group_title || displayTaskId(task.task_id)} / ${modeTitle}`;
@@ -876,6 +884,22 @@ function preferredModeOrder(mode) {
   return 99;
 }
 
+function taskChildStatus(task) {
+  const done = Number(task.done_steps || 0);
+  const total = Number(task.step_count || 0);
+  const failed = Number(task.failed_steps || 0);
+  const jobStatus = task.job_status || "";
+  const detail = total ? `${done}/${total}` : `${done}/-`;
+
+  if (jobStatus === "running") return { label: "进行中", detail, className: "running" };
+  if (jobStatus === "pending") return { label: "排队中", detail, className: "pending" };
+  if (jobStatus === "cancelled") return { label: "已取消", detail, className: "cancelled" };
+  if (failed > 0) return { label: "失败", detail, className: "failed" };
+  if (total > 0 && done >= total) return { label: "成功", detail: `${done}/${total}`, className: "success" };
+  if (done > 0) return { label: "进行中", detail, className: "running" };
+  return { label: "未开始", detail: total ? `${done}/${total}` : "等待启动", className: "pending" };
+}
+
 async function uploadSelectedVideo(event) {
   const input = event.target;
   const files = Array.from(input.files || []);
@@ -905,10 +929,8 @@ async function uploadFilesToBasket(files) {
     state.selectedTask = null;
     state.manifest = null;
     applyDefaultControls();
-    clearTaskPanels();
+    clearTaskPanels({ keepPreview: true });
     updateActiveTitleForSources();
-    $("videoPreview").src = `/api/videos/preview?path=${encodeURIComponent(video.path)}`;
-    $("videoPreview").load();
     await refreshWorkspace({ updatePreview: false });
   } catch (error) {
     alert(`上传失败：${cleanError(error)}`);
@@ -999,7 +1021,7 @@ async function loadLatestDraft(taskId, options = {}) {
   const drafts = await api(`/api/tasks/${taskId}/drafts`);
   state.drafts = drafts;
   state.latestDraft = drafts[0] || { exists: false, file: "", url: "" };
-  if (state.previewMode !== "draft") return;
+  if (state.previewMode !== "draft" || state.previewIntent === "basket" || state.previewIntent === "user-source") return;
   renderDraftList();
   if (!updatePreview) return;
   if (drafts.length) {
@@ -1029,14 +1051,23 @@ function syncPreviewTabs() {
   $("openSource")?.classList.toggle("primary", state.previewMode === "source");
   $("openDraft")?.classList.toggle("active", state.previewMode === "draft");
   $("openDraft")?.classList.toggle("primary", state.previewMode === "draft");
+  updatePreviewListTitle();
 }
 
-async function playSourceVideo() {
+function updatePreviewListTitle() {
+  const title = $("previewListTitle");
+  if (!title) return;
+  title.textContent = state.previewMode === "source" ? "原片列表" : "成片列表";
+}
+
+async function playSourceVideo(options = {}) {
+  const { preferredIndex = null } = options;
   setPreviewMode("source");
   if (state.sourceBasket.length) {
     const sources = state.sourceBasket.map(sourceBasketPreviewItem);
     const previewItems = renderSourceVideoList(sources);
-    playSourceItem(previewItems[previewItems.length - 1] || previewItems[0]);
+    const index = Number.isInteger(preferredIndex) ? preferredIndex : previewItems.length - 1;
+    playSourceItem(previewItems[index] || previewItems[0]);
   } else if (state.selectedTask) {
     await loadSourceVideos(state.selectedTask);
   } else if (state.selectedRemoteVideo) {
@@ -1046,17 +1077,23 @@ async function playSourceVideo() {
       state.selectedRemoteVideo.mediaLow ||
       state.selectedRemoteVideo.media_high_url ||
       state.selectedRemoteVideo.mediaHigh;
-    if (url) {
-      $("videoPreview").src = url;
-      $("videoPreview").load();
-      $("fileViewer").textContent = "正在预览远程原片。";
-    } else {
-      $("fileViewer").textContent = "该远程素材没有可预览地址。";
-    }
+    const item = {
+      label: state.selectedRemoteVideo.display_name || state.selectedRemoteVideo.name || "远程素材",
+      file: state.selectedRemoteVideo.name || state.selectedRemoteVideo.remote_id || "",
+      url,
+      list_index: 0,
+    };
+    renderSourceVideoList([item]);
+    if (url) playSourceItem(item);
   } else if (state.selectedVideo) {
-    $("videoPreview").src = `/api/videos/preview?path=${encodeURIComponent(state.selectedVideo.path)}`;
-    $("videoPreview").load();
-    $("fileViewer").textContent = "正在预览原片。";
+    const item = {
+      label: state.selectedVideo.name || state.selectedVideo.path,
+      file: state.selectedVideo.path,
+      url: `/api/videos/preview?path=${encodeURIComponent(state.selectedVideo.path)}`,
+      list_index: 0,
+    };
+    renderSourceVideoList([item]);
+    playSourceItem(item);
   } else {
     renderSourceVideoList([]);
     $("videoPreview").removeAttribute("src");
@@ -1087,9 +1124,14 @@ async function loadSourceVideos(taskId) {
   const sources = await api(`/api/tasks/${taskId}/source-videos`).catch(() => []);
   if (state.previewMode !== "source") return;
   if (!sources.length) {
-    $("videoPreview").src = `/api/tasks/${taskId}/preview`;
-    $("videoPreview").load();
-    $("fileViewer").textContent = "正在预览原片。";
+    renderSourceVideoList([]);
+    try {
+      $("videoPreview").src = `/api/tasks/${taskId}/preview`;
+      $("videoPreview").load();
+      $("fileViewer").textContent = "正在预览原片。";
+    } catch (_) {
+      $("fileViewer").textContent = "当前任务还没有可预览的原片，可能还在准备多源素材。";
+    }
     return;
   }
   const previewItems = renderSourceVideoList(sources);
@@ -1099,9 +1141,11 @@ async function loadSourceVideos(taskId) {
 function renderSourceVideoList(sources) {
   const box = $("draftList");
   if (!box) return [];
+  state.previewMode = "source";
+  syncPreviewTabs();
   const items = (sources || []).filter((source) => source?.url).map((source, index) => ({ ...source, list_index: index }));
   if (!items.length) {
-    box.innerHTML = `<div class="empty-row">当前任务还没有可预览的原片，可能还在准备多源素材。</div>`;
+    box.innerHTML = `<div class="empty-row">当前还没有可预览的原片，请先加入素材。</div>`;
     return [];
   }
   box.innerHTML = items
@@ -1135,10 +1179,12 @@ function playSourceItem(source) {
 }
 
 function renderDraftList() {
+  if (state.previewMode !== "draft") return;
   const box = $("draftList");
   if (!box) return;
+  updatePreviewListTitle();
   if (!state.drafts.length) {
-    box.textContent = "当前任务还没有生成粗剪视频。";
+    box.innerHTML = `<div class="empty-row">当前任务还没有生成粗剪视频。</div>`;
     return;
   }
   box.innerHTML = state.drafts
@@ -1748,7 +1794,8 @@ function getClientId() {
   return id;
 }
 
-function clearTaskPanels() {
+function clearTaskPanels(options = {}) {
+  const { keepPreview = false } = options;
   if (state.logTimer) clearInterval(state.logTimer);
   state.logTimer = null;
   state.activeJob = null;
@@ -1756,10 +1803,14 @@ function clearTaskPanels() {
   $("stepTable").innerHTML = "";
   $("fileList").innerHTML = "";
   $("fileViewer").textContent = "选择左侧任务或文件后显示内容。";
-  $("videoPreview").removeAttribute("src");
   state.latestDraft = null;
   state.drafts = [];
-  $("draftList").textContent = "当前任务还没有生成粗剪视频。";
+  if (!keepPreview) {
+    state.previewMode = "draft";
+    state.previewIntent = "auto";
+    $("videoPreview").removeAttribute("src");
+    $("draftList").innerHTML = `<div class="empty-row">当前任务还没有生成粗剪视频。</div>`;
+  }
   updateProgress(0, 0);
   $("metricSteps").textContent = "-";
   $("metricIssues").textContent = "-";
@@ -1767,6 +1818,7 @@ function clearTaskPanels() {
   updateJobMessage("");
   $("actionRequiredBanner").classList.add("hidden");
   updateTaskSubtitle();
+  syncPreviewTabs();
 }
 
 function syncSuggestedTaskIdForMode() {
