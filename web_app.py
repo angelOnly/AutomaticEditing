@@ -60,6 +60,114 @@ MAX_PENDING_JOBS = int(WEB_CONCURRENCY.get("max_pending_jobs", 20))
 SAME_TASK_POLICY = str(WEB_CONCURRENCY.get("same_task_policy", "reject"))
 
 
+COMMON_REUSABLE_STEPS = [
+    "source_prepare",
+    "metadata",
+    "audio_extract",
+    "frame_extract",
+    "chunk_build",
+    "asr",
+    "vision",
+    "timeline",
+    "timeline_digest",
+]
+
+
+def _step_order_for_production_mode(production_mode: str) -> list[str]:
+    if production_mode == "highlight_reassembly":
+        return [
+            "source_prepare",
+            "metadata",
+            "audio_extract",
+            "frame_extract",
+            "chunk_build",
+            "asr",
+            "vision",
+            "timeline",
+            "timeline_digest",
+            "video_understanding",
+            "highlight_detection",
+            "highlight_reassembly_plan",
+            "reassembly_cut_plan",
+            "reassembly_render",
+        ]
+
+    return [
+        "source_prepare",
+        "metadata",
+        "audio_extract",
+        "frame_extract",
+        "chunk_build",
+        "asr",
+        "vision",
+        "timeline",
+        "timeline_digest",
+        "content_analysis",
+        "short_video_edit_plan",
+        "voiceover_script",
+        "tts",
+        "subtitles",
+        "cut_plan",
+        "render",
+    ]
+
+
+def _init_multisource_child_manifest(
+    *,
+    task_dir: Path,
+    task_id: str,
+    req: RunRequest,
+    raw_source_items: list[dict[str, Any]],
+    common_task_id: str,
+    common_source_key: str,
+) -> None:
+    """Create a complete pending manifest for a multi-source child task.
+
+    The actual common analysis runs under outputs/__common__/common_xxx,
+    but the UI should only read the child task manifest. Therefore we create
+    all expected steps here and mark reusable common steps explicitly.
+    """
+    manifest_path = task_dir / "manifest.json"
+    if manifest_path.exists():
+        return
+
+    now = datetime.now().isoformat(timespec="seconds")
+    common_steps = set(COMMON_REUSABLE_STEPS)
+    steps: dict[str, dict[str, Any]] = {}
+
+    for step in _step_order_for_production_mode(req.production_mode):
+        item: dict[str, Any] = {
+            "step_name": step,
+            "status": "pending",
+            "updated_at": now,
+            "can_rerun": False,
+        }
+        if step in common_steps:
+            item["common_progress"] = True
+            item["common_task_id"] = common_task_id
+        steps[step] = item
+
+    write_json(
+        manifest_path,
+        {
+            "task_id": task_id,
+            "created_at": now,
+            "updated_at": now,
+            "status": "pending",
+            "source_mode": "multi_source_pending",
+            "source_video": "",
+            "source_manifest": "",
+            "source_videos": [],
+            "production_mode": req.production_mode,
+            "common_task_id": common_task_id,
+            "common_source_key": common_source_key,
+            "source_count": len(raw_source_items),
+            "last_web_run_options": req.model_dump(),
+            "steps": steps,
+        },
+    )
+
+
 @app.on_event("startup")
 def preload_remote_station_counts() -> None:
     _refresh_remote_station_counts()
@@ -817,6 +925,14 @@ def run_pipeline(req: RunRequest) -> dict[str, Any]:
                 "created_at": datetime.now().isoformat(timespec="seconds"),
             },
         )
+        _init_multisource_child_manifest(
+            task_dir=task_dir,
+            task_id=task_id,
+            req=req,
+            raw_source_items=raw_source_items,
+            common_task_id=common_task_id,
+            common_source_key=common_source_key,
+        )
         input_path = None
     else:
         source_items = _resolve_run_sources(req)
@@ -1083,9 +1199,12 @@ def _save_web_run_options(task_dir: Path, req: RunRequest) -> None:
     manifest = read_json(manifest_path, {})
     web_options = req.model_dump()
     web_options["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    manifest.setdefault("task_id", task_dir.name)
+    manifest.setdefault("created_at", web_options["updated_at"])
+    manifest["updated_at"] = web_options["updated_at"]
+    manifest["production_mode"] = req.production_mode
     manifest["last_web_run_options"] = web_options
-    if manifest:
-        write_json(manifest_path, manifest)
+    write_json(manifest_path, manifest)
 
 
 REUSABLE_MODE_SWITCH_STEPS = (

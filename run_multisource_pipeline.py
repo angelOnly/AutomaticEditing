@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
+import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -32,6 +34,97 @@ COMMON_REUSABLE_STEPS = [
 ]
 
 
+def _sync_common_progress_to_child(
+    *,
+    common_dir: Path,
+    task_dir: Path,
+    request: dict[str, Any],
+) -> None:
+    """Mirror common analysis step statuses into one child task manifest.
+
+    The common pipeline writes real progress to outputs/__common__/common_xxx.
+    The Web UI reads outputs/<child_task>/manifest.json. This function keeps
+    child manifest in sync without making the UI aware of common directories.
+    """
+    common_manifest = read_json(common_dir / "manifest.json", {})
+    if not common_manifest:
+        return
+
+    child_manifest_path = task_dir / "manifest.json"
+    child_manifest = read_json(child_manifest_path, {})
+    now = datetime.now().isoformat(timespec="seconds")
+
+    child_manifest.setdefault("task_id", task_dir.name)
+    child_manifest.setdefault("created_at", now)
+    child_manifest["updated_at"] = common_manifest.get("updated_at", now)
+    child_manifest["common_task_id"] = common_dir.name
+    child_manifest["common_source_key"] = request.get("common_source_key", "")
+    child_manifest["production_mode"] = request.get(
+        "production_mode",
+        child_manifest.get("production_mode", "ai_voiceover"),
+    )
+    child_manifest["source_count"] = len(request.get("source_items") or [])
+    child_manifest.setdefault("steps", {})
+
+    common_steps = common_manifest.get("steps", {}) or {}
+
+    for step in COMMON_REUSABLE_STEPS:
+        common_step = common_steps.get(step)
+        if not common_step:
+            continue
+
+        synced = dict(common_step)
+        synced["common_progress"] = True
+        synced["common_task_id"] = common_dir.name
+        synced["reused_from"] = relpath(common_dir, ROOT)
+        child_manifest["steps"][step] = synced
+
+    for key in ("source_video", "source_mode", "source_manifest", "source_videos"):
+        if common_manifest.get(key):
+            child_manifest[key] = common_manifest[key]
+
+    if common_manifest.get("status") == "failed":
+        child_manifest["status"] = "failed"
+        child_manifest["user_message"] = common_manifest.get("user_message", "")
+    elif any((common_steps.get(step) or {}).get("status") == "running" for step in COMMON_REUSABLE_STEPS):
+        child_manifest["status"] = "running"
+    elif all(
+        (common_steps.get(step) or {}).get("status") in {"success", "partial_success", "skipped"}
+        for step in COMMON_REUSABLE_STEPS
+        if step in common_steps
+    ):
+        # Common part is ready, but mode-specific steps may still be pending/running.
+        child_manifest["status"] = child_manifest.get("status") or "running"
+
+    write_json(child_manifest_path, child_manifest)
+
+
+def _start_common_progress_sync(
+    *,
+    common_dir: Path,
+    task_dir: Path,
+    request: dict[str, Any],
+    interval_seconds: float = 2.0,
+) -> threading.Event:
+    stop_event = threading.Event()
+
+    def loop() -> None:
+        while not stop_event.is_set():
+            try:
+                _sync_common_progress_to_child(
+                    common_dir=common_dir,
+                    task_dir=task_dir,
+                    request=request,
+                )
+            except Exception as exc:
+                _append_common_log(common_dir, f"sync common progress to child failed: {exc}")
+            stop_event.wait(interval_seconds)
+
+    thread = threading.Thread(target=loop, daemon=True)
+    thread.start()
+    return stop_event
+
+
 def parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, list[str]]:
     parser = argparse.ArgumentParser(description="Prepare multi-source inputs, then run the editing pipeline.")
     parser.add_argument("--source-request", required=True)
@@ -49,9 +142,45 @@ def main(argv: list[str] | None = None) -> int:
     common_task_id = str(request.get("common_task_id") or "").strip()
     if common_task_id:
         common_dir = ensure_dir(COMMON_OUTPUTS_DIR / common_task_id)
-        _ensure_common_analysis(common_dir=common_dir, request=request, args=args)
-        _copy_common_outputs_to_task(common_dir=common_dir, task_dir=task_dir, request=request)
-        return _run_mode_specific_pipeline(args=args, passthrough=passthrough, task_dir=task_dir, request=request)
+        stop_sync = _start_common_progress_sync(
+            common_dir=common_dir,
+            task_dir=task_dir,
+            request=request,
+        )
+        try:
+            _sync_common_progress_to_child(
+                common_dir=common_dir,
+                task_dir=task_dir,
+                request=request,
+            )
+            _ensure_common_analysis(common_dir=common_dir, request=request, args=args)
+            _sync_common_progress_to_child(
+                common_dir=common_dir,
+                task_dir=task_dir,
+                request=request,
+            )
+            _copy_common_outputs_to_task(common_dir=common_dir, task_dir=task_dir, request=request)
+            _sync_common_progress_to_child(
+                common_dir=common_dir,
+                task_dir=task_dir,
+                request=request,
+            )
+            return _run_mode_specific_pipeline(
+                args=args,
+                passthrough=passthrough,
+                task_dir=task_dir,
+                request=request,
+            )
+        finally:
+            stop_sync.set()
+            try:
+                _sync_common_progress_to_child(
+                    common_dir=common_dir,
+                    task_dir=task_dir,
+                    request=request,
+                )
+            except Exception:
+                pass
 
     _mark_source_prepare(task_dir, "running", request=request)
     try:
@@ -178,27 +307,36 @@ def _copy_common_outputs_to_task(*, common_dir: Path, task_dir: Path, request: d
         if dst.exists():
             shutil.rmtree(dst)
         shutil.copytree(src, dst)
+
     ensure_dir(task_dir / "input")
     write_json(task_dir / "input" / "source_request.json", request)
 
     common_manifest = read_json(common_dir / "manifest.json", {})
     manifest = read_json(task_dir / "manifest.json", {})
     now = datetime.now().isoformat(timespec="seconds")
-    manifest["task_id"] = task_dir.name
+
+    manifest.setdefault("task_id", task_dir.name)
     manifest.setdefault("created_at", now)
     manifest["updated_at"] = now
+    manifest["common_task_id"] = common_dir.name
+    manifest["common_source_key"] = request.get("common_source_key", "")
+    manifest["production_mode"] = request.get("production_mode", manifest.get("production_mode", "ai_voiceover"))
+
     for key in ("source_video", "source_mode", "source_manifest", "source_videos"):
         if key in common_manifest:
             manifest[key] = common_manifest[key]
-    manifest["common_task_id"] = common_dir.name
-    manifest["common_source_key"] = request.get("common_source_key", "")
+
     manifest["reused_common_steps"] = COMMON_REUSABLE_STEPS
     manifest.setdefault("steps", {})
+
     for step in COMMON_REUSABLE_STEPS:
         status = dict((common_manifest.get("steps") or {}).get(step, {}))
         if status:
             status["reused_from"] = relpath(common_dir, ROOT)
+            status["common_progress"] = True
+            status["common_task_id"] = common_dir.name
             manifest["steps"][step] = status
+
     write_json(task_dir / "manifest.json", manifest)
 
 

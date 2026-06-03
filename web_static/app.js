@@ -1239,13 +1239,23 @@ function restoreRunControls(manifest) {
   updateSummaryControls();
 }
 
+function stepsForManifest(manifest) {
+  const mode =
+    manifest?.production_mode ||
+    manifest?.last_run_options?.production_mode ||
+    manifest?.last_web_run_options?.production_mode ||
+    $("productionMode")?.value ||
+    "ai_voiceover";
+  return mode === "highlight_reassembly" ? HIGHLIGHT_REASSEMBLY_STEPS : AI_VOICEOVER_STEPS;
+}
+
 function renderManifest() {
   const manifest = state.manifest;
   if (!manifest) return;
-  updateActiveSteps();
+  const activeSteps = stepsForManifest(manifest);
   const steps = manifest.steps || {};
-  const stepDurations = buildStepDurationMap(manifest, STEPS);
-  const rows = STEPS.map((step, index) => {
+  const stepDurations = buildStepDurationMap(manifest, activeSteps);
+  const rows = activeSteps.map((step, index) => {
     const item = steps[step] || {};
     const status = item.status || "pending";
     const output = item.output || "";
@@ -1267,7 +1277,7 @@ function renderManifest() {
   document.querySelectorAll(".step-card[data-path]").forEach((card) => {
     card.addEventListener("click", () => openTaskFile(card.dataset.path));
   });
-  const visibleEntries = STEPS.map((step) => [step, steps[step] || {}]);
+  const visibleEntries = activeSteps.map((step) => [step, steps[step] || {}]);
   const values = visibleEntries.map(([, item]) => item);
   const done = values.filter((x) => ["success", "partial_success", "skipped"].includes(x.status)).length;
   const completed = values.filter((x) => ["success", "partial_success"].includes(x.status)).length;
@@ -1288,8 +1298,8 @@ function renderManifest() {
     visibleEntries[visibleEntries.length - 1];
   renderActionRequired(manifest);
   if (!state.activeJob) updateJobMessage(manifest.user_message || "");
-  updateProgress(done, STEPS.length, completed, skipped, failed);
-  $("metricSteps").textContent = `${done}/${STEPS.length}（成功 ${completed}，跳过 ${skipped}）`;
+  updateProgress(done, activeSteps.length, completed, skipped, failed);
+  $("metricSteps").textContent = `${done}/${activeSteps.length}（成功 ${completed}，跳过 ${skipped}）`;
   if ($("metricCurrentStep")) $("metricCurrentStep").textContent = currentEntry ? stepLabel(currentEntry[0]) : "-";
   $("metricIssues").textContent = skippedDetails.length ? `${failed} / ${stale}，跳过：${skippedDetails.join("；")}` : `${failed} / ${stale}`;
   if (!state.activeJob) {
@@ -1299,7 +1309,7 @@ function renderManifest() {
     }
     if (failed) $("metricJob").textContent = "有失败步骤";
     else if (renderStatus === "skipped") $("metricJob").textContent = "已完成，未生成粗剪";
-    else if (done >= STEPS.length) $("metricJob").textContent = "已完成";
+    else if (done >= activeSteps.length) $("metricJob").textContent = "已完成";
   }
 }
 
@@ -1331,7 +1341,23 @@ function jobStatusLabel(status) {
 }
 
 function stepNote(step, item = {}) {
-  if (!item || item.status === "pending") return "";
+  if (!item) return "";
+
+  if (step === "vision" && item.summary) {
+    const s = item.summary || {};
+    const total = Number(s.total_chunks || 0);
+    const processed = Number(s.processed_chunks || 0);
+    const failed = Number(s.failed_chunks || 0);
+    if (total && item.status === "running") {
+      return `画面 chunk ${processed}/${total}${failed ? `，失败 ${failed}` : ""}`;
+    }
+  }
+
+  if (item.common_progress && item.status === "running") return "公共分析中";
+  if (item.common_progress && item.status === "success") return "复用公共分析结果";
+  if (item.common_progress && item.status === "partial_success") return "公共分析部分成功";
+
+  if (!item.status || item.status === "pending") return "";
   if (item.status === "skipped") return skippedReasonText(item.reason, step);
   return item.error || item.reason || "";
 }
@@ -1650,8 +1676,11 @@ function afterJobStarted(job) {
   if (job.deduplicated) {
     $("logViewer").textContent = job.message || "已切换到现有任务。";
   } else {
-    updateProgress(0, STEPS.length, 0, 0, 0);
-    if ($("metricCurrentStep")) $("metricCurrentStep").textContent = stepLabel(STEPS[0]);
+    const activeSteps = $("productionMode")?.value === "highlight_reassembly"
+      ? HIGHLIGHT_REASSEMBLY_STEPS
+      : AI_VOICEOVER_STEPS;
+    updateProgress(0, activeSteps.length, 0, 0, 0);
+    if ($("metricCurrentStep")) $("metricCurrentStep").textContent = stepLabel(activeSteps[0]);
     $("logViewer").textContent = "任务已提交，等待日志输出...";
   }
   if (state.activeJob) startJobPolling();
