@@ -1742,7 +1742,7 @@ async function selectedTaskHasActiveJob(taskId) {
 function getClientId() {
   let id = localStorage.getItem("phoenix_client_id");
   if (!id) {
-    id = crypto.randomUUID();
+    id = makeSourceId();
     localStorage.setItem("phoenix_client_id", id);
   }
   return id;
