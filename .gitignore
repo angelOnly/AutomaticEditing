@@ -6,7 +6,6 @@ __pycache__/
 outputs/
 models/
 videos/
-tts_ref/
 
 *.zip
 *.tar
