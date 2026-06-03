@@ -402,8 +402,12 @@ function updateSummaryControls() {
 }
 
 function syncOutputModeControls() {
-  const outputMode = $("outputMode")?.value || "single";
-  $("maxOutputVideosWrap")?.classList.toggle("hidden", outputMode !== "multiple");
+  const isReassembly = $("productionMode")?.value === "highlight_reassembly";
+  const outputMode = isReassembly ? ($("outputMode")?.value || "single") : "single";
+
+  $("outputModeWrap")?.classList.toggle("hidden", !isReassembly);
+  if (!isReassembly && $("outputMode")) $("outputMode").value = "single";
+  $("maxOutputVideosWrap")?.classList.toggle("hidden", !isReassembly || outputMode !== "multiple");
   if ($("reassemblyOutputMode")) $("reassemblyOutputMode").value = outputMode === "multiple" ? "multiple" : "single";
 }
 
@@ -1529,7 +1533,7 @@ function baseRunRequest() {
   const targetDuration = Number($("targetDuration").value || state.defaults.default_target_seconds || 30);
   const allowLongVideo = $("allowLongVideo").checked;
   const productionMode = $("productionMode").value;
-  const outputMode = $("outputMode")?.value || "single";
+  const outputMode = productionMode === "highlight_reassembly" ? ($("outputMode")?.value || "single") : "single";
   return {
     production_mode: productionMode,
     output_mode: outputMode,
