@@ -3,6 +3,7 @@
 import json
 import re
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime
@@ -203,13 +204,17 @@ def download_ucms_video(
             "metadata": read_json(meta_path, {}),
         }
 
+    raw_url = str(url)
+    safe_url = _quote_url_for_http(raw_url)
+
     tmp = target.with_suffix(".downloading")
-    _download_file(str(url), tmp, headers=cfg.headers, timeout=cfg.request_timeout_seconds)
+    _download_file(safe_url, tmp, headers=cfg.headers, timeout=cfg.request_timeout_seconds)
     tmp.replace(target)
     meta = {
         "source_type": "remote_ucms",
         "downloaded_at": datetime.now().isoformat(timespec="seconds"),
-        "download_url": url,
+        "download_url": raw_url,
+        "download_url_encoded": safe_url,
         "remote_video": normalized,
         "local_path": relpath(target, root_dir),
     }
@@ -395,15 +400,63 @@ def _post_json(url: str, payload: dict[str, Any], *, headers: dict[str, str], ti
 
 def _download_file(url: str, target: Path, *, headers: dict[str, str], timeout: int) -> None:
     ensure_dir(target.parent)
-    req = urllib.request.Request(url, headers=headers, method="GET")
+
+    safe_url = _quote_url_for_http(url)
+    safe_headers = _ascii_safe_headers(headers)
+
+    req = urllib.request.Request(safe_url, headers=safe_headers, method="GET")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp, target.open("wb") as out:
             for chunk in iter(lambda: resp.read(1024 * 1024), b""):
                 out.write(chunk)
+    except urllib.error.HTTPError as exc:
+        if target.exists():
+            target.unlink(missing_ok=True)
+        raise RuntimeError(f"remote video download failed: HTTP {exc.code}, url={_mask_url(safe_url)}") from exc
+    except urllib.error.URLError as exc:
+        if target.exists():
+            target.unlink(missing_ok=True)
+        raise RuntimeError(f"remote video download failed: {exc}, url={_mask_url(safe_url)}") from exc
     except Exception:
         if target.exists():
             target.unlink(missing_ok=True)
         raise
+
+
+def _quote_url_for_http(url: str) -> str:
+    value = str(url or "").strip()
+    if not value:
+        raise RuntimeError("download url is empty")
+
+    parts = urllib.parse.urlsplit(value)
+    if parts.scheme not in {"http", "https"}:
+        raise RuntimeError(f"unsupported download url scheme: {parts.scheme or 'empty'}")
+
+    netloc = parts.netloc.encode("idna").decode("ascii")
+    path = urllib.parse.quote(parts.path, safe="/:%@&=+$,;~!*'()[]-._%")
+    query = urllib.parse.quote(parts.query, safe="=&?/:;+,%@~!*'()[]-._")
+    fragment = urllib.parse.quote(parts.fragment, safe="=&?/:;+,%@~!*'()[]-._")
+
+    return urllib.parse.urlunsplit((parts.scheme, netloc, path, query, fragment))
+
+
+def _ascii_safe_headers(headers: dict[str, str]) -> dict[str, str]:
+    safe: dict[str, str] = {}
+    for key, value in (headers or {}).items():
+        k = str(key)
+        v = str(value)
+        try:
+            k.encode("latin-1")
+            v.encode("latin-1")
+        except UnicodeEncodeError as exc:
+            raise RuntimeError(f"remote download header contains non-latin1 characters: {k}") from exc
+        safe[k] = v
+    return safe
+
+
+def _mask_url(url: str) -> str:
+    parts = urllib.parse.urlsplit(url)
+    return urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
 
 
 def _loads_json_field(value: Any) -> dict[str, Any]:

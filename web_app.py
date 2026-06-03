@@ -1280,6 +1280,12 @@ def _extract_user_message_from_log(path: Path) -> str:
         tail = text.rsplit(marker, 1)[-1].strip()
         tail = tail.split("可在任务表中查看失败步骤", 1)[0].strip()
         return tail
+    if "UnicodeEncodeError" in text and "request.encode('ascii')" in text:
+        return (
+            "Remote video download failed: UCMS returned a video URL with unescaped "
+            "non-ASCII or special characters. Encode the download URL before making "
+            "the HTTP request."
+        )
     runtime_marker = "RuntimeError:"
     if runtime_marker in text:
         tail = text.rsplit(runtime_marker, 1)[-1].strip()

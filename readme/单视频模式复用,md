@@ -1,0 +1,942 @@
+下面给你一份**更详细、可执行的代码修改指南**。核心目标是：
+
+> **同一个视频，先跑“视频重组”，再跑“AI 配音解说”时，不要重新跑 metadata / 抽音频 / 抽帧 / chunk / ASR / vision / timeline / timeline_digest。**
+
+你现在的问题不是 FunASR 或进度条显示错，而是**复用逻辑只在部分路径生效**。你这次日志里执行的是 `run_pipeline.py --input ... --production-mode ai_voiceover`，并且重新打印了 `完成: asr`、`vision chunk_0002: success`，所以确实是在重新跑公共分析。`run_pipeline.py` 只是入口转发到 `newsclip_agent.pipeline.main`。
+
+---
+
+# 一、先说清楚当前代码结构
+
+## 1. Web 启动入口不用改
+
+`run_web.py` 只是自动找端口，然后启动 FastAPI：
+
+```python
+uvicorn.run("web_app:app", host=host, port=port, reload=False)
+```
+
+所以你以后仍然是：
+
+```bash
+python run_web.py
+```
+
+这个文件不需要动。
+
+---
+
+## 2. Web 后端真正提交任务的位置是 `web_app.py`
+
+`web_app.py` 里 `/api/run` 会把前端参数组装成命令。核心函数是：
+
+```python
+@app.post("/api/run")
+def run_pipeline(req: RunRequest) -> dict[str, Any]:
+```
+
+它会根据请求构造 task_id、任务目录、命令，然后启动子进程。命令构造在 `_build_run_command()`。
+
+对于单素材，最终会跑：
+
+```bash
+python -u run_pipeline.py --task-id xxx --input xxx --production-mode ai_voiceover
+```
+
+对于多素材，才会跑：
+
+```bash
+python -u run_multisource_pipeline.py --source-request xxx
+```
+
+而你这次日志是 `run_pipeline.py`，所以走的是**单素材链路**。
+
+---
+
+## 3. 单素材和多素材的复用机制不一样
+
+多素材已经有公共目录：
+
+```text
+outputs/__common__/common_xxx
+```
+
+`run_multisource_pipeline.py` 里定义了公共复用步骤：
+
+```python
+COMMON_REUSABLE_STEPS = [
+    "source_prepare",
+    "metadata",
+    "audio_extract",
+    "frame_extract",
+    "chunk_build",
+    "asr",
+    "vision",
+    "timeline",
+    "timeline_digest",
+]
+```
+
+并且会先 `_ensure_common_analysis()`，再 `_copy_common_outputs_to_task()`。
+
+但是单素材没有这种 `__common__` 目录。单素材目前主要靠两个机制复用：
+
+第一种是**同一个 task_id 内断点续跑**，由 `PipelineRunner._can_reuse()` 控制。
+
+第二种是**模式切换复制旧任务输出**，由 `web_app.py` 的 `_prepare_mode_switched_run()` 和 `_seed_reusable_outputs()` 控制。
+
+问题就出在第二种：它只在特定点击路径生效。
+
+---
+
+# 二、问题根因
+
+## 根因 1：前端重新选视频时，后端不知道它是“同一个视频的另一个模式”
+
+前端 `runSelected()` 里，如果当前是左侧素材，会这样传：
+
+```javascript
+req.input_video = state.selectedVideo.path;
+req.remote_video = null;
+req.task_id = null;
+```
+
+也就是说，用户重新点了同一个视频，前端会把它当成**新素材任务**，不是“从已有视频重组任务切到 AI 配音任务”。
+
+于是后端 `_prepare_mode_switched_run()` 不生效，因为它第一行就要求必须有 `req.task_id`：
+
+```python
+if _collect_source_items(req) or req.rerun or req.rerun_from or not req.task_id:
+    return
+```
+
+
+
+---
+
+## 根因 2：`_seed_reusable_outputs()` 只有 `reuse_from_task_id` 存在才会复制
+
+当前代码里有这个函数：
+
+```python
+def _seed_reusable_outputs(req: RunRequest, task_id: str, task_dir: Path) -> None:
+    if not req.reuse_from_task_id or (task_dir / "manifest.json").exists():
+        return
+```
+
+也就是说，只有前面 `_prepare_mode_switched_run()` 成功设置了：
+
+```python
+req.reuse_from_task_id = source_task_id
+```
+
+它才会复制旧任务公共步骤。
+
+但你这次是重新选素材跑 AI 配音，所以 `reuse_from_task_id` 是空的。
+
+---
+
+## 根因 3：单素材的 fingerprint 把 `production_mode` 算进去了
+
+`web_app.py` 现在 `_run_fingerprint()` 会把 `production_mode`、`target_duration_seconds`、`output_mode` 等都算进去：
+
+```python
+payload = {
+    "video": ...,
+    "production_mode": req.production_mode,
+    "output_mode": req.output_mode,
+    ...
+}
+```
+
+
+
+这对“生成最终任务 ID”是合理的，但对“公共分析是否可复用”是不合理的。因为：
+
+```text
+视频重组 和 AI配音 的最终成片参数不一样，
+但 metadata/asr/vision/timeline 这些公共分析完全可以一样。
+```
+
+所以需要新增一个**只用于公共分析复用的 fingerprint**，不能把 `production_mode` 算进去。
+
+---
+
+# 三、推荐修改策略
+
+我建议先做一个**最稳、改动最小的版本**：
+
+> 不大改整体架构，不动 `run_web.py`，不动 `run_pipeline.py`，只在 `web_app.py` 里增强“自动寻找同源任务并复制公共步骤”的能力，再在 `pipeline.py` 里修正 `partial_success` 复用判断。
+
+需要改 3 个文件：
+
+```text
+web_app.py
+newsclip_agent/pipeline.py
+web_static/app.js   可选增强
+```
+
+其中：
+
+```text
+必须改：web_app.py
+建议改：newsclip_agent/pipeline.py
+可选改：web_static/app.js
+```
+
+---
+
+# 四、详细修改一：`web_app.py`
+
+## 目标
+
+当用户提交一个单素材 AI 配音任务时，后端自动扫描 `outputs/` 下已有任务：
+
+```text
+如果发现同一个视频、同样的 chunk_seconds、frame_interval、aspect_ratio、mode，
+并且已有任务已经完成 asr/vision/timeline/timeline_digest，
+就把这些公共步骤复制到新任务目录。
+```
+
+这样即使前端没有传 `reuse_from_task_id`，后端也能自动复用。
+
+---
+
+## 1. 找到 `REUSABLE_MODE_SWITCH_STEPS`
+
+你现在的 `web_app.py` 已经有：
+
+```python
+REUSABLE_MODE_SWITCH_STEPS = (
+    "metadata",
+    "audio_extract",
+    "frame_extract",
+    "chunk_build",
+    "asr",
+    "vision",
+    "timeline",
+    "video_understanding",
+    "highlight_detection",
+)
+```
+
+
+
+建议改成：
+
+```python
+REUSABLE_MODE_SWITCH_STEPS = (
+    "metadata",
+    "audio_extract",
+    "frame_extract",
+    "chunk_build",
+    "asr",
+    "vision",
+    "timeline",
+    "timeline_digest",
+    "video_understanding",
+    "highlight_detection",
+)
+```
+
+注意新增：
+
+```text
+timeline_digest
+```
+
+原因：AI 配音链路后面的 `content_analysis` 依赖 `timeline_digest`，视频重组链路后面的 `video_understanding`、`highlight_detection` 也依赖它。`timeline_digest` 是非常重要的公共结果。AI 配音步骤里明确有 `timeline_digest`，视频重组步骤里也有。
+
+---
+
+## 2. 新增“公共分析 fingerprint”函数
+
+在 `web_app.py` 里，建议放到 `_run_fingerprint()` 后面，也就是这个函数附近：
+
+```python
+def _run_fingerprint(req: RunRequest, input_path: Path | None) -> str:
+```
+
+新增：
+
+```python
+def _analysis_fingerprint_for_single_source(req: RunRequest, input_path: Path | None) -> str:
+    """
+    单素材公共分析 fingerprint。
+
+    注意：
+    这里故意不包含 production_mode、output_mode、target_duration_seconds、voice_id。
+    因为这些只影响后续成片，不影响 metadata/asr/vision/timeline/timeline_digest。
+    """
+    payload = {
+        "video": _video_fingerprint(input_path) if input_path else None,
+        "remote": _remote_video_fingerprint(req.remote_video),
+        "aspect_ratio": req.aspect_ratio,
+        "chunk_seconds": int(req.chunk_seconds),
+        "frame_interval": int(req.frame_interval),
+        "mode": req.mode or "normal",
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+```
+
+---
+
+## 3. 新增“从旧任务 manifest 反推公共分析 fingerprint”
+
+继续放在附近：
+
+```python
+def _analysis_fingerprint_from_manifest(task_dir: Path, manifest: dict[str, Any]) -> str:
+    """
+    从已有任务的 manifest / task.json 中还原公共分析 fingerprint。
+    """
+    opts = manifest.get("last_web_run_options") or manifest.get("last_run_options") or {}
+
+    source_video = _existing_task_source_video(task_dir, manifest)
+
+    payload = {
+        "video": _video_fingerprint(source_video),
+        "remote": None,
+        "aspect_ratio": opts.get("aspect_ratio") or "16:9",
+        "chunk_seconds": int(opts.get("chunk_seconds") or WORKFLOW_DEFAULTS.get("default_chunk_seconds", 60)),
+        "frame_interval": int(opts.get("frame_interval") or WORKFLOW_DEFAULTS.get("default_frame_interval", 10)),
+        "mode": opts.get("mode") or "normal",
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+```
+
+说明：
+这里先不处理 remote 的复杂还原，先保证本地视频稳定。你现在日志里的输入就是：
+
+```text
+/workspace/videos/美放松对俄油制裁.mp4
+```
+
+所以这个版本能解决你当前场景。
+
+---
+
+## 4. 新增“自动寻找可复用任务”函数
+
+继续新增：
+
+```python
+def _has_reusable_common_steps(manifest: dict[str, Any]) -> bool:
+    """
+    判断一个旧任务是否至少具备可复制的公共分析结果。
+    最理想是 timeline_digest 已成功；如果没有，也允许复制已有的前置步骤。
+    """
+    steps = manifest.get("steps", {})
+
+    # 最推荐复用到 timeline_digest
+    if steps.get("timeline_digest", {}).get("status") in {"success", "partial_success"}:
+        return True
+
+    # 退一步：至少 ASR / vision / timeline 里有成功项
+    for step in ("asr", "vision", "timeline"):
+        if steps.get(step, {}).get("status") in {"success", "partial_success"}:
+            return True
+
+    return False
+
+
+def _find_reusable_single_source_task(
+    *,
+    req: RunRequest,
+    current_task_id: str,
+    input_path: Path | None,
+) -> str | None:
+    """
+    在 outputs/ 下自动寻找同一素材、同一公共分析参数的已有任务。
+    找到后返回旧 task_id，后续交给 _seed_reusable_outputs 复制公共步骤。
+    """
+    if req.reuse_from_task_id:
+        return req.reuse_from_task_id
+
+    if not input_path:
+        return None
+
+    if not OUTPUTS_DIR.exists():
+        return None
+
+    target_key = _analysis_fingerprint_for_single_source(req, input_path)
+
+    candidates: list[tuple[float, str]] = []
+
+    for task_dir in OUTPUTS_DIR.iterdir():
+        if not task_dir.is_dir():
+            continue
+
+        if task_dir.name == current_task_id:
+            continue
+
+        if task_dir.name == "__common__" or task_dir.name.startswith("common_"):
+            continue
+
+        manifest = read_json(task_dir / "manifest.json", {})
+        if not manifest:
+            continue
+
+        # 只处理单素材任务。多素材已有 __common__ 逻辑。
+        if manifest.get("source_mode", "single_source") != "single_source":
+            continue
+
+        if not _has_reusable_common_steps(manifest):
+            continue
+
+        try:
+            old_source = _existing_task_source_video(task_dir, manifest)
+        except Exception:
+            continue
+
+        try:
+            if old_source.resolve() != input_path.resolve():
+                continue
+        except Exception:
+            continue
+
+        try:
+            old_key = _analysis_fingerprint_from_manifest(task_dir, manifest)
+        except Exception:
+            continue
+
+        if old_key != target_key:
+            continue
+
+        candidates.append((task_dir.stat().st_mtime, task_dir.name))
+
+    if not candidates:
+        return None
+
+    # 取最新的旧任务
+    candidates.sort(reverse=True)
+    return candidates[0][1]
+```
+
+---
+
+## 5. 在 `/api/run` 中调用这个函数
+
+在 `web_app.py` 的 `run_pipeline(req)` 里找到这一段：
+
+```python
+if not (req.rerun or req.rerun_from) and _is_task_already_completed(manifest, req.production_mode):
+    return {
+        ...
+    }
+
+_seed_reusable_outputs(req, task_id, task_dir)
+job_id = f"job_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+```
+
+把它改成：
+
+```python
+if not (req.rerun or req.rerun_from) and _is_task_already_completed(manifest, req.production_mode):
+    return {
+        "job_id": "",
+        "task_id": task_id,
+        "status": "success",
+        "returncode": 0,
+        "deduplicated": True,
+        "message": "相同任务已完成，直接复用结果。",
+    }
+
+# 新增：单素材自动查找可复用公共分析任务
+if not (req.rerun or req.rerun_from) and not req.reuse_from_task_id:
+    reusable_task_id = _find_reusable_single_source_task(
+        req=req,
+        current_task_id=task_id,
+        input_path=input_path,
+    )
+    if reusable_task_id:
+        req.reuse_from_task_id = reusable_task_id
+
+_seed_reusable_outputs(req, task_id, task_dir)
+job_id = f"job_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+```
+
+为什么放这里？
+
+因为这里已经算出了：
+
+```text
+task_id
+task_dir
+input_path
+manifest
+```
+
+并且还没真正启动子进程，所以正好可以先复制旧输出。
+
+---
+
+## 6. 修改 `_seed_reusable_outputs()`，让它复制更完整
+
+现在 `_seed_reusable_outputs()` 会复制每个 step 的输出目录，但有几个问题：
+
+第一，`REUSABLE_MODE_SWITCH_STEPS` 原来没有 `timeline_digest`。
+第二，manifest 没有记录 `production_mode` 和 `last_web_run_options`。
+第三，最好记录 `reused_common_steps`，方便前端显示“已复用公共分析”。
+
+找到这个函数：
+
+```python
+def _seed_reusable_outputs(req: RunRequest, task_id: str, task_dir: Path) -> None:
+```
+
+建议整体替换成下面这个版本：
+
+```python
+def _seed_reusable_outputs(req: RunRequest, task_id: str, task_dir: Path) -> None:
+    """
+    从另一个任务复制可复用公共分析结果到当前任务目录。
+
+    用途：
+    1. 用户从“视频重组”切到“AI配音解说”
+    2. 用户重新选择同一个视频，但后端自动发现已有公共分析结果
+    """
+    if not req.reuse_from_task_id:
+        return
+
+    # 如果当前任务已经有 manifest，说明已经初始化过，不要强行覆盖。
+    if (task_dir / "manifest.json").exists():
+        return
+
+    source_task_dir = _task_dir(req.reuse_from_task_id)
+    source_manifest = read_json(source_task_dir / "manifest.json", {})
+    source_steps = source_manifest.get("steps", {})
+
+    copied_steps: dict[str, Any] = {}
+    copied_versions: dict[str, str] = {}
+
+    for step in REUSABLE_MODE_SWITCH_STEPS:
+        step_info = source_steps.get(step) or {}
+
+        if step_info.get("status") not in {"success", "partial_success", "skipped"}:
+            continue
+
+        output = step_info.get("output")
+        if not output:
+            continue
+
+        source_output = source_task_dir / output
+        if not source_output.exists():
+            continue
+
+        # 复制整个版本目录，而不是只复制单个 json 文件
+        source_copy_root = source_output.parent
+        target_copy_root = task_dir / relpath(source_copy_root, source_task_dir)
+        _copy_reusable_path(source_copy_root, target_copy_root)
+
+        copied_step_info = dict(step_info)
+        copied_step_info["reused_from_task_id"] = req.reuse_from_task_id
+        copied_step_info["reused_from"] = relpath(source_task_dir, ROOT)
+
+        copied_steps[step] = copied_step_info
+
+        if step_info.get("version"):
+            copied_versions[step] = step_info["version"]
+
+    if not copied_steps:
+        return
+
+    source_video = (
+        Path(req.input_video).resolve()
+        if req.input_video
+        else _existing_task_source_video(source_task_dir, source_manifest)
+    )
+    source_video_ref = relpath(source_video, task_dir)
+    now = datetime.now().isoformat(timespec="seconds")
+
+    write_json(
+        task_dir / "task.json",
+        {
+            "task_id": task_id,
+            "created_at": now,
+            "source_video_original": str(source_video),
+            "source_video": source_video_ref,
+            "reused_from_task_id": req.reuse_from_task_id,
+        },
+    )
+
+    write_json(
+        task_dir / "manifest.json",
+        {
+            "task_id": task_id,
+            "created_at": now,
+            "updated_at": now,
+            "source_video": source_video_ref,
+            "source_video_original": str(source_video),
+            "source_mode": source_manifest.get("source_mode", "single_source"),
+            "source_manifest": source_manifest.get("source_manifest", ""),
+            "source_videos": source_manifest.get("source_videos", []),
+            "production_mode": req.production_mode,
+            "current_versions": copied_versions,
+            "steps": copied_steps,
+            "reused_from_task_id": req.reuse_from_task_id,
+            "reused_steps": list(copied_steps),
+            "reused_common_steps": list(copied_steps),
+            "last_web_run_options": req.model_dump(),
+        },
+    )
+```
+
+这个函数的作用是：新 AI 配音任务目录刚创建时，先把旧视频重组任务的公共结果复制过来。之后 `run_pipeline.py` 再启动时，`PipelineRunner._init_task()` 会发现 manifest 已存在，然后直接用里面的 source_video、steps、current_versions 继续跑。
+
+---
+
+# 五、详细修改二：`newsclip_agent/pipeline.py`
+
+## 目标
+
+让 pipeline 真正认得复制过来的公共步骤，并跳过它们。
+
+现在 `_can_reuse()` 只认：
+
+```python
+status == "success"
+```
+
+它不认：
+
+```text
+partial_success
+```
+
+但 `vision` 有可能是 `partial_success`，并且多源复用逻辑已经把 `partial_success` 当可复用。
+
+---
+
+## 修改位置
+
+文件：
+
+```text
+newsclip_agent/pipeline.py
+```
+
+找到函数：
+
+```python
+def _can_reuse(self, step: str, input_hash: str | None = None) -> bool:
+```
+
+当前逻辑里有：
+
+```python
+if status.get("status") != "success":
+    return False
+```
+
+
+
+改成：
+
+```python
+state = status.get("status")
+if state not in {"success", "partial_success"}:
+    return False
+```
+
+完整建议版本：
+
+```python
+def _can_reuse(self, step: str, input_hash: str | None = None) -> bool:
+    step_order = self._active_step_order()
+
+    if self.options.rerun == step or (
+        self.options.rerun_from and step_order.index(step) >= step_order.index(self.options.rerun_from)
+    ):
+        return False
+
+    status = self.manifest.get("steps", {}).get(step, {})
+
+    state = status.get("status")
+    if state not in {"success", "partial_success"}:
+        return False
+
+    if input_hash and status.get("input_hash") != input_hash:
+        return False
+
+    output = status.get("output")
+    if output and not (self.task_dir / output).exists():
+        return False
+
+    return self.options.resume
+```
+
+---
+
+## 关键注意点
+
+复制旧步骤后，新任务一启动，会重新计算当前 step 的 `input_hash`。如果复制过来的 `input_hash` 和当前新任务计算出来的不一致，仍然不会复用。
+
+所以我们前面做 `_analysis_fingerprint_for_single_source()` 时，必须保证只在这些参数一致时才复制：
+
+```text
+video
+aspect_ratio
+chunk_seconds
+frame_interval
+mode
+```
+
+如果你视频重组用的是 `frame_interval=10`，AI 配音也要是 `frame_interval=10`。
+如果一个是 5，一个是 10，就不能复用 vision，因为抽帧不同。
+
+---
+
+# 六、详细修改三：`web_static/app.js` 可选优化
+
+这个不是必须，但能让用户操作更符合直觉。
+
+## 当前问题
+
+用户从左侧重新点素材后，前端会清掉 selectedTask，然后后端只能靠自动扫描。
+
+后端自动扫描已经能解决大部分问题，但前端最好也明确传递“我想从哪个任务切过来”。
+
+---
+
+## 修改 1：state 增加 `lastSelectedTask`
+
+在 `web_static/app.js` 顶部 state 里新增：
+
+```javascript
+lastSelectedTask: null,
+```
+
+也就是：
+
+```javascript
+const state = {
+  selectedVideo: null,
+  selectedRemoteVideo: null,
+  sourceBasket: [],
+  selectedTask: null,
+  lastSelectedTask: null,
+  ...
+};
+```
+
+---
+
+## 修改 2：点击任务时保存 lastSelectedTask
+
+找到点击任务 child 的逻辑，里面现在有：
+
+```javascript
+state.selectedTask = task.task_id;
+```
+
+附近代码在任务列表渲染里。
+
+改成：
+
+```javascript
+state.selectedTask = task.task_id;
+state.lastSelectedTask = task.task_id;
+```
+
+---
+
+## 修改 3：单素材提交时，如果是模式切换，带上原 task_id
+
+找到 `runSelected()` 里：
+
+```javascript
+} else if (state.selectedVideo) {
+  req.input_video = state.selectedVideo.path;
+  req.remote_video = null;
+  req.task_id = null;
+}
+```
+
+替换成：
+
+```javascript
+} else if (state.selectedVideo) {
+  req.input_video = state.selectedVideo.path;
+  req.remote_video = null;
+
+  if (state.lastSelectedTask && isSwitchingModeFromTask(state.lastSelectedTask, req.production_mode)) {
+    req.task_id = state.lastSelectedTask;
+  } else {
+    req.task_id = null;
+  }
+}
+```
+
+新增 helper：
+
+```javascript
+function isSwitchingModeFromTask(taskId, productionMode) {
+  if (!taskId) return false;
+
+  const isReassemblyTask =
+    taskId.includes("视频重组") || taskId.includes("highlight_reassembly");
+
+  const isVoiceoverTask =
+    taskId.includes("AI配音解说") || taskId.includes("ai_voiceover");
+
+  if (productionMode === "ai_voiceover") return isReassemblyTask;
+  if (productionMode === "highlight_reassembly") return isVoiceoverTask;
+
+  return false;
+}
+```
+
+这个改动可以让后端原有 `_prepare_mode_switched_run()` 更容易触发。
+不过真正兜底还是后端自动扫描，所以前端这步是锦上添花。
+
+---
+
+# 七、验证方法
+
+## 1. 先清楚观察旧行为
+
+你现在的坏日志是：
+
+```text
+完成: metadata
+完成: audio_extract
+完成: frame_extract
+完成: chunk_build
+Loading FunASR model on cuda:0...
+完成: asr
+vision chunk_0002: success
+```
+
+这说明没复用。
+
+---
+
+## 2. 修改后正确日志应该是
+
+先跑“视频重组”完成，再跑“AI 配音解说”。
+
+AI 配音日志应该类似：
+
+```text
+执行步骤: metadata, audio_extract, frame_extract, chunk_build, asr, vision, timeline, timeline_digest, content_analysis, short_video_edit_plan, voiceover_script, tts, subtitles, cut_plan, render
+复用缓存: metadata
+复用缓存: audio_extract
+复用缓存: frame_extract
+复用缓存: chunk_build
+复用缓存: asr
+复用缓存: vision
+复用缓存: timeline
+复用缓存: timeline_digest
+完成: content_analysis
+完成: short_video_edit_plan
+完成: voiceover_script
+完成: tts
+完成: subtitles
+完成: cut_plan
+完成: render
+```
+
+尤其不能再出现：
+
+```text
+Loading FunASR model on cuda:0...
+```
+
+如果又出现，说明 ASR 没复用。
+
+---
+
+## 3. 查看 manifest 是否记录复用
+
+新 AI 配音任务的 `manifest.json` 应该出现：
+
+```json
+{
+  "reused_from_task_id": "xxx_视频重组_xxx",
+  "reused_common_steps": [
+    "metadata",
+    "audio_extract",
+    "frame_extract",
+    "chunk_build",
+    "asr",
+    "vision",
+    "timeline",
+    "timeline_digest"
+  ]
+}
+```
+
+同时每个复制来的 step 里应该有：
+
+```json
+{
+  "reused_from_task_id": "xxx_视频重组_xxx",
+  "reused_from": "outputs/xxx_视频重组_xxx"
+}
+```
+
+---
+
+# 八、一个重要坑：`rerun-from` 会强制重跑
+
+`PipelineRunner._can_reuse()` 里有这个逻辑：
+
+```python
+if self.options.rerun == step or (
+    self.options.rerun_from and step_order.index(step) >= step_order.index(self.options.rerun_from)
+):
+    return False
+```
+
+
+
+所以如果你提交任务时带了：
+
+```bash
+--rerun-from asr
+```
+
+那 ASR 之后都会重新跑。
+正常从视频重组切 AI 配音时，不要带 `rerun-from metadata/asr/vision`。让它默认完整跑，它自己会对前面步骤 `复用缓存`，从 `content_analysis` 开始真正执行。
+
+---
+
+# 九、长期更好的架构方案
+
+上面是最小改法。长期更干净的方案是：
+
+```text
+所有单素材、多素材都统一生成 common_source_key
+所有公共分析都放到 outputs/__common__/common_xxx
+AI配音任务 和 视频重组任务 都只引用 common 分析结果
+```
+
+也就是：
+
+```text
+outputs/__common__/common_abcd1234/
+  metadata/
+  preprocess/
+  asr/
+  vision/
+  timeline/
+
+outputs/美放松对俄油制裁_AI配音解说_xxx/
+  agents/content_analysis/
+  agents/short_video_edit_plan/
+  agents/voiceover_script/
+  edit/drafts/
+
+outputs/美放松对俄油制裁_视频重组_xxx/
+  agents/video_understanding/
+  agents/highlight_detection/
+  agents/highlight_reassembly/
+  edit/reassembly_drafts/
+```
+
+多素材现在已经接近这个结构，单素材应该后续也迁过去。`run_multisource_pipeline.py` 已经有 `_ensure_common_analysis()` 和 `_copy_common_outputs_to_task()`，可以抽成通用模块复用。
+
+但短期别先大改，先按上面的 `web_app.py + pipeline.py` 改完，能最快解决你现在的重复跑 ASR / vision 问题。
