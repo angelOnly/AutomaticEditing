@@ -406,6 +406,92 @@ def delete_video(path: str) -> dict[str, Any]:
     return {"ok": True, "deleted": relpath(file_path, ROOT)}
 
 
+def _display_title_from_task_id(task_id: str) -> str:
+    value = task_id
+    for alias in _all_mode_aliases():
+        value = value.replace(f"_{alias}_", "_")
+        if value.endswith(f"_{alias}"):
+            value = value[: -len(alias) - 1]
+    return value
+
+
+def _task_group_meta(task_dir: Path, manifest: dict[str, Any]) -> dict[str, Any]:
+    source_request = read_json(task_dir / "input" / "source_request.json", {})
+    opts = manifest.get("last_web_run_options") or manifest.get("last_run_options") or {}
+
+    production_mode = (
+        manifest.get("production_mode")
+        or opts.get("production_mode")
+        or source_request.get("production_mode")
+        or _task_id_production_mode(task_dir.name)
+        or "ai_voiceover"
+    )
+
+    common_source_key = (
+        manifest.get("common_source_key")
+        or opts.get("common_source_key")
+        or source_request.get("common_source_key")
+        or ""
+    )
+    common_task_id = (
+        manifest.get("common_task_id")
+        or opts.get("common_task_id")
+        or source_request.get("common_task_id")
+        or ""
+    )
+
+    source_items = source_request.get("source_items") or []
+    source_names: list[str] = []
+    for index, item in enumerate(source_items, start=1):
+        if not isinstance(item, dict):
+            continue
+        if item.get("display_name"):
+            source_names.append(str(item["display_name"]))
+            continue
+        if item.get("path"):
+            source_names.append(Path(str(item["path"])).name)
+            continue
+        remote = item.get("remote_video") if isinstance(item.get("remote_video"), dict) else item
+        source_names.append(
+            str(
+                remote.get("display_name")
+                or remote.get("name")
+                or remote.get("title")
+                or remote.get("id")
+                or f"素材 {index}"
+            )
+        )
+
+    source_count = len(source_names) or len(manifest.get("source_videos") or []) or 1
+    if common_source_key:
+        group_id = f"group_{common_source_key}"
+    else:
+        source_video = str(manifest.get("source_video") or "")
+        group_id = (
+            f"group_{hashlib.sha256(source_video.encode('utf-8')).hexdigest()[:16]}"
+            if source_video
+            else f"group_{task_dir.name}"
+        )
+
+    if source_count > 1:
+        group_title = f"多源剪辑（{source_count}段）"
+    elif source_names:
+        group_title = Path(source_names[0]).stem
+    else:
+        group_title = _display_title_from_task_id(task_dir.name)
+
+    return {
+        "group_id": group_id,
+        "group_title": group_title,
+        "source_count": source_count,
+        "source_names": source_names,
+        "production_mode": production_mode,
+        "mode_title": _mode_slug(production_mode),
+        "common_source_key": common_source_key,
+        "common_task_id": common_task_id,
+    }
+
+
 @app.get("/api/tasks")
 def list_tasks() -> list[dict[str, Any]]:
     if not OUTPUTS_DIR.exists():
@@ -430,6 +516,7 @@ def list_tasks() -> list[dict[str, Any]]:
         stale = sum(1 for s in steps.values() if s.get("status") == "stale")
         failed = sum(1 for s in steps.values() if s.get("status") == "failed")
         job_status = _active_job_status_for_task(task_dir.name)
+        group_meta = _task_group_meta(task_dir, manifest)
         seen_task_ids.add(task_dir.name)
         tasks.append(
             {
@@ -442,7 +529,14 @@ def list_tasks() -> list[dict[str, Any]]:
                 "failed_steps": failed,
                 "step_count": len(steps) or (1 if source_request_exists else 0),
                 "job_status": job_status,
-                "common_task_id": manifest.get("common_task_id", ""),
+                "common_task_id": group_meta["common_task_id"],
+                "common_source_key": group_meta["common_source_key"],
+                "group_id": group_meta["group_id"],
+                "group_title": group_meta["group_title"],
+                "source_count": group_meta["source_count"],
+                "source_names": group_meta["source_names"],
+                "production_mode": group_meta["production_mode"],
+                "mode_title": group_meta["mode_title"],
                 "reused_common_steps": manifest.get("reused_common_steps", []),
             }
         )
@@ -454,6 +548,9 @@ def list_tasks() -> list[dict[str, Any]]:
         task_id = job.get("task_id")
         if not task_id or task_id in seen_task_ids or job.get("status") not in {"pending", "running"}:
             continue
+        task_dir = OUTPUTS_DIR / task_id
+        manifest = read_json(task_dir / "manifest.json", {}) if task_dir.exists() else {}
+        group_meta = _task_group_meta(task_dir, manifest)
         seen_task_ids.add(task_id)
         tasks.append(
             {
@@ -466,6 +563,14 @@ def list_tasks() -> list[dict[str, Any]]:
                 "failed_steps": 0,
                 "step_count": 0,
                 "job_status": job.get("status", ""),
+                "common_task_id": group_meta["common_task_id"],
+                "common_source_key": group_meta["common_source_key"],
+                "group_id": group_meta["group_id"],
+                "group_title": group_meta["group_title"],
+                "source_count": group_meta["source_count"],
+                "source_names": group_meta["source_names"],
+                "production_mode": group_meta["production_mode"],
+                "mode_title": group_meta["mode_title"],
             }
         )
     return tasks

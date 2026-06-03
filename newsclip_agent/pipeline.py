@@ -90,6 +90,7 @@ HIGHLIGHT_REASSEMBLY_STEP_ORDER = [
     "asr",
     "vision",
     "timeline",
+    "timeline_digest",
     "video_understanding",
     "highlight_detection",
     "highlight_reassembly_plan",
@@ -465,6 +466,7 @@ class PipelineRunner:
         input_hash: str,
         output_files: list[Path] | None = None,
         extra: dict[str, Any] | None = None,
+        mark_downstream_stale: bool = True,
     ) -> None:
         data = {
             "step_name": step,
@@ -482,7 +484,8 @@ class PipelineRunner:
         self.manifest.setdefault("steps", {})[step] = data
         if status in {"success", "partial_success"}:
             self.manifest.setdefault("current_versions", {})[step] = version
-            self._mark_downstream_stale(step)
+            if mark_downstream_stale:
+                self._mark_downstream_stale(step)
         self._save_manifest()
 
     def _write_status(self, version_dir: Path, status: dict[str, Any]) -> None:
@@ -530,6 +533,8 @@ class PipelineRunner:
         if self.options.rerun != step and not self.options.rerun_from:
             return
         step_order = self._active_step_order()
+        if step not in step_order:
+            return
         idx = step_order.index(step)
         for downstream in step_order[idx + 1 :]:
             entry = self.manifest.setdefault("steps", {}).get(downstream)
@@ -971,9 +976,18 @@ class PipelineRunner:
         write_json(vdir / "final_output.json", output)
         out = write_json(vdir / out_name, output)
         status = self._base_status(step, version, input_hash, [out])
-        status.update({"compat_source_step": source_step, "prompt_version": prompt_version})
+        status.update({"compat_source_step": source_step, "prompt_version": prompt_version, "compat_output": True})
         self._write_status(vdir, status)
-        self._record_step(step=step, version=version, status="success", output=relpath(out, self.task_dir), input_hash=input_hash, output_files=[out], extra={"compat_source_step": source_step, "prompt_version": prompt_version})
+        self._record_step(
+            step=step,
+            version=version,
+            status="success",
+            output=relpath(out, self.task_dir),
+            input_hash=input_hash,
+            output_files=[out],
+            extra={"compat_source_step": source_step, "prompt_version": prompt_version, "compat_output": True},
+            mark_downstream_stale=False,
+        )
 
     def _write_compat_content_analysis(self, result: dict[str, Any]) -> None:
         video_analysis = {

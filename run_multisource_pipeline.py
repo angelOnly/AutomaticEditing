@@ -85,15 +85,26 @@ def main(argv: list[str] | None = None) -> int:
     return pipeline_main(pipeline_args)
 
 
+def _append_common_log(common_dir: Path, message: str) -> None:
+    log_dir = ensure_dir(common_dir / "web_jobs")
+    log_path = log_dir / "common_analysis.log"
+    timestamp = datetime.now().isoformat(timespec="seconds")
+    with log_path.open("a", encoding="utf-8", errors="replace") as f:
+        f.write(f"[{timestamp}] {message}\n")
+
+
 def _ensure_common_analysis(*, common_dir: Path, request: dict[str, Any], args: argparse.Namespace) -> None:
     ensure_dir(common_dir)
+    ensure_dir(common_dir / "web_jobs")
     lock_name = f"common_source_{common_dir.name}"
     with file_slot_lock(lock_name, slots=1):
         if _common_analysis_ready(common_dir):
             print(f"Reuse common analysis outputs: {common_dir}")
+            _append_common_log(common_dir, "reuse common analysis outputs")
             return
 
         print(f"Start common analysis: {common_dir}")
+        _append_common_log(common_dir, "start common analysis")
         _mark_source_prepare(common_dir, "running", request=request)
         try:
             config = load_config(ROOT / "config.toml")
@@ -107,8 +118,10 @@ def _ensure_common_analysis(*, common_dir: Path, request: dict[str, Any], args: 
                 fps=int(multi_source_config.get("fps", 25)),
                 sample_rate=int(multi_source_config.get("sample_rate", 48000)),
             )
+            _append_common_log(common_dir, f"source_prepare success: {built.get('input_video')}")
             _mark_source_prepare(common_dir, "success", request=request, built=built)
         except Exception as exc:
+            _append_common_log(common_dir, f"source_prepare failed: {exc}")
             _mark_source_prepare(common_dir, "failed", request=request, error=str(exc))
             raise
 
@@ -133,12 +146,19 @@ def _ensure_common_analysis(*, common_dir: Path, request: dict[str, Any], args: 
             "ai_voiceover",
             "--common-only",
         ]
-        result = pipeline_main(pipeline_args)
-        if result != 0:
-            raise RuntimeError(f"common analysis failed with return code {result}")
+        try:
+            _append_common_log(common_dir, "run common pipeline: " + " ".join(map(str, pipeline_args)))
+            result = pipeline_main(pipeline_args)
+            _append_common_log(common_dir, f"common pipeline finished with return code {result}")
+            if result != 0:
+                raise RuntimeError(f"common analysis failed with return code {result}")
 
-        if not _common_analysis_ready(common_dir):
-            raise RuntimeError("common analysis finished but timeline_digest is not ready")
+            if not _common_analysis_ready(common_dir):
+                raise RuntimeError("common analysis finished but timeline_digest is not ready")
+            _append_common_log(common_dir, "common analysis ready")
+        except Exception as exc:
+            _append_common_log(common_dir, f"common analysis failed: {exc}")
+            raise
 
 
 def _common_analysis_ready(common_dir: Path) -> bool:

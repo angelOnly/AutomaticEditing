@@ -301,6 +301,95 @@ button {
   line-height: 1.35;
 }
 
+.task-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.045);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.task-group-header {
+  width: 100%;
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  align-items: center;
+  text-align: left;
+  padding: 4px;
+}
+
+.task-group-header strong {
+  display: block;
+  font-size: 13px;
+  line-height: 1.35;
+  font-weight: 760;
+  color: var(--sidebar-text);
+  overflow-wrap: anywhere;
+}
+
+.task-group-header span {
+  display: block;
+  margin-top: 4px;
+  color: var(--sidebar-muted);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.task-group-children {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.task-child {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.055);
+  border-radius: 10px;
+  padding: 8px 10px;
+  color: var(--sidebar-text);
+  text-align: left;
+  cursor: pointer;
+  transition: background 160ms ease, border-color 160ms ease;
+}
+
+.task-child:hover {
+  background: rgba(255, 255, 255, 0.085);
+}
+
+.task-child.active {
+  border-color: rgba(239, 68, 68, 0.72);
+  background: rgba(166, 29, 42, 0.18);
+}
+
+.task-child-mode {
+  min-width: 0;
+  font-weight: 720;
+  overflow-wrap: anywhere;
+}
+
+.task-child-status {
+  color: var(--sidebar-muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.task-group.job-running,
+.task-child.job-running {
+  border-color: rgba(239, 68, 68, 0.78);
+}
+
+.task-group.job-pending,
+.task-child.job-pending {
+  border-color: rgba(217, 119, 6, 0.78);
+}
+
 .remote-item {
   padding: 7px 10px;
 }
@@ -466,9 +555,30 @@ h3 {
   border-color: #b91c1c;
 }
 
+.button.danger:disabled,
+.button.danger.disabled {
+  background: #e5e7eb;
+  border-color: #d1d5db;
+  color: #9ca3af;
+  cursor: not-allowed;
+  filter: none;
+  opacity: 1;
+}
+
+.button.danger:not(:disabled) {
+  background: #dc2626;
+  border-color: #dc2626;
+  color: #fff;
+}
+
 .button:disabled {
   opacity: 0.55;
   cursor: not-allowed;
+}
+
+.button.danger:disabled,
+.button.danger.disabled {
+  opacity: 1;
 }
 
 .summary-grid {

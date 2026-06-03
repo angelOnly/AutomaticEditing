@@ -136,6 +136,7 @@ function init() {
   bindEvents();
   syncPreviewTabs();
   renderSourceBasket();
+  updateStopJobButton();
   loadConfig().then(refreshAll);
   startAutoRefresh();
   lucide.createIcons();
@@ -735,32 +736,117 @@ async function loadTasks() {
   const tasks = await api("/api/tasks");
   const box = $("taskList");
   box.innerHTML = tasks.length ? "" : `<div class="list-item"><strong>暂无任务</strong><span>选择素材后开始分析</span></div>`;
-  tasks.forEach((task) => {
-    const item = document.createElement("button");
-    const jobClass = task.job_status ? ` job-${task.job_status}` : "";
-    item.className = `list-item${jobClass} ${state.selectedTask === task.task_id ? "active" : ""}`;
-    item.type = "button";
-    const jobBadge = task.job_status ? `<em class="task-job-badge ${escapeAttr(task.job_status)}">${escapeHtml(jobStatusLabel(task.job_status))}</em>` : "";
-    item.innerHTML = `<strong>${escapeHtml(displayTaskId(task.task_id))}</strong><span>${task.done_steps}/${task.step_count} 完成 · ${task.failed_steps} 失败 · ${task.updated_at || "-"}</span>${jobBadge}`;
-    item.addEventListener("click", async () => {
-      state.selectedTask = task.task_id;
-      state.selectedVideo = null;
-      state.selectedRemoteVideo = null;
-      state.sourceBasket = [];
-      renderSourceBasket();
-      $("taskIdInput").value = task.task_id;
-      $("activeTitle").textContent = displayTaskId(task.task_id);
-      updateTaskSubtitle(task.task_id);
-      await loadManifest(task.task_id);
-      await loadTree();
-      loadVideos();
-      renderRemoteVideos();
-      loadTasks();
+
+  groupTasks(tasks).forEach((group) => {
+    const groupEl = document.createElement("div");
+    groupEl.className = `task-group ${group.job_status ? `job-${group.job_status}` : ""}`;
+
+    const runningBadge = group.job_status
+      ? `<em class="task-job-badge ${escapeAttr(group.job_status)}">${escapeHtml(jobStatusLabel(group.job_status))}</em>`
+      : "";
+    const sourceTitle = group.source_names?.length
+      ? `${group.source_names.slice(0, 2).join(" / ")}${group.source_names.length > 2 ? ` 等 ${group.source_names.length} 段` : ""}`
+      : `${group.source_count || 1} 段素材`;
+
+    groupEl.innerHTML = `
+      <div class="task-group-header">
+        <div>
+          <strong>${escapeHtml(group.group_title || "任务组")}</strong>
+          <span>${escapeHtml(sourceTitle)} · ${group.done_steps}/${group.step_count} 完成 · ${group.failed_steps} 失败 · ${group.updated_at || "-"}</span>
+        </div>
+        ${runningBadge}
+      </div>
+      <div class="task-group-children"></div>
+    `;
+
+    const childrenBox = groupEl.querySelector(".task-group-children");
+    const children = [...group.children].sort((a, b) => preferredModeOrder(a.production_mode) - preferredModeOrder(b.production_mode));
+
+    children.forEach((task) => {
+      const child = document.createElement("button");
+      child.className = `task-child ${state.selectedTask === task.task_id ? "active" : ""} ${task.job_status ? `job-${task.job_status}` : ""}`;
+      child.type = "button";
+
+      const childBadge = task.job_status
+        ? `<em class="task-job-badge ${escapeAttr(task.job_status)}">${escapeHtml(jobStatusLabel(task.job_status))}</em>`
+        : "";
+      const modeTitle = task.mode_title || productionModeName(task.production_mode);
+
+      child.innerHTML = `
+        <span class="task-child-mode">${escapeHtml(modeTitle)}</span>
+        <span class="task-child-status">${task.done_steps}/${task.step_count} · 失败 ${task.failed_steps}</span>
+        ${childBadge}
+      `;
+
+      child.addEventListener("click", async (event) => {
+        event.stopPropagation();
+        state.selectedTask = task.task_id;
+        state.selectedVideo = null;
+        state.selectedRemoteVideo = null;
+        state.sourceBasket = [];
+        renderSourceBasket();
+        $("taskIdInput").value = task.task_id;
+        $("activeTitle").textContent = `${group.group_title || displayTaskId(task.task_id)} / ${modeTitle}`;
+        updateTaskSubtitle(task.task_id);
+        await loadManifest(task.task_id);
+        await loadTree();
+        loadVideos();
+        renderRemoteVideos();
+        loadTasks();
+      });
+
+      attachContextDelete(child, () => deleteTask(task));
+      childrenBox.appendChild(child);
     });
-    attachContextDelete(item, () => deleteTask(task));
-    box.appendChild(item);
+
+    box.appendChild(groupEl);
   });
   lucide.createIcons();
+}
+
+function groupTasks(tasks) {
+  const groups = new Map();
+
+  tasks.forEach((task) => {
+    const groupId = task.group_id || task.common_source_key || task.task_id;
+    if (!groups.has(groupId)) {
+      groups.set(groupId, {
+        group_id: groupId,
+        group_title: task.group_title || displayTaskId(task.task_id),
+        source_count: task.source_count || 1,
+        source_names: task.source_names || [],
+        common_task_id: task.common_task_id || "",
+        common_source_key: task.common_source_key || "",
+        updated_at: task.updated_at || "",
+        job_status: "",
+        failed_steps: 0,
+        done_steps: 0,
+        step_count: 0,
+        children: [],
+      });
+    }
+
+    const group = groups.get(groupId);
+    group.children.push(task);
+    if ((task.updated_at || "") > (group.updated_at || "")) group.updated_at = task.updated_at;
+    group.failed_steps += Number(task.failed_steps || 0);
+    group.done_steps += Number(task.done_steps || 0);
+    group.step_count += Number(task.step_count || 0);
+
+    if (task.job_status === "running") {
+      group.job_status = "running";
+    } else if (task.job_status === "pending" && group.job_status !== "running") {
+      group.job_status = "pending";
+    }
+  });
+
+  return Array.from(groups.values()).sort((a, b) => String(b.updated_at || "").localeCompare(String(a.updated_at || "")));
+}
+
+function preferredModeOrder(mode) {
+  if (mode === "ai_voiceover") return 1;
+  if (mode === "highlight_reassembly") return 2;
+  return 99;
 }
 
 async function uploadSelectedVideo(event) {
@@ -1517,28 +1603,36 @@ function updateStopJobButton() {
   const button = $("stopJob");
   if (!button) return;
   const active = Boolean(state.activeJob);
-  button.classList.toggle("hidden", !active);
+  button.classList.remove("hidden");
   button.disabled = !active;
+  button.classList.toggle("disabled", !active);
 }
 
 async function cancelActiveJob() {
   if (!state.activeJob) return;
   const jobId = state.activeJob;
   const button = $("stopJob");
+  const label = button?.querySelector("span");
   if (button) button.disabled = true;
-  const job = await api(`/api/jobs/${jobId}`, { method: "DELETE" });
-  state.activeJob = null;
-  if (state.logTimer) {
-    clearInterval(state.logTimer);
-    state.logTimer = null;
+  if (label) label.textContent = "终止中...";
+
+  try {
+    const job = await api(`/api/jobs/${jobId}`, { method: "DELETE" });
+    state.activeJob = null;
+    if (state.logTimer) {
+      clearInterval(state.logTimer);
+      state.logTimer = null;
+    }
+    $("metricJob").textContent = jobStatusLabel(job.status);
+    updateJobMessage(job.user_message || "任务已取消。");
+    await refreshActiveTaskSnapshot(job.task_id).catch(() => {});
+    await refreshLog().catch(() => {});
+    await loadTasks().catch(() => {});
+  } finally {
+    if (label) label.textContent = "终止任务";
+    setRunControlsBusy(false);
+    updateStopJobButton();
   }
-  setRunControlsBusy(false);
-  updateStopJobButton();
-  $("metricJob").textContent = jobStatusLabel(job.status);
-  updateJobMessage(job.user_message || "任务已取消。");
-  await refreshActiveTaskSnapshot(job.task_id).catch(() => {});
-  await refreshLog().catch(() => {});
-  await loadTasks().catch(() => {});
 }
 
 async function refreshJobAndLog() {
@@ -1629,6 +1723,7 @@ function clearTaskPanels() {
   if (state.logTimer) clearInterval(state.logTimer);
   state.logTimer = null;
   state.activeJob = null;
+  updateStopJobButton();
   $("stepTable").innerHTML = "";
   $("fileList").innerHTML = "";
   $("fileViewer").textContent = "选择左侧任务或文件后显示内容。";
