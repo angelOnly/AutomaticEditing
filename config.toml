@@ -34,8 +34,8 @@ text_doubao_base_url = "https://ark.cn-beijing.volces.com/api/v3"
 
 # 文字转语言
 [omnivoice]
-model_path = "E:\\ai\\skills\\AutomaticEditing\\models\\OmniVoice"
-reference_audio = "E:\\ai\\skills\\AutomaticEditing\\tts_ref\\664925840_0_13s.mp3"
+model_path = "models/OmniVoice"
+reference_audio = "tts_ref/664925840_0_13s.mp3"
 reference_text = "问一下啊，今天所有来到我直播间，宝贝现在不要离开直播间。因为身上这个小黑裙是你们家衣柜里没有过的类型，没有过的风格。我知道宝贝，你们家都有裙子，夏天谁家没有小裙子，对不对？"
 speed = 0.85
 default_voice_id = "default_female"
@@ -54,7 +54,7 @@ enabled = true
 
 # 音频转文字
 [funasr]
-asr_model_path = "E:\\ai\\skills\\AutomaticEditing\\models\\iic"
+asr_model_path = ""models/iic""
 
 # 工作流与网页默认配置
 [workflow]
