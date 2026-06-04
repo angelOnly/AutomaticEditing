@@ -17,6 +17,22 @@ const AI_VOICEOVER_STEPS = [
   "render",
 ];
 
+const UNIFIED_AI_VOICEOVER_STEPS = [
+  "source_prepare",
+  "source_analysis",
+  "source_aggregate",
+  "content_analysis",
+  "candidate_refine",
+  "short_video_edit_plan",
+  "merge_decision",
+  "voiceover_script",
+  "voiceover_quality_check",
+  "tts",
+  "subtitles",
+  "cut_plan",
+  "render",
+];
+
 const HIGHLIGHT_REASSEMBLY_STEPS = [
   "source_prepare",
   "metadata",
@@ -34,25 +50,43 @@ const HIGHLIGHT_REASSEMBLY_STEPS = [
   "reassembly_render",
 ];
 
+const UNIFIED_HIGHLIGHT_REASSEMBLY_STEPS = [
+  "source_prepare",
+  "source_analysis",
+  "source_aggregate",
+  "video_understanding",
+  "highlight_detection",
+  "candidate_refine",
+  "highlight_reassembly_plan",
+  "reassembly_cut_plan",
+  "reassembly_render",
+];
+
 let STEPS = AI_VOICEOVER_STEPS;
 
 const STEP_LABELS = {
   source_prepare: "准备多源素材",
+  source_analysis: "按源分析素材",
+  source_aggregate: "汇总素材分析",
   metadata: "读取视频信息",
   audio_extract: "提取音频",
   frame_extract: "抽取关键帧",
   chunk_build: "切分分析片段",
   asr: "语音转文字",
+  asr_digest: "压缩语音摘要",
   vision: "画面识别",
   timeline: "合并时间线",
   timeline_digest: "压缩分析时间线",
   content_analysis: "内容分析",
+  candidate_refine: "精选候选片段",
   short_video_edit_plan: "短视频剪辑规划",
+  merge_decision: "合并成片决策",
   video_understanding: "理解整条新闻",
   highlight_detection: "识别高光片段",
   short_video_planning: "规划短视频",
   editing_script: "生成剪辑脚本",
   voiceover_script: "生成配音文案",
+  voiceover_quality_check: "校验配音文案",
   tts: "生成 TTS 配音",
   subtitles: "生成字幕",
   cut_plan: "生成剪辑计划",
@@ -1498,6 +1532,17 @@ function stepsForManifest(manifest) {
     manifest?.last_web_run_options?.production_mode ||
     $("productionMode")?.value ||
     "ai_voiceover";
+  const manifestSteps = manifest?.steps || {};
+  const stepNames = Object.keys(manifestSteps);
+  const hasUnifiedSteps = stepNames.includes("source_analysis") || stepNames.includes("source_aggregate");
+  if (hasUnifiedSteps) {
+    const preferred =
+      mode === "highlight_reassembly"
+        ? UNIFIED_HIGHLIGHT_REASSEMBLY_STEPS
+        : UNIFIED_AI_VOICEOVER_STEPS;
+    const known = preferred.filter((step) => step in manifestSteps);
+    return known.length ? known : preferred;
+  }
   return mode === "highlight_reassembly" ? HIGHLIGHT_REASSEMBLY_STEPS : AI_VOICEOVER_STEPS;
 }
 
