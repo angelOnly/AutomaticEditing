@@ -194,11 +194,13 @@ function fillVoiceSelect() {
   }
 
   select.innerHTML = voices.map((voice) => {
-    const label = [
-      voice.name || voice.id,
+    const name = voice.name || voice.id;
+    let label = [
+      name.includes("默认") ? "" : name,
       voice.gender ? genderLabel(voice.gender) : "",
       voice.style ? styleLabel(voice.style) : "",
     ].filter(Boolean).join(" · ");
+    if (!label) label = name;
     return `<option value="${escapeAttr(voice.id)}">${escapeHtml(label)}</option>`;
   }).join("");
 
