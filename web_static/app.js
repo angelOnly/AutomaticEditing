@@ -424,13 +424,25 @@ function bindEvents() {
 }
 
 function fillStepSelect() {
-  updateActiveSteps();
-  $("rerunStep").innerHTML = STEPS.map((s) => `<option value="${s}">${stepLabel(s)}</option>`).join("");
+  let activeSteps;
+  if (state.manifest) {
+    activeSteps = stepsForManifest(state.manifest);
+  } else {
+    updateActiveSteps();
+    activeSteps = STEPS;
+  }
+  const currentVal = $("rerunStep").value;
+  $("rerunStep").innerHTML = activeSteps.map((s) => `<option value="${s}">${stepLabel(s)}</option>`).join("");
+  if (activeSteps.includes(currentVal)) {
+    $("rerunStep").value = currentVal;
+  } else if (activeSteps.length > 0) {
+    $("rerunStep").value = activeSteps[0];
+  }
   updateChunkInputState();
 }
 
 function updateActiveSteps() {
-  STEPS = $("productionMode")?.value === "highlight_reassembly" ? HIGHLIGHT_REASSEMBLY_STEPS : AI_VOICEOVER_STEPS;
+  STEPS = $("productionMode")?.value === "highlight_reassembly" ? UNIFIED_HIGHLIGHT_REASSEMBLY_STEPS : UNIFIED_AI_VOICEOVER_STEPS;
 }
 
 function onProductionModeChange() {
@@ -1201,6 +1213,7 @@ async function loadManifest(taskId, options = {}) {
   const manifest = await api(`/api/tasks/${taskId}/manifest`);
   state.manifest = manifest;
   if (restoreControls) restoreRunControls(manifest);
+  fillStepSelect();
   renderManifest();
   if (refreshDrafts || updatePreview) await refreshPreviewForCurrentMode(taskId, { updatePreview });
   if (adoptJob) await adoptRunningJob(taskId);
@@ -1929,9 +1942,11 @@ function afterJobStarted(job) {
   if (job.deduplicated) {
     $("logViewer").textContent = job.message || "已切换到现有任务。";
   } else {
-    const activeSteps = $("productionMode")?.value === "highlight_reassembly"
-      ? HIGHLIGHT_REASSEMBLY_STEPS
-      : AI_VOICEOVER_STEPS;
+    const activeSteps = state.manifest
+      ? stepsForManifest(state.manifest)
+      : ($("productionMode")?.value === "highlight_reassembly"
+          ? UNIFIED_HIGHLIGHT_REASSEMBLY_STEPS
+          : UNIFIED_AI_VOICEOVER_STEPS);
     updateProgress(0, activeSteps.length, 0, 0, 0);
     if ($("metricCurrentStep")) $("metricCurrentStep").textContent = stepLabel(activeSteps[0]);
     $("logViewer").textContent = "任务已提交，等待日志输出...";
