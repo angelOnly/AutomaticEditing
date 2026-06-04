@@ -1023,6 +1023,59 @@ class PipelineRunner:
             return digest if isinstance(digest, dict) else {"chunks": []}
         return self._load_step_json("timeline_digest")
 
+    def _load_current_timeline_digest_for_llm(self, step: str) -> dict[str, Any]:
+        digest = self._load_current_timeline_digest()
+        chunks = digest.get("chunks", []) if isinstance(digest, dict) else []
+        compact_chunks: list[dict[str, Any]] = []
+        for chunk in chunks:
+            if not isinstance(chunk, dict):
+                continue
+            compact_chunks.append({
+                "chunk_id": chunk.get("chunk_id") or chunk.get("global_chunk_id") or "",
+                "source_id": chunk.get("source_id", ""),
+                "source_index": chunk.get("source_index", ""),
+                "start": chunk.get("start_seconds", chunk.get("start", 0)),
+                "end": chunk.get("end_seconds", chunk.get("end", 0)),
+                "speech": compact_text(str(chunk.get("speech") or ""), max_chars=70),
+                "visual": compact_text(str(chunk.get("visual") or ""), max_chars=50),
+                "visual_score": chunk.get("visual_score", 0),
+                "hook_score": chunk.get("hook_score", 0),
+                "flags": compact_list(chunk.get("flags") or [], max_items=2, max_chars_each=18),
+            })
+        return {
+            "version": str(digest.get("version") or "timeline_digest_llm_compact_v1"),
+            "source": "source_aggregate" if self._is_virtual_source_manifest() else "timeline_digest",
+            "video_duration_seconds": digest.get("video_duration_seconds", 0),
+            "chunk_count": len(compact_chunks),
+            "chunks": compact_chunks,
+        }
+
+    def _load_compact_source_aggregate_for_llm(self) -> dict[str, Any]:
+        if not self._is_virtual_source_manifest():
+            return {}
+        aggregate = self._load_optional_step_json("source_aggregate", {})
+        sources: list[dict[str, Any]] = []
+        for item in aggregate.get("sources") or []:
+            if not isinstance(item, dict):
+                continue
+            sources.append({
+                "source_id": item.get("source_id", ""),
+                "source_index": item.get("source_index", ""),
+                "display_name": item.get("display_name", ""),
+                "duration_seconds": item.get("duration_seconds", 0),
+                "virtual_start_seconds": item.get("virtual_start_seconds", 0),
+                "virtual_end_seconds": item.get("virtual_end_seconds", 0),
+                "summary": compact_text(str(item.get("summary") or ""), max_chars=160),
+                "key_facts": compact_list(item.get("key_facts") or [], max_items=2, max_chars_each=70),
+            })
+        return {
+            "version": "source_aggregate_llm_compact_v1",
+            "source_count": aggregate.get("source_count", len(sources)),
+            "successful_source_count": aggregate.get("successful_source_count", len(sources)),
+            "failed_sources": aggregate.get("failed_sources", []),
+            "sources": sources,
+        }
+
     def _current_timeline_digest_hash(self) -> str:
         if self._is_virtual_source_manifest():
             return self._step_content_hash("source_aggregate")
@@ -1771,26 +1824,120 @@ class PipelineRunner:
         self._record_step(step="timeline_digest", version=version, status="success", output=relpath(out, self.task_dir), input_hash=input_hash, output_files=[out], extra={"summary": {"chunks": len(chunks)}})
         print("完成: timeline_digest")
 
+    def _format_source_aggregate_text(self, aggregate: dict[str, Any]) -> str:
+        if not aggregate or not aggregate.get("sources"):
+            return ""
+        lines = ["素材概览："]
+        for src in aggregate.get("sources", []):
+            idx = src.get("source_index", "")
+            name = src.get("display_name", "")
+            duration = float(src.get("duration_seconds", 0))
+            summary = src.get("summary", "")
+            facts = " ".join(src.get("key_facts", []))
+            dur_str = f"{int(duration//60)}分{int(duration%60)}秒"
+            
+            lines.append(f"素材{idx}《{name}》，时长{dur_str}。")
+            if summary:
+                lines.append(f"摘要：{summary}")
+            if facts:
+                lines.append(f"要点：{facts}")
+            lines.append("")
+        return "\n".join(lines).strip()
+
+    def _format_timeline_chunks_text(self, digest: dict[str, Any], max_chunks: int | None = None) -> str:
+        chunks = digest.get("chunks", [])
+        if max_chunks is not None:
+            chunks = chunks[:max_chunks]
+        
+        lines = [
+            "格式说明：片段=素材序号 时间段，随后两行依次为声音内容、画面内容。",
+            "",
+            "片段列表："
+        ]
+        for c in chunks:
+            idx = c.get("source_index", "")
+            if not idx:
+                idx = "1"
+            start = seconds_to_timecode(c.get("start", 0))
+            end = seconds_to_timecode(c.get("end", 0))
+            speech = str(c.get("speech") or "").strip() or "无"
+            visual = str(c.get("visual") or "").strip() or "无"
+            
+            lines.append(f"{idx} {start}-{end}：")
+            lines.append(speech)
+            lines.append(visual)
+            lines.append("")
+        return "\n".join(lines).strip()
+
+    def _build_content_analysis_brief_text(self) -> str:
+        digest = self._load_current_timeline_digest_for_llm("content_analysis")
+        aggregate = self._load_compact_source_aggregate_for_llm()
+        opts = self._run_options_payload_minimal()
+        
+        lines = [
+            "任务：请判断这些素材的新闻主题、素材关系、可剪方向，并提取候选短视频角度。",
+            ""
+        ]
+        if opts:
+            lines.append("要求：")
+            if opts.get("target_duration_seconds"):
+                lines.append(f"- 目标时长：{opts['target_duration_seconds']}秒")
+            if opts.get("allow_long_video"):
+                lines.append("- 允许长视频")
+            lines.append("")
+            
+        src_text = self._format_source_aggregate_text(aggregate)
+        if src_text:
+            lines.append(src_text)
+            lines.append("")
+            
+        lines.append(self._format_timeline_chunks_text(digest, max_chunks=20))
+        return "\n".join(lines).strip()
+
+    def _build_video_understanding_brief_text(self) -> str:
+        digest = self._load_current_timeline_digest_for_llm("video_understanding")
+        aggregate = self._load_compact_source_aggregate_for_llm()
+        
+        lines = [
+            "任务：请理解这些素材的新闻内容、叙事结构、人物/地点/事件关系，并判断哪些部分适合做原声高光重组。",
+            ""
+        ]
+        src_text = self._format_source_aggregate_text(aggregate)
+        if src_text:
+            lines.append(src_text)
+            lines.append("")
+            
+        lines.append(self._format_timeline_chunks_text(digest))
+        return "\n".join(lines).strip()
+
+    def _build_highlight_detection_brief_text(self) -> str:
+        digest = self._load_current_timeline_digest_for_llm("highlight_detection")
+        video_analysis = self._load_step_json("video_understanding")
+        
+        lines = [
+            "任务：请从以下片段中找适合原声重组的高光片段。",
+            ""
+        ]
+        if video_analysis and video_analysis.get("overall_understanding"):
+            lines.append("整体理解：")
+            lines.append(str(video_analysis["overall_understanding"]))
+            lines.append("")
+            
+        lines.append(self._format_timeline_chunks_text(digest))
+        return "\n".join(lines).strip()
+
     def step_content_analysis(self) -> None:
-        result = self._run_text_agent("content_analysis", {
-            "timeline_digest": self._load_current_timeline_digest(),
-            "source_aggregate": self._load_optional_step_json("source_aggregate", {}) if self._is_virtual_source_manifest() else {},
-            "run_options": self._run_options_payload_minimal(),
-        })
+        text_input = self._build_content_analysis_brief_text()
+        result = self._run_text_agent("content_analysis", text_input)
         self._write_compat_content_analysis(result)
 
     def step_video_understanding(self) -> None:
-        self._run_text_agent("video_understanding", {
-            "timeline_digest": self._load_current_timeline_digest(),
-            "source_aggregate": self._load_optional_step_json("source_aggregate", {}) if self._is_virtual_source_manifest() else {},
-        })
+        text_input = self._build_video_understanding_brief_text()
+        self._run_text_agent("video_understanding", text_input)
 
     def step_highlight_detection(self) -> None:
-        self._run_text_agent("highlight_detection", {
-            "timeline_digest": self._load_current_timeline_digest(),
-            "video_analysis": self._load_step_json("video_understanding"),
-            "source_aggregate": self._load_optional_step_json("source_aggregate", {}) if self._is_virtual_source_manifest() else {},
-        })
+        text_input = self._build_highlight_detection_brief_text()
+        self._run_text_agent("highlight_detection", text_input)
 
     def step_candidate_refine(self) -> None:
         cfg = self.config.raw.get("candidate_refine", {})
