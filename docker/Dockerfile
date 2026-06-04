@@ -28,10 +28,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         wget \
     && rm -rf /var/lib/apt/lists/*
 
+RUN python -m pip install \
+--index-url https://download.pytorch.org/whl/cu128 \
+torch==2.9.1+cu128 \
+torchaudio==2.9.1+cu128 \
+torchvision==0.24.1+cu128 \
+torchcodec==0.9.0+cu128
+
 COPY docker/requirements-docker.txt /tmp/requirements-docker.txt
 
 RUN python -m pip install --upgrade pip setuptools wheel \
     && python -m pip install -r /tmp/requirements-docker.txt
+
+ENV LD_LIBRARY_PATH=/usr/local/lib/python3.13/site-packages/torch/lib:/usr/local/lib/python3.13/site-packages/nvidia/npp/lib:/usr/local/lib/python3.13/site-packages/nvidia/cuda_runtime/lib:/usr/local/lib/python3.13/site-packages/nvidia/cuda_nvrtc/lib:${LD_LIBRARY_PATH}
 
 COPY models /opt/automatic-editing/models
 COPY tts_ref /opt/automatic-editing/tts_ref

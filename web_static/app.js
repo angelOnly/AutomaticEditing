@@ -380,16 +380,47 @@ async function previewSelectedVoice() {
     return;
   }
 
-  const voice = (state.voices || []).find((item) => item.id === voiceId);
-  const url = voice?.preview_url || `/api/voices/${encodeURIComponent(voiceId)}/preview`;
+  const button = $("previewVoice");
   const audio = $("voicePreviewAudio");
-  audio.src = url;
-  audio.load();
+  const oldText = button?.textContent || "试听音色";
 
   try {
+    if (button) {
+      button.disabled = true;
+      button.textContent = "生成中...";
+    }
+
+    const res = await fetch(`/api/voices/${encodeURIComponent(voiceId)}/preview-tts`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        text: "欢迎收听凤凰新闻智能剪辑系统生成的配音试听。本段音频用于测试当前音色在新闻解说场景下的语速、音质和表达效果。",
+      }),
+    });
+
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(text || res.statusText);
+    }
+
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+
+    if (audio.dataset.objectUrl) {
+      URL.revokeObjectURL(audio.dataset.objectUrl);
+    }
+
+    audio.dataset.objectUrl = url;
+    audio.src = url;
+    audio.load();
     await audio.play();
   } catch (error) {
     alert(`试听失败：${cleanError(error)}`);
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = oldText;
+    }
   }
 }
 
@@ -1345,7 +1376,7 @@ function renderManifest() {
     visibleEntries.find(([, item]) => ["pending", "stale"].includes(item.status || "pending")) ||
     visibleEntries[visibleEntries.length - 1];
   renderActionRequired(manifest);
-  if (!state.activeJob) updateJobMessage(manifest.user_message || "");
+  if (!state.activeJob) renderJobError(manifest, visibleEntries);
   updateProgress(done, activeSteps.length, completed, skipped, failed);
   $("metricSteps").textContent = `${done}/${activeSteps.length}（成功 ${completed}，跳过 ${skipped}）`;
   if ($("metricCurrentStep")) $("metricCurrentStep").textContent = currentEntry ? stepLabel(currentEntry[0]) : "-";
@@ -1408,6 +1439,11 @@ function stepNote(step, item = {}) {
 
   if (!item.status || item.status === "pending") return "";
   if (item.status === "skipped") return skippedReasonText(item.reason, step);
+  if (item.status === "failed") {
+    const rawError = item.error || item.reason || "";
+    const explained = explainStepError(step, rawError);
+    return `${explained.title}，${explained.suggestion}`;
+  }
   return item.error || item.reason || "";
 }
 
@@ -1848,8 +1884,57 @@ function updateJobMessage(message) {
     box.textContent = "";
     return;
   }
+  $("jobErrorCard")?.classList.add("hidden");
   box.classList.remove("hidden");
   box.textContent = value;
+}
+
+function renderJobError(manifest, visibleEntries) {
+  const box = $("jobErrorCard");
+  const msgBox = $("jobMessage");
+  if (!box || !msgBox) return;
+
+  const failedEntry = visibleEntries.find(([, item]) => item.status === "failed");
+  if (failedEntry) {
+    const [stepName, item] = failedEntry;
+    const rawError = item.error || item.reason || manifest.user_message || "";
+    const explained = explainStepError(stepName, rawError);
+    
+    box.innerHTML = `
+      <strong>${escapeHtml(explained.title)}</strong>
+      <p>${escapeHtml(explained.message)}</p>
+      <p>${escapeHtml(explained.suggestion)}</p>
+      <div class="error-actions">
+        <button class="button primary rerun-btn" type="button">${escapeHtml(explained.rerunLabel)}</button>
+      </div>
+      <details>
+        <summary>查看技术详情</summary>
+        <pre>${escapeHtml(explained.technicalDetail)}</pre>
+      </details>
+    `;
+    box.querySelector(".rerun-btn")?.addEventListener("click", () => {
+      rerunFromSuggestedStep(explained.rerunStep);
+    });
+    box.classList.remove("hidden");
+    msgBox.classList.add("hidden");
+  } else if (manifest.user_message) {
+    box.classList.add("hidden");
+    msgBox.textContent = manifest.user_message;
+    msgBox.classList.remove("hidden");
+  } else {
+    box.classList.add("hidden");
+    msgBox.classList.add("hidden");
+  }
+}
+
+function rerunFromSuggestedStep(stepName) {
+  const select = $("rerunStep");
+  if (select) select.value = stepName;
+
+  const chunkInput = $("chunkInput");
+  if (chunkInput) chunkInput.value = "";
+
+  rerun(true).catch(handleRunError);
 }
 
 async function refreshLog() {
@@ -1980,6 +2065,103 @@ function escapeAttr(str) {
 
 function cleanError(error) {
   return String(error?.message || error || "未知错误").replace(/^Error:\s*/, "");
+}
+
+function explainStepError(stepName, rawError = "") {
+  const text = String(rawError || "");
+
+  if (
+    stepName === "voiceover_script" &&
+    text.includes("does not satisfy target duration") &&
+    text.includes("duration_fit=too_short")
+  ) {
+    return {
+      title: "解说文案长度不足",
+      message:
+        "系统计划生成的视频时长较长，但当前解说文案偏短，可能导致配音无法覆盖完整画面。因此系统已暂停后续的配音、字幕和渲染。",
+      suggestion:
+        "建议从【生成配音文案】步骤重新运行，让系统生成更完整的解说文案。",
+      rerunStep: "voiceover_script",
+      rerunLabel: "从生成配音文案重新运行",
+      severity: "warning",
+      technicalDetail: text,
+    };
+  }
+
+  if (text.includes("TorchCodec is required")) {
+    return {
+      title: "TTS 音频解码依赖缺失",
+      message: "系统生成配音时缺少必要的音频解码组件。",
+      suggestion: "请联系开发人员修复依赖问题。",
+      rerunStep: stepName,
+      rerunLabel: "重试",
+      severity: "error",
+      technicalDetail: text,
+    };
+  }
+  
+  if (text.includes("voice reference audio not found")) {
+    return {
+      title: "配音参考音频缺失",
+      message: "所选音色的参考音频未找到，无法生成 TTS 配音。",
+      suggestion: "请选择其他音色，或联系管理员上传该音色的参考音频。",
+      rerunStep: stepName,
+      rerunLabel: "重试",
+      severity: "error",
+      technicalDetail: text,
+    };
+  }
+
+  if (text.includes("CUDA out of memory")) {
+    return {
+      title: "显存不足",
+      message: "系统当前负载较高，显存资源不足。",
+      suggestion: "建议稍等片刻，然后重新运行失败步骤。",
+      rerunStep: stepName,
+      rerunLabel: "重新运行",
+      severity: "error",
+      technicalDetail: text,
+    };
+  }
+
+  if (text.includes("compact video duration below")) {
+    return {
+      title: "成片时长不足",
+      message: "提取的高光片段总时长未达到要求。",
+      suggestion: "需要放宽时长限制或重组素材。",
+      rerunStep: stepName,
+      rerunLabel: "重试",
+      severity: "warning",
+      technicalDetail: text,
+    };
+  }
+
+  if (
+    stepName === "tts" &&
+    text.includes("require_tts=true")
+  ) {
+    return {
+      title: "配音生成失败",
+      message:
+        "系统在生成 AI 配音时失败，因此暂停了后续的字幕、剪辑计划和渲染。",
+      suggestion:
+        "建议先试听音色，确认 TTS 环境正常；然后从【生成 TTS 配音】步骤重新运行。",
+      rerunStep: "tts",
+      rerunLabel: "从生成 TTS 配音重新运行",
+      severity: "error",
+      technicalDetail: text,
+    };
+  }
+
+  return {
+    title: "任务运行失败",
+    message: "当前步骤运行失败，系统已暂停后续流程。",
+    suggestion: "建议从失败步骤重新运行；如果多次失败，再查看技术详情。",
+    rerunStep: stepName,
+    rerunLabel: "从失败步骤重新运行",
+    severity: "error",
+    technicalDetail: text,
+  };
 }
 
 init();

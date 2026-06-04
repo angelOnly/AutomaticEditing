@@ -1246,6 +1246,57 @@ select:focus {
   white-space: pre-wrap;
 }
 
+.user-error-card {
+  margin-top: 12px;
+  padding: 16px;
+  border: 1px solid rgba(166, 29, 42, 0.24);
+  border-radius: 12px;
+  background: #fff5f3;
+}
+
+.user-error-card strong {
+  display: block;
+  font-size: 15px;
+  color: var(--brand);
+  margin-bottom: 8px;
+}
+
+.user-error-card p {
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.5;
+  margin: 0 0 12px;
+}
+
+.user-error-card .error-actions {
+  display: flex;
+  gap: 10px;
+}
+
+.user-error-card details {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid rgba(166, 29, 42, 0.1);
+}
+
+.user-error-card summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 12px;
+  user-select: none;
+}
+
+.user-error-card pre {
+  margin: 10px 0 0;
+  padding: 10px;
+  background: #fdf2f0;
+  border-radius: 8px;
+  font-size: 11px;
+  color: var(--brand);
+  white-space: pre-wrap;
+  word-wrap: break-word;
+}
+
 .action-required {
   display: flex;
   justify-content: space-between;

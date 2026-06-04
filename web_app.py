@@ -31,6 +31,7 @@ from newsclip_agent.remote_ucms import (
     public_config as remote_ucms_public_config,
 )
 from newsclip_agent.utils import ensure_dir, read_json, relpath, write_json
+from newsclip_agent.tts_omnivoice import generate_omnivoice_audio
 
 
 ROOT = Path(__file__).resolve().parent
@@ -337,6 +338,76 @@ def preview_voice(voice_id: str) -> FileResponse:
     if root != resolved and root not in resolved.parents:
         raise HTTPException(400, "voice preview must be inside project directory")
     return FileResponse(str(resolved))
+
+
+@app.post("/api/voices/{voice_id}/preview-tts")
+def preview_voice_tts(voice_id: str, payload: dict[str, Any] | None = None) -> FileResponse:
+    voice = _voice_catalog().get(voice_id)
+    if not voice:
+        raise HTTPException(404, "voice not found")
+
+    payload = payload or {}
+    text = str(
+        payload.get("text")
+        or "这里是凤凰新闻智能剪辑系统的配音试听。当前音色将用于生成新闻解说、字幕和粗剪成片。"
+    ).strip()
+
+    if not text:
+        raise HTTPException(400, "preview text is empty")
+
+    reference_audio = voice.get("reference_audio") or PROJECT_CONFIG.omnivoice.get("reference_audio")
+    reference_text = voice.get("reference_text") or PROJECT_CONFIG.omnivoice.get("reference_text") or ""
+    speed = voice.get("speed")
+    if speed is None:
+        speed = PROJECT_CONFIG.omnivoice.get("speed")
+
+    ref_path = PROJECT_CONFIG.resolve_path(str(reference_audio))
+    if not ref_path or not ref_path.exists() or not ref_path.is_file():
+        raise HTTPException(404, "voice reference audio not found")
+
+    model_path = PROJECT_CONFIG.resolve_path(
+        str(PROJECT_CONFIG.omnivoice.get("model_path") or "models/OmniVoice")
+    )
+    if not model_path or not model_path.exists():
+        raise HTTPException(404, "OmniVoice model path not found")
+
+    preview_dir = OUTPUTS_DIR / "__voice_previews"
+    ensure_dir(preview_dir)
+
+    cache_key = hashlib.sha256(
+        json.dumps(
+            {
+                "voice_id": voice_id,
+                "text": text,
+                "reference_audio": str(reference_audio),
+                "reference_text": reference_text,
+                "speed": speed,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()[:16]
+
+    output_path = preview_dir / f"{voice_id}_{cache_key}.wav"
+
+    if not output_path.exists() or output_path.stat().st_size <= 0:
+        result = generate_omnivoice_audio(
+            text=text,
+            output_path=output_path,
+            model_path=model_path,
+            reference_audio=ref_path,
+            reference_text=reference_text,
+            speed=speed,
+        )
+        if result.status != "success" or not output_path.exists():
+            raise HTTPException(500, f"TTS preview failed: {result.error}")
+
+    return FileResponse(
+        str(output_path),
+        media_type="audio/wav",
+        filename=output_path.name,
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.get("/api/remote-videos")
