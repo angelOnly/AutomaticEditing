@@ -4,6 +4,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 import tomllib
+import os
+
+
+def _expand_env_vars(data: Any) -> Any:
+    if isinstance(data, dict):
+        return {k: _expand_env_vars(v) for k, v in data.items()}
+    elif isinstance(data, list):
+        return [_expand_env_vars(item) for item in data]
+    elif isinstance(data, str):
+        return os.path.expandvars(data)
+    else:
+        return data
 
 
 @dataclass(frozen=True)
@@ -58,4 +70,5 @@ def load_config(config_path: str | Path = "config.toml") -> ProjectConfig:
     config_file = Path(config_path).resolve()
     with config_file.open("rb") as f:
         raw = tomllib.load(f)
+    raw = _expand_env_vars(raw)
     return ProjectConfig(root_dir=config_file.parent, raw=raw)

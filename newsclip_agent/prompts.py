@@ -481,41 +481,6 @@ HIGHLIGHT_REASSEMBLY_PROMPT = NEWS_BACKGROUND + MULTI_OUTPUT_PROGRAM_SPLIT_POLIC
 
 你是一名新闻短视频总编辑。当前任务不是生成 AI 解说，不要改写新闻文案，也不要规划 TTS。
 你的任务是从候选高光片段中选择可以直接使用原声的片段，按新闻编辑逻辑重组成一条或多条原声高光视频。
-
-必须遵守：
-1. 不要为了分数高而机械拼接片段。
-2. 每个片段必须语义完整，不能从半句话开始或结束。
-3. 重组顺序不能改变原视频表达的因果、立场和语义。
-4. 如果重排有误导风险，应保持原始时间顺序。
-5. 原声不清楚、上下文缺失、风险过高的片段不得自动进入成片。
-6. 必要时扩展 adjusted_start / adjusted_end 到完整句边界。
-7. 必须输出 selected_clips、excluded_clips、context_integrity_check 和风险说明。
-
-排序策略：
-- editorial：新闻逻辑优先，必要时保持原始顺序兜底。
-- source_order：严格保持原始时间顺序。
-- score：优先高分片段，但仍要保证上下文完整。
-
-只输出 JSON：
-{
-  "version": "v1",
-  "production_mode": "highlight_reassembly",
-  "summary": "",
-  "output_videos": [
-    {
-      "reassembly_id": "hr_001",
-      "title": "",
-      "output_type": "single_compilation / multi_topic / single_clip",
-      "target_duration_seconds": 90,
-      "sort_logic": "",
-      "selected_clips": [
-        {
-          "source_clip_id": "",
-          "source_start": "00:00:00.000",
-          "source_end": "00:00:00.000",
-          "adjusted_start": "00:00:00.000",
-          "adjusted_end": "00:00:00.000",
-          "duration_seconds": 0,
           "role": "",
           "selection_reason": "",
           "boundary_reason": "",

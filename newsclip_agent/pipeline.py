@@ -2797,32 +2797,59 @@ class PipelineRunner:
                 if end <= start:
                     warnings.append(f"{clip.get('source_clip_id') or clip.get('clip_id') or idx}: invalid time range")
                     continue
-                duration = end - start
-                if duration < self.options.reassembly_min_clip_seconds:
-                    warnings.append(f"{clip.get('source_clip_id') or clip.get('clip_id') or idx}: shorter than min clip seconds")
+                
+                normalized_parts = self._normalize_reassembly_clip_to_source_boundaries(clip, start, end)
+                if not normalized_parts:
+                    warnings.append(
+                        f"{clip.get('source_clip_id') or clip.get('clip_id') or idx}: "
+                        f"outside source boundaries {start:.3f}-{end:.3f}"
+                    )
                     continue
-                if duration > self.options.reassembly_max_clip_seconds:
-                    end = start + self.options.reassembly_max_clip_seconds
-                    duration = self.options.reassembly_max_clip_seconds
-                    warnings.append(f"{clip.get('source_clip_id') or clip.get('clip_id') or idx}: truncated to max clip seconds")
-                clips.append({
-                    "clip_id": f"{rid}_{len(clips) + 1:03d}",
-                    "source_clip_id": clip.get("source_clip_id") or clip.get("clip_id") or clip.get("id") or "",
-                    "source_start": seconds_to_timecode(start, ms=True),
-                    "source_end": seconds_to_timecode(end, ms=True),
-                    "target_start": seconds_to_timecode(target, ms=True),
-                    "duration_seconds": round(duration, 3),
-                    "original_audio_volume": 1.0,
-                    "keep_original_audio": True,
-                    "role": clip.get("role", ""),
-                    "selection_reason": clip.get("selection_reason", ""),
-                    "boundary_reason": clip.get("boundary_reason", ""),
-                    "risk_level": clip.get("risk_level", ""),
-                    "risk_notes": clip.get("risk_notes", ""),
-                    "transition_after": clip.get("transition_after", "hard_cut"),
-                    "crop_mode": "fit_blur" if self.options.aspect_ratio == "9:16" else "original",
-                })
-                target += duration
+
+                for part in normalized_parts:
+                    part_start = float(part["_normalized_start"])
+                    part_end = float(part["_normalized_end"])
+                    duration = part_end - part_start
+
+                    if duration < self.options.reassembly_min_clip_seconds:
+                        warnings.append(
+                            f"{part.get('source_clip_id') or part.get('clip_id') or idx}: "
+                            "shorter than min clip seconds after boundary normalization"
+                        )
+                        continue
+
+                    if duration > self.options.reassembly_max_clip_seconds:
+                        part_end = part_start + self.options.reassembly_max_clip_seconds
+                        duration = self.options.reassembly_max_clip_seconds
+                        warnings.append(
+                            f"{part.get('source_clip_id') or part.get('clip_id') or idx}: "
+                            "truncated to max clip seconds"
+                        )
+
+                    clips.append({
+                        "clip_id": f"{rid}_{len(clips) + 1:03d}",
+                        "source_clip_id": part.get("source_clip_id") or part.get("clip_id") or part.get("id") or "",
+                        "source_id": part.get("source_id", ""),
+                        "source_index": part.get("source_index"),
+                        "source_start": seconds_to_timecode(part_start, ms=True),
+                        "source_end": seconds_to_timecode(part_end, ms=True),
+                        "target_start": seconds_to_timecode(target, ms=True),
+                        "duration_seconds": round(duration, 3),
+                        "original_audio_volume": 1.0,
+                        "keep_original_audio": True,
+                        "role": part.get("role", ""),
+                        "selection_reason": part.get("selection_reason", ""),
+                        "boundary_reason": part.get("boundary_reason", ""),
+                        "risk_level": part.get("risk_level", ""),
+                        "risk_notes": part.get("risk_notes", ""),
+                        "transition_after": part.get("transition_after", "hard_cut"),
+                        "crop_mode": "fit_blur" if self.options.aspect_ratio == "9:16" else "original",
+                    })
+
+                    target += duration
+
+                    if len(clips) >= self.options.reassembly_max_clip_count:
+                        break
                 if len(clips) >= self.options.reassembly_max_clip_count:
                     break
             if not clips:
@@ -2917,6 +2944,60 @@ class PipelineRunner:
         if status == "failed":
             raise RuntimeError("reassembly_render has no available videos")
 
+    def _normalize_reassembly_clip_to_source_boundaries(
+        self,
+        clip: dict[str, Any],
+        start: float,
+        end: float,
+    ) -> list[dict[str, Any]]:
+        """
+        将高光重组片段限制在多源虚拟时间轴的合法源边界内。
+        - 如果片段完全落在一个源内：返回 1 段
+        - 如果片段跨源：自动拆成多段
+        - 如果片段完全超出所有源：返回空数组
+        """
+        if not self._is_virtual_multi_source():
+            return [dict(clip, _normalized_start=start, _normalized_end=end)]
+
+        normalized: list[dict[str, Any]] = []
+        requested_source_id = str(clip.get("source_id") or "").strip()
+
+        for item in self._iter_source_items():
+            item_source_id = str(item.get("source_id") or "").strip()
+            if requested_source_id and item_source_id != requested_source_id:
+                continue
+
+            virtual_start = float(item.get("virtual_start_seconds") or 0)
+            virtual_end = float(item.get("virtual_end_seconds") or 0)
+            if virtual_end <= virtual_start:
+                continue
+
+            seg_start = max(start, virtual_start)
+            seg_end = min(end, virtual_end)
+
+            if seg_end <= seg_start:
+                continue
+
+            new_clip = dict(clip)
+            new_clip["source_id"] = item_source_id
+            new_clip["source_index"] = item.get("source_index")
+            new_clip["_normalized_start"] = seg_start
+            new_clip["_normalized_end"] = seg_end
+            new_clip["source_start"] = seconds_to_timecode(seg_start, ms=True)
+            new_clip["source_end"] = seconds_to_timecode(seg_end, ms=True)
+            new_clip["duration_seconds"] = round(seg_end - seg_start, 3)
+
+            if seg_start != start or seg_end != end:
+                new_clip["boundary_adjusted"] = True
+                new_clip["boundary_reason"] = (
+                    str(new_clip.get("boundary_reason") or "")
+                    + "；自动按多源素材边界裁剪/拆分"
+                ).strip("；")
+
+            normalized.append(new_clip)
+
+        return normalized
+
     def _resolve_reassembly_clip_source(self, clip: dict[str, Any]) -> tuple[Path, float, float]:
         start = timecode_to_seconds(clip.get("source_start"))
         end = timecode_to_seconds(clip.get("source_end"))
@@ -2934,7 +3015,11 @@ class PipelineRunner:
                     source_path = self._resolve_source_item_path(item)
                     return source_path, start - virtual_start, end - virtual_start
             raise RuntimeError(
-                f"clip {clip.get('clip_id') or ''} ({start}-{end}) exceeds source boundaries"
+                "视频重组渲染失败：片段时间不在任何源视频边界内。\n"
+                f"片段：{clip.get('clip_id') or ''} {start:.3f}-{end:.3f}\n"
+                f"source_id：{clip.get('source_id') or ''}\n"
+                "可能原因：模型输出了超出虚拟总时间轴的时间码，或把单个源视频的局部时间误当成多源虚拟时间。\n"
+                "处理办法：请从 highlight_reassembly_plan 重跑；如果仍失败，需要启用 reassembly_cut_plan 的边界裁剪/拆分逻辑。"
             )
 
         manifest_value = str(self.manifest.get("source_manifest") or "").strip()
