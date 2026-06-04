@@ -3347,7 +3347,44 @@ class PipelineRunner:
         else:
             font_size = int(cfg.get("font_size_16_9", 30))
             margin_v = int(cfg.get("margin_v_16_9", 52))
-        font_name = str(cfg.get("font_name", "Microsoft YaHei"))
+        configured_font = str(cfg.get("font_name", "")).strip()
+        font_name = configured_font
+
+        import os
+        import shutil
+        import subprocess
+
+        def _font_available(fname: str) -> bool:
+            if not fname:
+                return False
+            try:
+                result = subprocess.run(
+                    ["fc-match", fname],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    timeout=2,
+                )
+                return fname.lower() in result.stdout.lower()
+            except Exception:
+                return False
+
+        if shutil.which("fc-match"):
+            candidates = [
+                configured_font,
+                "Noto Sans CJK SC",
+                "WenQuanYi Micro Hei",
+                "Microsoft YaHei",
+                "SimHei",
+                "Arial Unicode MS",
+            ]
+            for cand in candidates:
+                if cand and _font_available(cand):
+                    font_name = cand
+                    break
+
+        if not font_name:
+            font_name = "Microsoft YaHei" if os.name == "nt" else "Noto Sans CJK SC"
         primary = str(cfg.get("primary_colour", "&H00FFFFFF"))
         outline_colour = str(cfg.get("outline_colour", "&H00000000"))
         back_colour = str(cfg.get("back_colour", "&H80000000"))
