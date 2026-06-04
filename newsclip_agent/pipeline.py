@@ -142,6 +142,21 @@ AGENT_INFO = {
 }
 
 
+class UserFacingPipelineError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        user_message: str,
+        suggestions: list[str] | None = None,
+        technical_detail: dict | None = None,
+    ):
+        super().__init__(message)
+        self.user_message = user_message
+        self.suggestions = suggestions or []
+        self.technical_detail = technical_detail or {}
+
+
 @dataclass
 class RunOptions:
     input: str | None = None
@@ -2909,16 +2924,52 @@ class PipelineRunner:
         renderable_count = sum(1 for video in output_videos if video.get("duration_status") != "blocked")
         blocked_count = len(output_videos) - renderable_count
         status = "success" if blocked_count == 0 else ("partial_success" if renderable_count else "failed")
-        self._write_status(vdir, self._base_status("reassembly_cut_plan", version, input_hash, [out]))
-        self._record_step(step="reassembly_cut_plan", version=version, status=status, output=relpath(out, self.task_dir), input_hash=input_hash, output_files=[out])
-        print(f"completed: reassembly_cut_plan ({status})")
+        status_doc = self._base_status("reassembly_cut_plan", version, input_hash, [out])
+        status_doc["status"] = status
+        
         if status == "failed":
             plan_output_videos = plan.get("output_videos", [])
-            raise RuntimeError(
-                "reassembly_cut_plan has no available clips. "
-                f"plan_output_videos={len(plan_output_videos)}, "
-                "please check whether plan uses clips instead of selected_clips, "
-                "or whether clip durations are below min_clip_seconds."
+            status_doc["user_error"] = {
+                "title": "生成重组剪辑计划失败",
+                "message": "没有找到可用于剪辑的片段。",
+                "suggestions": [
+                    "从“规划高光重组”重新运行。",
+                    "降低最短片段时长后重试。",
+                    "检查高光规划结果是否包含可用 clips。",
+                ],
+            }
+            status_doc["technical_error"] = {
+                "message": "reassembly_cut_plan has no available clips",
+                "plan_output_videos": len(plan_output_videos),
+                "renderable_count": renderable_count,
+                "blocked_count": blocked_count,
+                "blocked_reasons": [
+                    reason
+                    for video in output_videos
+                    for reason in video.get("blocked_reasons", [])
+                ],
+                "warnings": [
+                    warning
+                    for video in output_videos
+                    for warning in video.get("warnings", [])
+                ],
+            }
+
+        self._write_status(vdir, status_doc)
+        self._record_step(step="reassembly_cut_plan", version=version, status=status, output=relpath(out, self.task_dir), input_hash=input_hash, output_files=[out])
+        print(f"completed: reassembly_cut_plan ({status})")
+        
+        if status == "failed":
+            raise UserFacingPipelineError(
+                "reassembly_cut_plan has no available clips",
+                user_message="生成重组剪辑计划失败：没有找到可用于剪辑的片段。",
+                suggestions=[
+                    "从“规划高光重组”重新运行，让系统重新选择高光片段。",
+                    "降低“最短片段时长”后，从“生成重组剪辑计划”重新运行。",
+                    "检查高光重组规划结果中是否包含 clips 或 selected_clips。",
+                    "如果是多段素材，请确认素材没有混乱或时间轴异常。",
+                ],
+                technical_detail=status_doc["technical_error"],
             )
 
     def step_reassembly_render(self) -> None:
