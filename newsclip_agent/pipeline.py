@@ -2784,12 +2784,23 @@ class PipelineRunner:
         for item in plan.get("output_videos", []):
             if not isinstance(item, dict):
                 continue
-            rid = item.get("reassembly_id") or f"hr_{len(output_videos) + 1:03d}"
+            rid = (
+                item.get("reassembly_id")
+                or item.get("video_id")
+                or f"hr_{len(output_videos) + 1:03d}"
+            )
             clips = []
             warnings: list[str] = []
             blocked_reasons: list[str] = []
             target = 0.0
-            for idx, clip in enumerate(item.get("selected_clips", []), start=1):
+            selected_clips = (
+                item.get("selected_clips")
+                or item.get("clips")
+                or item.get("clip_sequence")
+                or item.get("segments")
+                or []
+            )
+            for idx, clip in enumerate(selected_clips, start=1):
                 if not isinstance(clip, dict):
                     continue
                 start = self._clip_time_seconds(clip, "adjusted_start", "source_start", "start", "start_time")
@@ -2902,7 +2913,13 @@ class PipelineRunner:
         self._record_step(step="reassembly_cut_plan", version=version, status=status, output=relpath(out, self.task_dir), input_hash=input_hash, output_files=[out])
         print(f"completed: reassembly_cut_plan ({status})")
         if status == "failed":
-            raise RuntimeError("reassembly_cut_plan has no available clips")
+            plan_output_videos = plan.get("output_videos", [])
+            raise RuntimeError(
+                "reassembly_cut_plan has no available clips. "
+                f"plan_output_videos={len(plan_output_videos)}, "
+                "please check whether plan uses clips instead of selected_clips, "
+                "or whether clip durations are below min_clip_seconds."
+            )
 
     def step_reassembly_render(self) -> None:
         render_slots = int(self.config.raw.get("gpu_limits", {}).get("render_slots", 1))
