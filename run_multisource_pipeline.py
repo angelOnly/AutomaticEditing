@@ -28,6 +28,7 @@ COMMON_REUSABLE_STEPS = [
     "frame_extract",
     "chunk_build",
     "asr",
+    "asr_digest",
     "vision",
     "timeline",
     "timeline_digest",

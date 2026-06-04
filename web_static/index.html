@@ -39,7 +39,11 @@
           </div>
           <label class="remote-filter">
             <span>信号源</span>
-            <select id="remoteRecordStation"></select>
+            <div class="custom-select" id="remoteStationSelect">
+              <button class="custom-select-trigger" id="remoteStationTrigger" type="button">请选择信号源</button>
+              <div class="custom-select-menu hidden" id="remoteStationMenu"></div>
+            </div>
+            <input type="hidden" id="remoteRecordStation" value="" />
           </label>
           <div class="remote-tools">
             <label>
@@ -58,6 +62,12 @@
             <button class="mini-button" id="remotePrev" type="button">上一页</button>
             <span id="remotePageInfo">1 / -</span>
             <button class="mini-button" id="remoteNext" type="button">下一页</button>
+          </div>
+          <div class="remote-pager-jump">
+            <span>跳至</span>
+            <input id="remoteJumpPage" type="number" min="1" inputmode="numeric" />
+            <span>页</span>
+            <button id="remoteJumpBtn" type="button" class="mini-button">跳转</button>
           </div>
           <div id="remoteVideoList" class="list"></div>
         </section>

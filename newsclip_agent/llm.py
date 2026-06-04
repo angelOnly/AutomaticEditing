@@ -148,4 +148,6 @@ class OpenAICompatibleClient:
 def _safe_json(value: Any) -> str:
     import json
 
-    return json.dumps(value, ensure_ascii=False, indent=2, default=str)
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)

@@ -1,35 +1,11 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import re
 from typing import Any
 
 
-NEWS_KEYWORDS = [
-    "宣布",
-    "表示",
-    "指出",
-    "强调",
-    "回应",
-    "发布",
-    "数据",
-    "同比",
-    "增长",
-    "一季度",
-    "工信部",
-    "算力",
-    "人工智能",
-    "工业",
-    "制造业",
-    "政策",
-    "冲突",
-    "袭击",
-    "外交",
-    "会谈",
-    "制裁",
-    "事故",
-    "伤亡",
-]
+NEWS_KEYWORDS: list[str] = []
 
 
 def compact_text(text: str, max_chars: int = 320) -> str:
@@ -37,7 +13,7 @@ def compact_text(text: str, max_chars: int = 320) -> str:
     if len(text) <= max_chars:
         return text
 
-    parts = re.split(r"(?<=[。！？；?!;])", text)
+    parts = re.split(r"(?<=[銆傦紒锛燂紱?!;])", text)
     selected: list[str] = []
     total = 0
     for part in parts:
@@ -55,33 +31,8 @@ def compact_text(text: str, max_chars: int = 320) -> str:
 
 
 def compact_asr_for_llm(text: str, max_chars: int = 320) -> str:
-    text = re.sub(r"\s+", " ", text or "").strip()
-    if len(text) <= max_chars:
-        return text
+    return compact_text(text, max_chars=max_chars)
 
-    sentences = [x.strip() for x in re.split(r"(?<=[。！？；?!;])", text) if x.strip()]
-    if not sentences:
-        return text[:max_chars].strip() + "..."
-
-    scored: list[tuple[int, int, str]] = []
-    for idx, sentence in enumerate(sentences):
-        score = sum(2 for keyword in NEWS_KEYWORDS if keyword in sentence)
-        if idx <= 1:
-            score += 1
-        if idx >= len(sentences) - 2:
-            score += 1
-        scored.append((score, idx, sentence))
-
-    picked: list[tuple[int, str]] = []
-    total = 0
-    for _score, idx, sentence in sorted(scored, key=lambda x: (-x[0], x[1])):
-        if total + len(sentence) <= max_chars:
-            picked.append((idx, sentence))
-            total += len(sentence)
-
-    picked.sort(key=lambda x: x[0])
-    result = "".join(sentence for _idx, sentence in picked).strip()
-    return result or text[:max_chars].strip() + "..."
 
 
 def compact_list(items: list[Any], max_items: int = 5, max_chars_each: int = 30) -> list[str]:
@@ -107,10 +58,10 @@ def compact_list(items: list[Any], max_items: int = 5, max_chars_each: int = 30)
 
 def build_chunk_flags(item: dict[str, Any]) -> list[str]:
     flags: list[str] = []
-    scene = item.get("scene_type") or item.get("scene") or ""
-    if "发布会" in scene:
+    scene = str(item.get("scene_type") or item.get("scene") or "").lower()
+    if "press" in scene or "conference" in scene:
         flags.append("press_conference")
-    if "图表" in scene or "数据" in scene:
+    if "chart" in scene or "data" in scene:
         flags.append("data_visual")
     if item.get("is_archive_footage"):
         flags.append("archive_footage")

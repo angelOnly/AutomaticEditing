@@ -99,8 +99,14 @@ const state = {
   previewRequestId: 0,
   remoteVideos: [],
   remotePagination: { current: 1, pageSize: 10, total: 0 },
+  remotePage: 1,
+  remotePageSize: 10,
+  remoteTotal: 0,
+  remoteTotalPages: 1,
   remoteRecordStations: [],
+  remoteStationOptions: [],
   remoteStationCounts: {},
+  remoteStationOpen: false,
   remoteSearchTimer: null,
   remoteEnabled: false,
   voices: [],
@@ -158,8 +164,10 @@ async function loadConfig() {
     const remote = config.remote_ucms || {};
     state.remoteEnabled = Boolean(remote.enabled);
     state.remoteRecordStations = remote.record_stations || [];
+    state.remoteStationOptions = remote.record_station_options || [];
     state.remoteStationCounts = remote.station_counts || {};
     state.remotePagination.pageSize = remote.default_page_size || 10;
+    state.remotePageSize = remote.default_page_size || 10;
     fillRemoteStationSelect(remote.default_record_station || "");
     fillVoiceSelect();
     applyDefaultControls();
@@ -171,17 +179,91 @@ async function loadConfig() {
 }
 
 function fillRemoteStationSelect(defaultStation) {
-  const select = $("remoteRecordStation");
-  if (!select) return;
-  const selected = defaultStation || select.value;
-  const stations = state.remoteRecordStations.length ? state.remoteRecordStations : [defaultStation].filter(Boolean);
-  select.innerHTML = stations.map((station) => `<option value="${escapeAttr(station)}">${escapeHtml(remoteStationLabel(station))}</option>`).join("");
-  if (selected) select.value = selected;
+  const input = $("remoteRecordStation");
+  if (!input) return;
+  const selected = defaultStation || input.value;
+  if (!state.remoteStationOptions.length) {
+    const stations = state.remoteRecordStations.length ? state.remoteRecordStations : [defaultStation].filter(Boolean);
+    state.remoteStationOptions = stations.map((station) => ({
+      value: station,
+      label: station,
+      total: state.remoteStationCounts?.[station],
+    }));
+  }
+  if (selected) input.value = selected;
+  if (!input.value && state.remoteStationOptions.length) {
+    input.value = state.remoteStationOptions[0].value;
+  }
+  renderRemoteStationSelect();
 }
 
 function remoteStationLabel(station) {
   const count = state.remoteStationCounts?.[station];
   return Number.isFinite(Number(count)) ? `${station}（${count}）` : station;
+}
+
+function renderRemoteStationSelect() {
+  const trigger = $("remoteStationTrigger");
+  const menu = $("remoteStationMenu");
+  const input = $("remoteRecordStation");
+  if (!trigger || !menu || !input) return;
+
+  const options = state.remoteStationOptions || [];
+  const current = input.value || options[0]?.value || "";
+  const currentOption = options.find((item) => item.value === current);
+  const currentTotal = currentOption?.total ?? state.remoteStationCounts?.[current];
+  trigger.textContent = currentOption
+    ? `${currentOption.label || currentOption.value}${currentTotal != null ? ` (${currentTotal})` : ""}`
+    : "请选择信号源";
+
+  menu.innerHTML = options
+    .map((item) => {
+      const total = item.total ?? state.remoteStationCounts?.[item.value];
+      const disabled = total != null && Number(total) <= 0;
+      const active = item.value === current;
+      return `
+        <button
+          type="button"
+          class="custom-select-option ${active ? "active" : ""} ${disabled ? "disabled" : ""}"
+          data-value="${escapeAttr(item.value)}"
+          ${disabled ? "disabled" : ""}
+        >
+          <span>${escapeHtml(item.label || item.value)}</span>
+          <em>${total ?? ""}</em>
+        </button>
+      `;
+    })
+    .join("");
+
+  menu.querySelectorAll(".custom-select-option").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const value = btn.dataset.value || "";
+      input.value = value;
+      state.remoteStationOpen = false;
+      menu.classList.add("hidden");
+      await loadRemoteVideos(1);
+      renderRemoteStationSelect();
+    });
+  });
+}
+
+function bindRemoteStationSelect() {
+  const trigger = $("remoteStationTrigger");
+  const menu = $("remoteStationMenu");
+  if (!trigger || !menu) return;
+
+  trigger.addEventListener("click", (event) => {
+    event.stopPropagation();
+    state.remoteStationOpen = !state.remoteStationOpen;
+    menu.classList.toggle("hidden", !state.remoteStationOpen);
+  });
+
+  document.addEventListener("click", (event) => {
+    if (!event.target.closest("#remoteStationSelect")) {
+      state.remoteStationOpen = false;
+      menu.classList.add("hidden");
+    }
+  });
 }
 
 function fillVoiceSelect() {
@@ -239,6 +321,9 @@ function normalizeDefaultRunMode(mode) {
 }
 
 function bindEvents() {
+  bindRemoteStationSelect();
+  bindRemotePagerJump();
+  bindVideoPreviewErrors();
   $("uploadVideo")?.addEventListener("click", () => $("videoUploadInput")?.click());
   $("videoUploadInput")?.addEventListener("change", uploadSelectedVideo);
   bindSourceDropZone();
@@ -536,6 +621,7 @@ async function loadVideos() {
 async function loadRemoteVideos(page = 1) {
   const box = $("remoteVideoList");
   if (!box) return;
+  state.remotePage = Math.max(1, Number(page || 1));
   if (!state.remoteEnabled) {
     box.innerHTML = `<div class="list-item"><strong>远程素材未启用</strong><span>请检查 config.toml 的 remote_ucms 配置</span></div>`;
     updateRemotePager();
@@ -547,18 +633,25 @@ async function loadRemoteVideos(page = 1) {
   box.innerHTML = `<div class="list-item"><strong>正在加载远程素材...</strong><span>${escapeHtml(station || "-")}</span></div>`;
   const params = new URLSearchParams({
     record_station: station,
-    current: String(page),
-    page_size: String(state.remotePagination.pageSize || 10),
+    current: String(state.remotePage || 1),
+    page_size: String(state.remotePageSize || state.remotePagination.pageSize || 10),
     sort_order: sortOrder,
   });
   if (keyword) params.set("keyword", keyword);
   const data = await api(`/api/remote-videos?${params.toString()}`);
   state.remoteVideos = data.items || [];
-  state.remotePagination = data.pagination || { current: page, pageSize: 10, total: state.remoteVideos.length };
+  state.remotePagination = data.pagination || { current: state.remotePage, pageSize: state.remotePageSize || 10, total: state.remoteVideos.length };
+  state.remotePage = Number(state.remotePagination.current || state.remotePage || 1);
+  state.remotePageSize = Number(state.remotePagination.pageSize || state.remotePagination.page_size || state.remotePageSize || 10);
+  state.remoteTotal = Number(state.remotePagination.total || 0);
+  state.remoteTotalPages = Math.max(1, Math.ceil(state.remoteTotal / (state.remotePageSize || 10)));
   state.remoteStationCounts = { ...state.remoteStationCounts, ...(data.station_counts || {}) };
   if (station && state.remotePagination.total !== undefined) {
     state.remoteStationCounts[station] = Number(state.remotePagination.total || 0);
   }
+  state.remoteStationOptions = state.remoteStationOptions.map((item) => (
+    item.value === station ? { ...item, total: state.remoteStationCounts[station] } : item
+  ));
   fillRemoteStationSelect(station);
   renderRemoteVideos();
 }
@@ -588,7 +681,45 @@ function renderRemoteVideos() {
 function updateRemotePager() {
   const p = state.remotePagination || {};
   const maxPage = Math.max(1, Math.ceil((p.total || 0) / (p.pageSize || 10)));
+  const page = Number(state.remotePage || p.current || 1);
+  const total = Number(state.remoteTotal || p.total || 0);
+  const pageSize = Number(state.remotePageSize || p.pageSize || p.page_size || 10);
+  const totalPages = Math.max(1, Number(state.remoteTotalPages || Math.ceil(total / pageSize) || 1));
   if ($("remotePageInfo")) $("remotePageInfo").textContent = `${p.current || 1} / ${maxPage} · 共 ${p.total || 0}`;
+  if ($("remotePageInfo")) $("remotePageInfo").textContent = `${page} / ${totalPages} · 共 ${total}`;
+  const input = $("remoteJumpPage");
+  if (input) {
+    input.max = String(totalPages);
+    if (document.activeElement !== input) {
+      input.value = String(page);
+    }
+  }
+  const prev = $("remotePrev");
+  const next = $("remoteNext");
+  if (prev) prev.disabled = page <= 1;
+  if (next) next.disabled = page >= totalPages;
+}
+
+function bindRemotePagerJump() {
+  const input = $("remoteJumpPage");
+  const btn = $("remoteJumpBtn");
+  if (!input || !btn) return;
+
+  const jump = async () => {
+    let page = Number(input.value || 1);
+    if (!Number.isFinite(page)) page = 1;
+    page = Math.max(1, Math.min(page, state.remoteTotalPages || 1));
+    state.remotePage = page;
+    input.value = String(page);
+    await loadRemoteVideos(page);
+  };
+
+  btn.addEventListener("click", jump);
+  input.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    jump();
+  });
 }
 
 function addLocalSourceToBasket(video) {
@@ -1144,6 +1275,21 @@ function setVideoPreviewSource(url, options = {}) {
   video.pause?.();
   video.src = options.cacheBust ? withPreviewCacheBuster(url) : url;
   video.load();
+}
+
+function bindVideoPreviewErrors() {
+  const video = $("videoPreview");
+  const viewer = $("fileViewer");
+  if (!video || !viewer) return;
+
+  video.addEventListener("error", () => {
+    const code = video.error?.code || "";
+    viewer.textContent = [
+      "原片预览失败。",
+      "可能原因：视频地址不可访问、远程素材链接过期、浏览器不支持该编码，或文件路径异常。",
+      `错误码：${code || "-"}`,
+    ].join("\n");
+  });
 }
 
 function updatePreviewListTitle() {

@@ -69,6 +69,7 @@ COMMON_REUSABLE_STEPS = [
     "frame_extract",
     "chunk_build",
     "asr",
+    "asr_digest",
     "vision",
     "timeline",
     "timeline_digest",
@@ -84,11 +85,13 @@ def _step_order_for_production_mode(production_mode: str) -> list[str]:
             "frame_extract",
             "chunk_build",
             "asr",
+            "asr_digest",
             "vision",
             "timeline",
             "timeline_digest",
             "video_understanding",
             "highlight_detection",
+            "candidate_refine",
             "highlight_reassembly_plan",
             "reassembly_cut_plan",
             "reassembly_render",
@@ -101,12 +104,16 @@ def _step_order_for_production_mode(production_mode: str) -> list[str]:
         "frame_extract",
         "chunk_build",
         "asr",
+        "asr_digest",
         "vision",
         "timeline",
         "timeline_digest",
         "content_analysis",
+        "candidate_refine",
         "short_video_edit_plan",
+        "merge_decision",
         "voiceover_script",
+        "voiceover_quality_check",
         "tts",
         "subtitles",
         "cut_plan",
@@ -881,18 +888,25 @@ def preview_source(task_id: str):
 def list_source_videos(task_id: str) -> list[dict[str, Any]]:
     task_dir = _task_dir(task_id)
     manifest = get_manifest(task_id)
+    request_previews = _source_request_preview_items(task_dir, task_id)
+    if request_previews:
+        return request_previews
+
     sources: list[dict[str, Any]] = []
     source = manifest.get("source_video")
-    if not source:
-        pending_previews = _source_request_preview_items(task_dir, task_id)
-        if pending_previews:
-            return pending_previews
     if source:
-        source_url = f"/api/tasks/{task_id}/file?path={source}" if (task_dir / source).exists() else ""
+        source_path = str(source)
+        source_url = ""
+        try:
+            resolved_source = _resolve_task_source(task_dir, str(source))
+            source_path = relpath(resolved_source, ROOT)
+            source_url = f"/api/videos/preview?path={quote(source_path, safe='/')}"
+        except HTTPException:
+            source_url = ""
         sources.append(
             {
                 "label": "拼接原片" if manifest.get("source_mode") == "multi_source_concat_proxy" else "原片",
-                "file": source,
+                "file": source_path,
                 "url": source_url,
                 "source_index": 0,
                 "source_type": "concat" if manifest.get("source_mode") == "multi_source_concat_proxy" else "single",
@@ -993,26 +1007,13 @@ def run_pipeline(req: RunRequest) -> dict[str, Any]:
         task_id = _with_mode_suffix(task_id, req.production_mode)
         task_dir = ensure_dir(OUTPUTS_DIR / task_id)
         source_request_path = task_dir / "input" / "source_request.json"
-        ensure_dir(source_request_path.parent)
-        write_json(
-            source_request_path,
-            {
-                "task_id": task_id,
-                "production_mode": req.production_mode,
-                "common_source_key": common_source_key,
-                "common_task_id": common_task_id,
-                "source_items": raw_source_items,
-                "force_remote_download": req.force_remote_download,
-                "output_mode": req.output_mode,
-                "max_output_videos": req.max_output_videos,
-                "min_output_video_seconds": req.min_output_video_seconds,
-                "max_output_video_seconds": req.max_output_video_seconds,
-                "aspect_ratio": req.aspect_ratio,
-                "chunk_seconds": req.chunk_seconds,
-                "frame_interval": req.frame_interval,
-                "mode": req.mode,
-                "created_at": datetime.now().isoformat(timespec="seconds"),
-            },
+        _write_source_request_for_preview(
+            task_dir,
+            task_id,
+            req,
+            raw_source_items,
+            common_task_id=common_task_id,
+            common_source_key=common_source_key,
         )
         _init_multisource_child_manifest(
             task_dir=task_dir,
@@ -1060,6 +1061,8 @@ def run_pipeline(req: RunRequest) -> dict[str, Any]:
                 "updated_at": datetime.now().isoformat(timespec="seconds"),
             },
         )
+    if raw_source_items:
+        _write_source_request_for_preview(task_dir, task_id, req, raw_source_items)
 
     existing_job = _find_active_job_by_task_id(task_id)
     if existing_job and not (req.rerun or req.rerun_from):
@@ -1662,6 +1665,48 @@ def _collect_source_items(req: RunRequest) -> list[dict[str, Any]]:
     return items
 
 
+def _write_source_request_for_preview(
+    task_dir: Path,
+    task_id: str,
+    req: RunRequest,
+    raw_source_items: list[dict[str, Any]],
+    *,
+    common_task_id: str = "",
+    common_source_key: str = "",
+) -> None:
+    if not raw_source_items:
+        return
+
+    path = task_dir / "input" / "source_request.json"
+    ensure_dir(path.parent)
+    existing = read_json(path, {})
+    if not isinstance(existing, dict):
+        existing = {}
+    now = datetime.now().isoformat(timespec="seconds")
+    payload = {
+        **existing,
+        "task_id": task_id,
+        "production_mode": req.production_mode,
+        "source_items": raw_source_items,
+        "force_remote_download": req.force_remote_download,
+        "output_mode": req.output_mode,
+        "max_output_videos": req.max_output_videos,
+        "min_output_video_seconds": req.min_output_video_seconds,
+        "max_output_video_seconds": req.max_output_video_seconds,
+        "aspect_ratio": req.aspect_ratio,
+        "chunk_seconds": req.chunk_seconds,
+        "frame_interval": req.frame_interval,
+        "mode": req.mode,
+        "updated_at": now,
+    }
+    if common_task_id:
+        payload["common_task_id"] = common_task_id
+    if common_source_key:
+        payload["common_source_key"] = common_source_key
+    payload.setdefault("created_at", now)
+    write_json(path, payload)
+
+
 def _normalize_output_options(req: RunRequest) -> None:
     if req.output_mode not in {"single", "multiple"}:
         req.output_mode = "single"
@@ -1782,6 +1827,8 @@ def _resolve_task_source(task_dir: Path, source: str) -> Path:
         path = raw.resolve()
     else:
         path = (task_dir / raw).resolve()
+        if not path.exists():
+            path = (ROOT / raw).resolve()
     root = ROOT.resolve()
     task_root = task_dir.resolve()
     if not path.exists() or not path.is_file():

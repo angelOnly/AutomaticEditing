@@ -70,12 +70,16 @@ AI_VOICEOVER_STEP_ORDER = [
     "frame_extract",
     "chunk_build",
     "asr",
+    "asr_digest",
     "vision",
     "timeline",
     "timeline_digest",
     "content_analysis",
+    "candidate_refine",
     "short_video_edit_plan",
+    "merge_decision",
     "voiceover_script",
+    "voiceover_quality_check",
     "tts",
     "subtitles",
     "cut_plan",
@@ -88,11 +92,13 @@ HIGHLIGHT_REASSEMBLY_STEP_ORDER = [
     "frame_extract",
     "chunk_build",
     "asr",
+    "asr_digest",
     "vision",
     "timeline",
     "timeline_digest",
     "video_understanding",
     "highlight_detection",
+    "candidate_refine",
     "highlight_reassembly_plan",
     "reassembly_cut_plan",
     "reassembly_render",
@@ -108,22 +114,26 @@ DEPENDENCIES = {
     "frame_extract": ["metadata"],
     "chunk_build": ["metadata", "frame_extract"],
     "asr": ["audio_extract"],
-    "vision": ["frame_extract", "chunk_build", "asr"],
-    "timeline": ["asr", "vision"],
-    "timeline_digest": ["timeline"],
+    "asr_digest": ["asr", "chunk_build"],
+    "vision": ["frame_extract", "chunk_build", "asr", "asr_digest"],
+    "timeline": ["asr", "asr_digest", "vision"],
+    "timeline_digest": ["timeline", "asr_digest"],
     "content_analysis": ["timeline_digest"],
-    "short_video_edit_plan": ["content_analysis", "timeline_digest"],
+    "candidate_refine": ["timeline_digest"],
+    "short_video_edit_plan": ["content_analysis", "candidate_refine"],
+    "merge_decision": ["short_video_edit_plan"],
     "video_understanding": ["timeline_digest"],
     "highlight_detection": ["timeline_digest", "video_understanding"],
     "short_video_planning": ["highlight_detection", "video_understanding"],
     "editing_script": ["short_video_planning", "highlight_detection", "timeline"],
-    "voiceover_script": ["short_video_edit_plan"],
+    "voiceover_script": ["short_video_edit_plan", "merge_decision"],
+    "voiceover_quality_check": ["voiceover_script", "short_video_edit_plan"],
     "risk_review": ["editing_script", "voiceover_script", "video_understanding"],
-    "tts": ["voiceover_script"],
+    "tts": ["voiceover_script", "voiceover_quality_check"],
     "subtitles": ["voiceover_script", "tts"],
     "cut_plan": ["short_video_edit_plan", "voiceover_script", "subtitles", "tts"],
     "render": ["cut_plan"],
-    "highlight_reassembly_plan": ["highlight_detection", "video_understanding", "timeline_digest"],
+    "highlight_reassembly_plan": ["highlight_detection", "video_understanding", "candidate_refine"],
     "reassembly_cut_plan": ["highlight_reassembly_plan"],
     "reassembly_render": ["reassembly_cut_plan"],
 }
@@ -135,10 +145,12 @@ AGENT_INFO = {
     "short_video_planning": ("agents/short_video_planning", "short_video_plan.json", prompts.SHORT_VIDEO_PLANNER_PROMPT, "short_video_planning_v1"),
     "editing_script": ("agents/editing_script", "editing_script.json", prompts.EDITING_DIRECTOR_PROMPT, "editing_script_v1"),
     "content_analysis": ("agents/content_analysis", "content_analysis.json", prompts.CONTENT_ANALYSIS_PROMPT, "content_analysis_v1"),
-    "short_video_edit_plan": ("agents/short_video_edit_plan", "short_video_edit_plan.json", prompts.SHORT_VIDEO_EDIT_PLAN_PROMPT, "short_video_edit_plan_v1"),
-    "voiceover_script": ("agents/voiceover_script", "voiceover_script.json", prompts.VOICEOVER_LIGHT_PROMPT, "voiceover_script_light_v1"),
+    "short_video_edit_plan": ("agents/short_video_edit_plan", "short_video_edit_plan.json", prompts.SHORT_VIDEO_EDIT_PLAN_TEXT_PROMPT, "short_video_edit_plan_text_v1"),
+    "merge_decision": ("agents/merge_decision", "merge_decision.json", prompts.MERGE_DECISION_PROMPT, "merge_decision_v1"),
+    "voiceover_script": ("agents/voiceover_script", "voiceover_script.json", prompts.VOICEOVER_SCRIPT_TEXT_PROMPT, "voiceover_script_text_v1"),
+    "voiceover_quality_check": ("agents/voiceover_quality_check", "voiceover_quality_check.json", prompts.VOICEOVER_QUALITY_CHECK_PROMPT, "voiceover_quality_check_v1"),
     "risk_review": ("agents/risk_review", "review_report.json", prompts.RISK_REVIEW_PROMPT, "risk_review_v1"),
-    "highlight_reassembly_plan": ("agents/highlight_reassembly", "highlight_reassembly_plan.json", prompts.HIGHLIGHT_REASSEMBLY_PROMPT, "highlight_reassembly_v1"),
+    "highlight_reassembly_plan": ("agents/highlight_reassembly", "highlight_reassembly_plan.json", prompts.HIGHLIGHT_REASSEMBLY_TEXT_PROMPT, "highlight_reassembly_text_v1"),
 }
 
 
@@ -423,6 +435,7 @@ class PipelineRunner:
                 "frame_extract",
                 "chunk_build",
                 "asr",
+                "asr_digest",
                 "vision",
                 "timeline",
                 "timeline_digest",
@@ -1125,11 +1138,103 @@ class PipelineRunner:
         )
         return self._asr_engine
 
+    def step_asr_digest(self) -> None:
+        cfg = self.config.raw.get("asr_digest", {})
+        chunks_doc = self._load_step_json("chunk_build")
+        asr = self._load_step_json("asr")
+        chunks = chunks_doc.get("chunks", [])
+        model = str(cfg.get("model_name") or self._text_model_name())
+        fallback = list(cfg.get("fallback_models") or [])
+        max_workers = max(1, int(cfg.get("max_workers", 4) or 4))
+        input_hash = stable_hash({
+            "chunks": self._step_content_hash("chunk_build"),
+            "asr": self._step_content_hash("asr"),
+            "model": model,
+            "fallback": fallback,
+            "cfg": cfg,
+        })
+        if self._can_reuse("asr_digest", input_hash):
+            print("澶嶇敤缂撳瓨: asr_digest")
+            return
+
+        version, vdir = self._version_dir("asr_digest", "asr_digest")
+        ensure_dir(vdir)
+        asr_by_chunk_id: dict[str, str] = {}
+        for chunk in chunks:
+            chunk_id = str(chunk.get("chunk_id") or "")
+            segs = self._segments_in_range(asr.get("segments", []), float(chunk.get("start") or 0), float(chunk.get("end") or 0))
+            asr_by_chunk_id[chunk_id] = " ".join(str(s.get("text") or "") for s in segs).strip()
+
+        def process_one(index: int, chunk: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+            chunk_id = str(chunk.get("chunk_id") or f"chunk_{index + 1:04d}")
+            raw_text = asr_by_chunk_id.get(chunk_id, "")
+            ts = self._format_chunk_ts(chunk)
+            if not raw_text.strip():
+                return index, {"chunk_id": chunk_id, "ts": ts, "speech": ""}
+
+            target_chars = int(cfg.get("target_chars_per_chunk", 320) or 320)
+            input_data = {
+                "target_chars": target_chars,
+                "asr_text": raw_text[: int(cfg.get("max_input_chars_per_chunk", 4000) or 4000)],
+            }
+            write_json(vdir / chunk_id / "input.json", input_data)
+            try:
+                if self.llm_text is None:
+                    raise RuntimeError("missing text llm")
+                result = self.llm_text.call_json(
+                    model=model,
+                    fallback_models=fallback,
+                    prompt=prompts.ASR_DIGEST_PROMPT,
+                    input_data=input_data,
+                    temperature=float(cfg.get("temperature", 0.0) or 0.0),
+                    max_tokens=int(cfg.get("max_tokens", 600) or 600),
+                    debug_dir=vdir / "_llm_debug" / chunk_id,
+                )
+                parsed = result.parsed if isinstance(result.parsed, dict) else {}
+                speech = str(parsed.get("speech") or "").strip()
+                if not speech:
+                    speech = compact_asr_for_llm(raw_text, max_chars=target_chars)
+            except Exception as exc:
+                write_json(vdir / "_errors" / f"{chunk_id}.json", {"chunk_id": chunk_id, "error": str(exc), "created_at": now_iso()})
+                speech = compact_asr_for_llm(raw_text, max_chars=target_chars)
+            return index, {"chunk_id": chunk_id, "ts": ts, "speech": speech}
+
+        results: list[tuple[int, dict[str, Any]]] = []
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(process_one, index, chunk) for index, chunk in enumerate(chunks)]
+            for future in as_completed(futures):
+                results.append(future.result())
+
+        results.sort(key=lambda x: x[0])
+        output = {
+            "version": "asr_digest_v1",
+            "model": model,
+            "chunks": [item for _index, item in results],
+        }
+        out = write_json(vdir / "asr_digest.json", output)
+        self._write_status(vdir, self._base_status("asr_digest", version, input_hash, [out]))
+        self._record_step(
+            step="asr_digest",
+            version=version,
+            status="success",
+            output=relpath(out, self.task_dir),
+            input_hash=input_hash,
+            output_files=[out],
+            extra={"summary": {"chunks": len(output["chunks"]), "max_workers": max_workers}, "model": model},
+        )
+        print("瀹屾垚: asr_digest")
+
     def step_vision(self) -> None:
         if self.llm_vision is None:
             raise RuntimeError("缺少 vision LLM 配置")
         chunks_doc = self._load_step_json("chunk_build")
         asr = self._load_step_json("asr")
+        asr_digest = self._load_optional_step_json("asr_digest", {"chunks": []})
+        asr_digest_by_id = {
+            str(item.get("chunk_id")): str(item.get("speech") or "")
+            for item in asr_digest.get("chunks", [])
+            if isinstance(item, dict)
+        }
         llm_cfg = self.config.llm
         provider = llm_cfg.get("vision_llm_provider", "openai")
         model = self.options.model or llm_cfg.get(f"vision_{provider}_model_name")
@@ -1138,6 +1243,7 @@ class PipelineRunner:
         base_input_hash = stable_hash({
             "chunks": self._step_content_hash("chunk_build"),
             "asr": self._step_content_hash("asr"),
+            "asr_digest": self._step_content_hash("asr_digest"),
             "model": model,
             "fallback": fallback,
             "prompt_version": prompt_version,
@@ -1178,7 +1284,7 @@ class PipelineRunner:
             frame_paths = select_frames_for_vision(frame_paths, max_frames=max(1, int(self.options.vision_max_frames_per_chunk or 1)))
             input_data = {
                 "chunk": compact_chunk_for_vision(chunk),
-                "asr_text": compact_asr_for_llm(" ".join(s.get("text", "") for s in asr_segments), max_chars=500),
+                "asr_text": asr_digest_by_id.get(cid) or compact_asr_for_llm(" ".join(s.get("text", "") for s in asr_segments), max_chars=500),
                 "prompt_version": prompt_version,
                 "model": model,
             }
@@ -1270,10 +1376,17 @@ class PipelineRunner:
 
     def step_timeline(self) -> None:
         asr = self._load_step_json("asr")
+        asr_digest = self._load_optional_step_json("asr_digest", {"chunks": []})
         vision = self._load_step_json("vision")
         chunks = self._load_step_json("chunk_build")
+        asr_digest_by_id = {
+            str(item.get("chunk_id")): str(item.get("speech") or "")
+            for item in asr_digest.get("chunks", [])
+            if isinstance(item, dict)
+        }
         input_hash = stable_hash({
             "asr": self._step_content_hash("asr"),
+            "asr_digest": self._step_content_hash("asr_digest"),
             "vision": self._step_content_hash("vision"),
             "chunks": self._step_content_hash("chunk_build"),
         })
@@ -1294,6 +1407,7 @@ class PipelineRunner:
                 "start_seconds": chunk["start"],
                 "end_seconds": chunk["end"],
                 "asr_text": " ".join(s.get("text", "") for s in segs).strip(),
+                "asr_digest": asr_digest_by_id.get(str(chunk["chunk_id"]), ""),
                 "asr_segments": segs,
                 "scene_type": vr.get("scene_type", ""),
                 "visual_summary": vr.get("visual_summary", ""),
@@ -1311,7 +1425,7 @@ class PipelineRunner:
                 t_entry["local_start_seconds"] = chunk.get("local_start_seconds", chunk.get("local_start", 0))
                 t_entry["local_end_seconds"] = chunk.get("local_end_seconds", chunk.get("local_end", 0))
             timeline.append(t_entry)
-        out = write_json(vdir / "merged_timeline.json", {"timeline": timeline, "source_versions": {"asr": self._step_content_hash("asr"), "vision": self._step_content_hash("vision")}})
+        out = write_json(vdir / "merged_timeline.json", {"timeline": timeline, "source_versions": {"asr": self._step_content_hash("asr"), "asr_digest": self._step_content_hash("asr_digest"), "vision": self._step_content_hash("vision")}})
         self._write_status(vdir, self._base_status("timeline", version, input_hash, [out]))
         self._record_step(step="timeline", version=version, status="success", output=relpath(out, self.task_dir), input_hash=input_hash, output_files=[out])
         print("完成: timeline")
@@ -1320,7 +1434,7 @@ class PipelineRunner:
         timeline_data = self._load_step_json("timeline")
         timeline = timeline_data.get("timeline", [])
         llm_input_cfg = self.config.raw.get("llm_input", {})
-        digest_version = "llm_timeline_digest_v1"
+        digest_version = "llm_timeline_digest_v2_asr_digest"
         input_hash = stable_hash({
             "timeline": self._step_content_hash("timeline"),
             "digest_version": digest_version,
@@ -1338,7 +1452,7 @@ class PipelineRunner:
                 "time": f"{item.get('start', '')}-{item.get('end', '')}",
                 "start_seconds": item.get("start_seconds", 0),
                 "end_seconds": item.get("end_seconds", 0),
-                "speech": compact_asr_for_llm(item.get("asr_text", ""), max_chars=int(llm_input_cfg.get("max_asr_chars_per_chunk", 320))),
+                "speech": compact_asr_for_llm(item.get("asr_digest") or item.get("asr_text", ""), max_chars=int(llm_input_cfg.get("max_asr_chars_per_chunk", 320))),
                 "visual": compact_text(item.get("visual_summary", ""), max_chars=int(llm_input_cfg.get("max_visual_chars_per_chunk", 160))),
                 "screen_text": compact_list(item.get("screen_text", []), max_items=int(llm_input_cfg.get("max_screen_text_items", 5))),
                 "people": compact_list(item.get("visible_people", []), max_items=int(llm_input_cfg.get("max_people_items", 5))),
@@ -1376,17 +1490,106 @@ class PipelineRunner:
             "video_analysis": self._load_step_json("video_understanding"),
         })
 
-    def step_highlight_reassembly_plan(self) -> None:
-        self._run_text_agent("highlight_reassembly_plan", {
-            "run_options": self._run_options_payload(),
-            "reassembly_options": self._reassembly_options_payload(),
-            "timeline_digest": self._load_step_json("timeline_digest"),
-            "video_analysis": self._load_step_json("video_understanding"),
-            "candidate_clips": self._load_step_json("highlight_detection"),
-            "source_mode": self.manifest.get("source_mode", "single_source"),
-            "source_videos": self.manifest.get("source_videos", []),
-            "source_manifest": self.manifest.get("source_manifest", ""),
+    def step_candidate_refine(self) -> None:
+        cfg = self.config.raw.get("candidate_refine", {})
+        candidate_clips = self._load_candidate_clips_for_current_mode()
+        topic = self._load_video_topic_or_brief()
+        context_index = self._build_timeline_context_index()
+        model = str(cfg.get("model_name") or self._text_model_name())
+        fallback = list(cfg.get("fallback_models") or [])
+        max_workers = max(1, int(cfg.get("max_workers", 4) or 4))
+        input_hash = stable_hash({
+            "production_mode": self.options.production_mode,
+            "candidate_source": self._candidate_source_hash(),
+            "timeline_digest": self._step_content_hash("timeline_digest"),
+            "model": model,
+            "fallback": fallback,
+            "cfg": cfg,
         })
+        if self._can_reuse("candidate_refine", input_hash):
+            print("澶嶇敤缂撳瓨: candidate_refine")
+            return
+
+        version, vdir = self._version_dir("candidate_refine", "candidate_refine")
+        ensure_dir(vdir)
+
+        def refine_one(index: int, clip: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+            clip_id = self._clip_id(clip, index)
+            input_data = {
+                "topic": topic,
+                "clip": {
+                    "id": clip_id,
+                    "t": self._format_clip_time(clip),
+                    "dur": clip.get("duration_seconds"),
+                    "sum": compact_text(str(clip.get("summary") or clip.get("reason") or ""), max_chars=500),
+                    "visual": compact_text(str(clip.get("visual") or clip.get("visual_summary") or clip.get("why_this_visual_matters") or ""), max_chars=500),
+                    "speech": compact_text(str(clip.get("speech") or clip.get("asr_text") or clip.get("original_audio_transcript_summary") or ""), max_chars=500),
+                    "score": self._compact_clip_score(clip),
+                },
+                "ctx": self._nearby_context_for_clip(
+                    clip,
+                    context_index,
+                    max_chunks=int(cfg.get("max_context_chunks", 3) or 3),
+                ),
+            }
+            write_json(vdir / clip_id / "input.json", input_data)
+            try:
+                if self.llm_text is None:
+                    raise RuntimeError("missing text llm")
+                result = self.llm_text.call_json(
+                    model=model,
+                    fallback_models=fallback,
+                    prompt=prompts.CANDIDATE_REFINE_PROMPT,
+                    input_data=input_data,
+                    temperature=float(cfg.get("temperature", 0.0) or 0.0),
+                    max_tokens=int(cfg.get("max_tokens", 300) or 300),
+                    debug_dir=vdir / "_llm_debug" / clip_id,
+                )
+                parsed = result.parsed if isinstance(result.parsed, dict) else {}
+                item = self._normalize_candidate_refine_output(
+                    clip_id=clip_id,
+                    parsed=parsed,
+                    fallback_rank=index + 1,
+                )
+            except Exception as exc:
+                write_json(vdir / "_errors" / f"{clip_id}.json", {"clip_id": clip_id, "error": str(exc), "created_at": now_iso()})
+                item = {
+                    "clip_id": clip_id,
+                    "k": 1,
+                    "u": "both",
+                    "i": 0,
+                    "c": 0,
+                    "g": "g1",
+                    "r": index + 1,
+                }
+            return index, item
+
+        results: list[tuple[int, dict[str, Any]]] = []
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(refine_one, index, clip) for index, clip in enumerate(candidate_clips)]
+            for future in as_completed(futures):
+                results.append(future.result())
+
+        results.sort(key=lambda x: x[0])
+        output = {
+            "version": "candidate_refine_v1",
+            "clips": [item for _index, item in results],
+        }
+        out = write_json(vdir / "candidate_refine.json", output)
+        self._write_status(vdir, self._base_status("candidate_refine", version, input_hash, [out]))
+        self._record_step(
+            step="candidate_refine",
+            version=version,
+            status="success",
+            output=relpath(out, self.task_dir),
+            input_hash=input_hash,
+            output_files=[out],
+            extra={"summary": {"clips": len(output["clips"]), "max_workers": max_workers}, "model": model},
+        )
+        print("瀹屾垚: candidate_refine")
+
+    def step_highlight_reassembly_plan(self) -> None:
+        self._run_text_agent("highlight_reassembly_plan", self._build_highlight_reassembly_plan_text())
 
     def step_short_video_planning(self) -> None:
         self._run_text_agent("short_video_planning", {
@@ -1406,42 +1609,206 @@ class PipelineRunner:
         })
 
     def step_short_video_edit_plan(self) -> None:
-        result = self._run_text_agent("short_video_edit_plan", {
-            "content_analysis": self._load_step_json("content_analysis"),
-            "timeline_digest": self._load_step_json("timeline_digest"),
-            "duration_strategy": self._duration_strategy_payload(),
-            "run_options": self._run_options_payload(),
-            "source_mode": self.manifest.get("source_mode", "single_source"),
-            "source_videos": self.manifest.get("source_videos", []),
-            "source_manifest": self.manifest.get("source_manifest", ""),
-        })
-        result = self._normalize_short_video_split_decision(result)
-        write_json(self.task_dir / self._step_output("short_video_edit_plan"), result)
+        result = self._run_text_agent("short_video_edit_plan", self._build_short_video_edit_plan_text())
         self._write_compat_short_video_plan_and_editing_script(result)
+
+    def step_merge_decision(self) -> None:
+        cfg = self.config.raw.get("merge_decision", {})
+        edit_plan = self._load_step_json("short_video_edit_plan")
+        scripts = [x for x in edit_plan.get("scripts", []) if isinstance(x, dict)]
+        model = str(cfg.get("model_name") or self._text_model_name())
+        fallback = list(cfg.get("fallback_models") or [])
+        input_text = self._build_merge_decision_text(edit_plan)
+        input_hash = stable_hash({
+            "short_video_edit_plan": self._step_content_hash("short_video_edit_plan"),
+            "model": model,
+            "fallback": fallback,
+            "cfg": cfg,
+            "input": input_text,
+        })
+        if self._can_reuse("merge_decision", input_hash):
+            print("澶嶇敤缂撳瓨: merge_decision")
+            return
+        version, vdir = self._version_dir("merge_decision", "agents/merge_decision")
+        ensure_dir(vdir)
+        write_text(vdir / "input.txt", input_text)
+        write_text(vdir / "prompt.txt", prompts.MERGE_DECISION_PROMPT)
+        if len(scripts) <= 1:
+            decision = {"version": "merge_decision_v1", "m": 0, "groups": []}
+        else:
+            try:
+                if self.llm_text is None:
+                    raise RuntimeError("missing text llm")
+                result = self.llm_text.call_json(
+                    model=model,
+                    fallback_models=fallback,
+                    prompt=prompts.MERGE_DECISION_PROMPT,
+                    input_data=input_text,
+                    temperature=float(cfg.get("temperature", 0.0) or 0.0),
+                    max_tokens=int(cfg.get("max_tokens", 300) or 300),
+                    debug_dir=vdir / "_llm_debug",
+                )
+                decision = self._normalize_merge_decision(result.parsed)
+            except Exception as exc:
+                write_json(vdir / "_errors" / "main.json", {"error": str(exc), "created_at": now_iso()})
+                should_merge = self._should_merge_short_video_scripts(scripts)
+                decision = {"version": "merge_decision_v1", "m": 1 if should_merge else 0, "groups": [[str(s.get("short_video_id") or f"v_{i + 1:03d}") for i, s in enumerate(scripts)]] if should_merge else [], "fallback": "rules"}
+        final_plan = self._apply_merge_decision_to_edit_plan(edit_plan, decision)
+        if final_plan != edit_plan:
+            plan_path = write_json(self.task_dir / self._step_output("short_video_edit_plan"), final_plan)
+            self.manifest.setdefault("steps", {}).setdefault("short_video_edit_plan", {})["output_hash"] = output_hash([plan_path])
+            self._save_manifest()
+            self._write_compat_short_video_plan_and_editing_script(final_plan)
+        out = write_json(vdir / "merge_decision.json", decision)
+        self._write_status(vdir, self._base_status("merge_decision", version, input_hash, [out]) | {"model": model})
+        self._record_step(step="merge_decision", version=version, status="success", output=relpath(out, self.task_dir), input_hash=input_hash, output_files=[out], extra={"model": model})
+        print("瀹屾垚: merge_decision")
 
     def step_voiceover_script(self) -> None:
         edit_plan = self._load_step_json("short_video_edit_plan")
-        editing = self._load_step_json("editing_script")
-        plan = self._load_step_json("short_video_planning")
-        plan_by_id = {x.get("short_video_id"): x for x in plan.get("short_videos", []) if isinstance(x, dict)}
-        contracts = [
-            build_voiceover_timing_contract(
-                script,
-                plan_by_id.get(script.get("short_video_id"), {}),
-                chars_per_second=self.duration_settings.chars_per_second,
-            )
-            for script in editing.get("scripts", [])
-        ]
-        final_output = self._run_text_agent("voiceover_script", {
-            "short_video_edit_plan": edit_plan,
-            "editing_script": {"scripts": editing.get("scripts", [])},
-            "voiceover_timing_contracts": contracts,
-            "duration_strategy": self._duration_strategy_payload(),
-            "run_options": self._run_options_payload(),
+        scripts = [x for x in edit_plan.get("scripts", []) if isinstance(x, dict)]
+        cfg = self.config.raw.get("voiceover_script", {})
+        max_workers = max(1, int(cfg.get("max_workers", 2) or 2))
+        model = str(cfg.get("model_name") or self._text_model_name())
+        fallback = list(cfg.get("fallback_models") or self._text_fallback_models())
+        input_hash = stable_hash({
+            "short_video_edit_plan": self._step_content_hash("short_video_edit_plan"),
+            "model": model,
+            "fallback": fallback,
+            "cfg": cfg,
         })
+        if self._can_reuse("voiceover_script", input_hash):
+            print("澶嶇敤缂撳瓨: voiceover_script")
+            final_output = self._load_step_json("voiceover_script")
+            self._normalize_voiceover_scripts(final_output)
+            self._validate_voiceover_script_duration_or_raise(final_output)
+            self._enforce_long_video_confirmation_after_voiceover(final_output)
+            return
+        version, vdir = self._version_dir("voiceover_script", "agents/voiceover_script")
+        ensure_dir(vdir)
+
+        def generate_one(index: int, script: dict[str, Any]) -> tuple[int, list[dict[str, Any]]]:
+            short_video_id = str(script.get("short_video_id") or f"v_{index + 1:03d}")
+            input_text = self._build_voiceover_script_text_input(script)
+            write_text(vdir / short_video_id / "input.txt", input_text)
+            try:
+                if self.llm_text is None:
+                    raise RuntimeError("missing text llm")
+                result = self.llm_text.call_json(
+                    model=model,
+                    fallback_models=fallback,
+                    prompt=prompts.VOICEOVER_SCRIPT_TEXT_PROMPT,
+                    input_data=input_text,
+                    temperature=float(cfg.get("temperature", 0.2) or 0.2),
+                    max_tokens=int(cfg.get("max_tokens", 1200) or 1200),
+                    debug_dir=vdir / "_llm_debug" / short_video_id,
+                )
+                parsed = result.parsed if isinstance(result.parsed, dict) else {}
+                items = [x for x in parsed.get("scripts", []) if isinstance(x, dict)]
+                if not items:
+                    items = [self._fallback_voiceover_script(script, short_video_id)]
+            except Exception as exc:
+                write_json(vdir / "_errors" / f"{short_video_id}.json", {"short_video_id": short_video_id, "error": str(exc), "created_at": now_iso()})
+                items = [self._fallback_voiceover_script(script, short_video_id)]
+            return index, items
+
+        results: list[tuple[int, list[dict[str, Any]]]] = []
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(generate_one, index, script) for index, script in enumerate(scripts)]
+            for future in as_completed(futures):
+                results.append(future.result())
+        results.sort(key=lambda x: x[0])
+        final_output = {"scripts": [item for _index, items in results for item in items]}
+        out = write_json(vdir / "voiceover_script.json", final_output)
+        self._write_status(vdir, self._base_status("voiceover_script", version, input_hash, [out]) | {"model": model})
+        self._record_step(
+            step="voiceover_script",
+            version=version,
+            status="success",
+            output=relpath(out, self.task_dir),
+            input_hash=input_hash,
+            output_files=[out],
+            extra={"model": model, "summary": {"scripts": len(final_output["scripts"]), "max_workers": max_workers}},
+        )
         self._normalize_voiceover_scripts(final_output)
         self._validate_voiceover_script_duration_or_raise(final_output)
         self._enforce_long_video_confirmation_after_voiceover(final_output)
+
+    def step_voiceover_quality_check(self) -> None:
+        cfg = self.config.raw.get("voiceover_quality_check", {})
+        voiceover = self._load_step_json("voiceover_script")
+        edit_plan = self._load_step_json("short_video_edit_plan")
+        scripts = [x for x in voiceover.get("scripts", []) if isinstance(x, dict)]
+        model = str(cfg.get("model_name") or self._text_model_name())
+        fallback = list(cfg.get("fallback_models") or [])
+        max_workers = max(1, int(cfg.get("max_workers", 2) or 2))
+        input_hash = stable_hash({
+            "voiceover_script": self._step_content_hash("voiceover_script"),
+            "short_video_edit_plan": self._step_content_hash("short_video_edit_plan"),
+            "model": model,
+            "fallback": fallback,
+            "cfg": cfg,
+        })
+        if self._can_reuse("voiceover_quality_check", input_hash):
+            print("澶嶇敤缂撳瓨: voiceover_quality_check")
+            return
+        version, vdir = self._version_dir("voiceover_quality_check", "agents/voiceover_quality_check")
+        ensure_dir(vdir)
+        plan_by_id = {
+            str(item.get("short_video_id") or ""): item
+            for item in edit_plan.get("scripts", [])
+            if isinstance(item, dict)
+        }
+
+        def check_one(index: int, script: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+            short_video_id = str(script.get("short_video_id") or f"v_{index + 1:03d}")
+            input_text = self._build_voiceover_quality_check_text(script, plan_by_id.get(short_video_id, {}))
+            write_text(vdir / short_video_id / "input.txt", input_text)
+            try:
+                if self.llm_text is None:
+                    raise RuntimeError("missing text llm")
+                result = self.llm_text.call_json(
+                    model=model,
+                    fallback_models=fallback,
+                    prompt=prompts.VOICEOVER_QUALITY_CHECK_PROMPT,
+                    input_data=input_text,
+                    temperature=float(cfg.get("temperature", 0.0) or 0.0),
+                    max_tokens=int(cfg.get("max_tokens", 300) or 300),
+                    debug_dir=vdir / "_llm_debug" / short_video_id,
+                )
+                parsed = result.parsed if isinstance(result.parsed, dict) else {}
+                item = self._normalize_voiceover_quality_check(short_video_id, parsed)
+            except Exception as exc:
+                write_json(vdir / "_errors" / f"{short_video_id}.json", {"short_video_id": short_video_id, "error": str(exc), "created_at": now_iso()})
+                item = {"short_video_id": short_video_id, "ok": 1, "rewrite": 0, "missing": [], "warning": "quality_check_failed"}
+            return index, item
+
+        results: list[tuple[int, dict[str, Any]]] = []
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(check_one, index, script) for index, script in enumerate(scripts)]
+            for future in as_completed(futures):
+                results.append(future.result())
+        results.sort(key=lambda x: x[0])
+        checks = [item for _index, item in results]
+        output = {
+            "version": "voiceover_quality_check_v1",
+            "checks": checks,
+            "ok": 1 if all(int(item.get("ok", 1) or 0) == 1 for item in checks) else 0,
+            "rewrite": 1 if any(int(item.get("rewrite", 0) or 0) == 1 for item in checks) else 0,
+            "missing": [m for item in checks for m in (item.get("missing") or [])],
+        }
+        out = write_json(vdir / "voiceover_quality_check.json", output)
+        self._write_status(vdir, self._base_status("voiceover_quality_check", version, input_hash, [out]) | {"model": model})
+        self._record_step(
+            step="voiceover_quality_check",
+            version=version,
+            status="success",
+            output=relpath(out, self.task_dir),
+            input_hash=input_hash,
+            output_files=[out],
+            extra={"model": model, "summary": {"scripts": len(checks), "max_workers": max_workers}},
+        )
+        print("瀹屾垚: voiceover_quality_check")
 
     def step_risk_review(self) -> None:
         self._run_text_agent("risk_review", {
@@ -1701,22 +2068,335 @@ class PipelineRunner:
             "editing_structure": normalized_structure,
         }
 
-    def _log_llm_input_size(self, step: str, input_data: dict[str, Any]) -> None:
-        text = json.dumps(input_data, ensure_ascii=False)
+    def _text_model_name(self) -> str:
+        llm_cfg = self.config.llm
+        provider = llm_cfg.get("text_llm_provider", "openai")
+        return str(llm_cfg.get("text_llm_model_name") or llm_cfg.get(f"text_{provider}_model_name") or "")
+
+    def _text_fallback_models(self) -> list[str]:
+        llm_cfg = self.config.llm
+        provider = llm_cfg.get("text_llm_provider", "openai")
+        return list(llm_cfg.get(f"text_{provider}_fallback_models", []) or [])
+
+    def _format_chunk_ts(self, chunk: dict[str, Any]) -> str:
+        if chunk.get("time_range"):
+            return str(chunk.get("time_range"))
+        return f"{seconds_to_timecode(float(chunk.get('start') or 0), ms=True)}-{seconds_to_timecode(float(chunk.get('end') or 0), ms=True)}"
+
+    def _clip_id(self, clip: dict[str, Any], index: int = 0) -> str:
+        return str(clip.get("clip_id") or clip.get("id") or clip.get("source_clip_id") or f"clip_{index + 1:03d}")
+
+    def _clip_start_end(self, clip: dict[str, Any]) -> tuple[float, float]:
+        start = clip.get("start_seconds")
+        end = clip.get("end_seconds")
+        if start is None:
+            start = self._clip_time_seconds(clip, "start", "source_start")
+        if end is None:
+            end = self._clip_time_seconds(clip, "end", "source_end")
+        start_f = float(start or 0)
+        end_f = float(end or 0)
+        if end_f <= start_f and clip.get("duration_seconds"):
+            end_f = start_f + float(clip.get("duration_seconds") or 0)
+        return start_f, end_f
+
+    def _format_clip_time(self, clip: dict[str, Any]) -> str:
+        start, end = self._clip_start_end(clip)
+        if clip.get("start") and clip.get("end"):
+            return f"{clip.get('start')}-{clip.get('end')}"
+        return f"{seconds_to_timecode(start, ms=True)}-{seconds_to_timecode(end, ms=True)}"
+
+    def _compact_clip_score(self, clip: dict[str, Any]) -> dict[str, Any]:
+        keys = ["news_value_score", "timeliness_score", "information_density_score", "visual_score", "visual_evidence_score", "independence_score", "hook_score"]
+        return {key: clip.get(key) for key in keys if key in clip}
+
+    def _candidate_source_hash(self) -> str:
+        if self.options.production_mode == "highlight_reassembly":
+            return self._step_content_hash("highlight_detection")
+        return self._step_content_hash("content_analysis")
+
+    def _load_candidate_clips_for_current_mode(self) -> list[dict[str, Any]]:
+        source_step = "highlight_detection" if self.options.production_mode == "highlight_reassembly" else "content_analysis"
+        doc = self._load_optional_step_json(source_step, {})
+        clips = doc.get("candidate_clips", [])
+        if isinstance(clips, dict):
+            clips = clips.get("candidate_clips", [])
+        if not isinstance(clips, list) and source_step != "highlight_detection":
+            doc = self._load_optional_step_json("highlight_detection", {})
+            clips = doc.get("candidate_clips", [])
+        return [clip for clip in clips if isinstance(clip, dict)]
+
+    def _load_video_topic_or_brief(self) -> str:
+        docs = [self._load_optional_step_json("content_analysis", {}), self._load_optional_step_json("video_understanding", {})]
+        parts: list[str] = []
+        for doc in docs:
+            for key in ("main_topic", "topic", "summary", "video_type", "video_news_type"):
+                value = str(doc.get(key) or "").strip()
+                if value and value not in parts:
+                    parts.append(value)
+        return "\n".join(parts[:4])
+
+    def _build_timeline_context_index(self) -> list[dict[str, Any]]:
+        digest = self._load_optional_step_json("timeline_digest", {})
+        out: list[dict[str, Any]] = []
+        for item in digest.get("chunks", []):
+            if not isinstance(item, dict):
+                continue
+            out.append({
+                "chunk_id": item.get("chunk_id", ""),
+                "start": float(item.get("start_seconds") or 0),
+                "end": float(item.get("end_seconds") or 0),
+                "speech": item.get("speech", ""),
+                "visual": item.get("visual", ""),
+            })
+        return out
+
+    def _nearby_context_for_clip(self, clip: dict[str, Any], context_index: list[dict[str, Any]], max_chunks: int = 3) -> list[dict[str, Any]]:
+        start, end = self._clip_start_end(clip)
+        center = (start + end) / 2
+        scored: list[tuple[float, dict[str, Any]]] = []
+        for item in context_index:
+            item_start = float(item.get("start") or 0)
+            item_end = float(item.get("end") or item_start)
+            overlap = max(0.0, min(end, item_end) - max(start, item_start))
+            distance = 0.0 if overlap > 0 else min(abs(center - item_start), abs(center - item_end))
+            scored.append((distance, item))
+        scored.sort(key=lambda x: x[0])
+        return [
+            {
+                "id": item.get("chunk_id", ""),
+                "t": f"{seconds_to_timecode(item.get('start', 0), ms=True)}-{seconds_to_timecode(item.get('end', 0), ms=True)}",
+                "speech": compact_text(str(item.get("speech") or ""), max_chars=240),
+                "visual": compact_text(str(item.get("visual") or ""), max_chars=160),
+            }
+            for _distance, item in scored[:max(1, max_chunks)]
+        ]
+
+    def _normalize_candidate_refine_output(self, *, clip_id: str, parsed: dict[str, Any], fallback_rank: int) -> dict[str, Any]:
+        keep = int(parsed.get("k", parsed.get("keep", 1)) or 0)
+        usage = str(parsed.get("u", parsed.get("usage", "both")) or "both").lower()
+        if usage not in {"av", "re", "both", "drop"}:
+            usage = "both" if keep else "drop"
+        return {
+            "clip_id": clip_id,
+            "k": 1 if keep else 0,
+            "u": usage,
+            "i": 1 if int(parsed.get("i", parsed.get("independent", 0)) or 0) else 0,
+            "c": 1 if int(parsed.get("c", parsed.get("needs_context", 0)) or 0) else 0,
+            "g": str(parsed.get("g", parsed.get("story_group", "g1")) or "g1")[:24],
+            "r": int(parsed.get("r", parsed.get("rank", fallback_rank)) or fallback_rank),
+        }
+
+    def _candidate_refine_by_clip_id(self) -> dict[str, dict[str, Any]]:
+        doc = self._load_optional_step_json("candidate_refine", {})
+        return {str(item.get("clip_id")): item for item in doc.get("clips", []) if isinstance(item, dict) and item.get("clip_id")}
+
+    def _source_boundaries(self) -> list[dict[str, Any]]:
+        boundaries: list[dict[str, Any]] = []
+        for item in self.manifest.get("source_videos", []) or []:
+            if isinstance(item, dict):
+                boundaries.append({
+                    "source_id": item.get("source_id", ""),
+                    "start": float(item.get("virtual_start_seconds") or 0),
+                    "end": float(item.get("virtual_end_seconds") or item.get("duration_seconds") or 0),
+                })
+        if boundaries:
+            return boundaries
+        metadata = self._load_optional_step_json("metadata", {})
+        duration = float(metadata.get("duration") or 0)
+        return [{"source_id": "source_1", "start": 0.0, "end": duration}] if duration else []
+
+    def _build_highlight_reassembly_plan_text(self) -> str:
+        llm_cfg = self.config.raw.get("llm_input", {})
+        max_clips = int(llm_cfg.get("max_llm_candidate_clips", llm_cfg.get("max_candidate_clips_for_edit_plan", 14)) or 14)
+        max_boundaries = int(llm_cfg.get("max_llm_source_boundaries", 20) or 20)
+        video = self._load_optional_step_json("video_understanding", {})
+        refine = self._candidate_refine_by_clip_id()
+        clips = self._load_candidate_clips_for_current_mode()[:max_clips]
+        lines = [
+            "Task: original-audio highlight reassembly.",
+            "",
+            "Options:",
+            f"- target={self.options.reassembly_target_seconds}s",
+            f"- max_clip_count={self.options.reassembly_max_clip_count}",
+            f"- output_mode={self.options.reassembly_output_mode}",
+            "",
+            "Video:",
+            f"topic: {video.get('main_topic') or video.get('topic') or ''}",
+            f"summary: {video.get('summary') or ''}",
+            "",
+            "Candidate clips:",
+        ]
+        for index, clip in enumerate(clips):
+            cid = self._clip_id(clip, index)
+            r = refine.get(cid, {})
+            lines.append(f"[{cid}] t={self._format_clip_time(clip)} dur={clip.get('duration_seconds', '')} source={clip.get('source_id', 'source_1')} k={r.get('k', 1)} u={r.get('u', 'both')} i={r.get('i', 0)} c={r.get('c', 0)} g={r.get('g', 'g1')} r={r.get('r', index + 1)}")
+            lines.append(f"summary: {compact_text(str(clip.get('summary') or ''), max_chars=400)}")
+            lines.append(f"speech: {compact_text(str(clip.get('speech') or clip.get('asr_text') or clip.get('original_audio_transcript_summary') or ''), max_chars=400)}")
+            lines.append(f"visual: {compact_text(str(clip.get('visual') or clip.get('visual_summary') or clip.get('why_this_visual_matters') or ''), max_chars=400)}")
+            lines.append("")
+        lines.append("Source boundaries:")
+        for boundary in self._source_boundaries()[:max_boundaries]:
+            lines.append(f"{boundary['source_id']}: {boundary['start']}-{boundary['end']}s")
+        lines.append("")
+        lines.append("Return strict JSON following the prompt schema.")
+        return "\n".join(lines)
+
+    def _build_short_video_edit_plan_text(self) -> str:
+        llm_cfg = self.config.raw.get("llm_input", {})
+        max_clips = int(llm_cfg.get("max_llm_candidate_clips", llm_cfg.get("max_candidate_clips_for_edit_plan", 14)) or 14)
+        content = self._load_optional_step_json("content_analysis", {})
+        refine = self._candidate_refine_by_clip_id()
+        clips = self._load_candidate_clips_for_current_mode()[:max_clips]
+        lines = [
+            "Task: generate AI voiceover short-video edit plan.",
+            "",
+            "Run options:",
+            f"- target_duration_seconds={self.options.target_duration_seconds}",
+            f"- output_mode={self.options.output_mode}",
+            f"- max_output_videos={self.options.max_output_videos}",
+            "",
+            "Video brief:",
+            f"topic: {content.get('main_topic') or content.get('topic') or ''}",
+            f"summary: {content.get('summary') or ''}",
+            "key facts:",
+        ]
+        for fact in (content.get("key_facts") or [])[: int(llm_cfg.get("max_llm_key_facts", 8) or 8)]:
+            lines.append(f"- {fact if isinstance(fact, str) else json.dumps(fact, ensure_ascii=False)}")
+        lines.append("")
+        lines.append("Candidate clips:")
+        context_index = self._build_timeline_context_index()
+        for index, clip in enumerate(clips):
+            cid = self._clip_id(clip, index)
+            r = refine.get(cid, {})
+            lines.append(f"[{cid}] t={self._format_clip_time(clip)} dur={clip.get('duration_seconds', '')} k={r.get('k', 1)} u={r.get('u', 'both')} i={r.get('i', 0)} c={r.get('c', 0)} g={r.get('g', 'g1')} r={r.get('r', index + 1)}")
+            lines.append(f"summary: {compact_text(str(clip.get('summary') or ''), max_chars=400)}")
+            lines.append(f"speech: {compact_text(str(clip.get('speech') or clip.get('asr_text') or clip.get('original_audio_transcript_summary') or ''), max_chars=400)}")
+            lines.append(f"visual: {compact_text(str(clip.get('visual') or clip.get('visual_summary') or clip.get('why_this_visual_matters') or ''), max_chars=400)}")
+            nearby = self._nearby_context_for_clip(clip, context_index, max_chunks=int(llm_cfg.get("max_llm_context_chunks", 3) or 3))
+            if nearby:
+                lines.append("nearby context: " + json.dumps(nearby, ensure_ascii=False, separators=(",", ":")))
+            lines.append("")
+        lines.append("Return strict JSON following the prompt schema.")
+        return "\n".join(lines)
+
+    def _build_merge_decision_text(self, edit_plan: dict[str, Any]) -> str:
+        lines = ["Task: decide whether planned short videos should be merged.", ""]
+        for index, script in enumerate(edit_plan.get("scripts", []) or []):
+            if not isinstance(script, dict):
+                continue
+            sid = str(script.get("short_video_id") or f"v_{index + 1:03d}")
+            lines.append(f"[{sid}]")
+            lines.append(f"topic: {script.get('topic') or ''}")
+            lines.append(f"angle: {script.get('news_angle') or ''}")
+            lines.append(f"target: {script.get('target_duration_seconds') or ''}s")
+            lines.append("facts: " + "; ".join(map(str, script.get("must_keep_fact_points") or [])))
+            lines.append("clips: " + ", ".join(map(str, script.get("source_clip_ids") or [])))
+            lines.append("")
+        lines.append('Return JSON like {"m":1,"groups":[["v_001","v_002"]]}.')
+        return "\n".join(lines)
+
+    def _normalize_merge_decision(self, parsed: Any) -> dict[str, Any]:
+        parsed = parsed if isinstance(parsed, dict) else {}
+        groups = parsed.get("groups") if isinstance(parsed.get("groups"), list) else []
+        clean_groups = [[str(x) for x in group if str(x).strip()] for group in groups if isinstance(group, list)]
+        return {"version": "merge_decision_v1", "m": 1 if int(parsed.get("m", 0) or 0) else 0, "groups": clean_groups}
+
+    def _apply_merge_decision_to_edit_plan(self, edit_plan: dict[str, Any], decision: dict[str, Any]) -> dict[str, Any]:
+        scripts = [x for x in edit_plan.get("scripts", []) if isinstance(x, dict)]
+        if len(scripts) <= 1 or int(decision.get("m", 0) or 0) != 1:
+            return edit_plan
+        by_id = {str(script.get("short_video_id") or f"v_{index + 1:03d}"): script for index, script in enumerate(scripts)}
+        groups = decision.get("groups") or [[sid for sid in by_id]]
+        consumed: set[str] = set()
+        merged_scripts: list[dict[str, Any]] = []
+        for group in groups:
+            group_scripts = [by_id[sid] for sid in group if sid in by_id]
+            if len(group_scripts) >= 2:
+                merged_scripts.append(self._merge_short_video_scripts(group_scripts))
+                consumed.update(str(script.get("short_video_id") or "") for script in group_scripts)
+        for sid, script in by_id.items():
+            if sid not in consumed:
+                merged_scripts.append(script)
+        if not merged_scripts:
+            return edit_plan
+        normalized = dict(edit_plan)
+        normalized["scripts"] = merged_scripts
+        normalized["recommended_video_count"] = len(merged_scripts)
+        normalized["model_merge_applied"] = True
+        return normalized
+
+    def _build_voiceover_script_text_input(self, script: dict[str, Any]) -> str:
+        lines = [
+            "Task: write the final AI voiceover script for one short video.",
+            f"short_video_id: {script.get('short_video_id') or ''}",
+            f"topic: {script.get('topic') or ''}",
+            f"angle: {script.get('news_angle') or ''}",
+            f"title: {script.get('title') or ''}",
+            f"target_duration_seconds: {script.get('target_duration_seconds') or self.options.target_duration_seconds}",
+            "must_keep_fact_points:",
+        ]
+        for fact in script.get("must_keep_fact_points") or []:
+            lines.append(f"- {fact}")
+        lines.append("")
+        lines.append("editing_structure:")
+        for shot in script.get("editing_structure") or []:
+            if isinstance(shot, dict):
+                lines.append(f"- shot_id={shot.get('shot_id') or ''} t={shot.get('source_start') or ''}-{shot.get('source_end') or ''} dur={shot.get('duration_seconds') or ''} visual={shot.get('visual') or ''} fact={shot.get('fact') or shot.get('news_fact_to_explain') or shot.get('editing_note') or ''}")
+        return "\n".join(lines)
+
+    def _fallback_voiceover_script(self, script: dict[str, Any], short_video_id: str) -> dict[str, Any]:
+        facts = [str(x).strip() for x in script.get("must_keep_fact_points") or [] if str(x).strip()]
+        shots = [x for x in script.get("editing_structure") or [] if isinstance(x, dict)]
+        narration = " ".join(facts or [str(script.get("topic") or script.get("title") or "")]).strip()
+        segments = []
+        for index, shot in enumerate(shots, start=1):
+            text = str(shot.get("fact") or shot.get("news_fact_to_explain") or shot.get("visual") or narration).strip()
+            segments.append({"shot_id": shot.get("shot_id") or f"{short_video_id}_s{index:02d}", "text": text})
+        return {"short_video_id": short_video_id, "narration_text": narration, "narration_segments": segments}
+
+    def _build_voiceover_quality_check_text(self, script: dict[str, Any], plan_item: dict[str, Any]) -> str:
+        lines = [
+            "Task: check voiceover script quality.",
+            f"short_video_id: {script.get('short_video_id') or ''}",
+            f"target_duration_seconds: {plan_item.get('target_duration_seconds') or script.get('target_duration_seconds') or ''}",
+            "required facts:",
+        ]
+        for index, fact in enumerate(plan_item.get("must_keep_fact_points") or [], start=1):
+            lines.append(f"{index}. {fact}")
+        lines.append("")
+        lines.append("script:")
+        lines.append(str(script.get("narration_text") or ""))
+        return "\n".join(lines)
+
+    def _normalize_voiceover_quality_check(self, short_video_id: str, parsed: dict[str, Any]) -> dict[str, Any]:
+        missing = parsed.get("missing") if isinstance(parsed.get("missing"), list) else []
+        return {
+            "short_video_id": short_video_id,
+            "ok": 1 if int(parsed.get("ok", 1) or 0) else 0,
+            "rewrite": 1 if int(parsed.get("rewrite", 0) or 0) else 0,
+            "missing": missing,
+        }
+
+    def _text_agent_input_limit(self, step: str) -> int:
+        cfg = self.config.raw.get("llm_input", {})
+        return int(cfg.get(f"max_{step}_input_chars", cfg.get("max_text_agent_input_chars", 60000)) or 60000)
+
+    def _log_llm_input_size(self, step: str, input_data: Any) -> None:
+        text = input_data if isinstance(input_data, str) else json.dumps(input_data, ensure_ascii=False, separators=(",", ":"), default=str)
         print(f"LLM input size [{step}]: {len(text)} chars")
-        limit = int(self.config.raw.get("llm_input", {}).get("max_text_agent_input_chars", 60000) or 60000)
+        limit = self._text_agent_input_limit(step)
         if len(text) > limit:
             raise RuntimeError(
                 f"LLM input size [{step}] exceeds max_text_agent_input_chars={limit}; 应改用 timeline_digest"
             )
 
-    def _run_text_agent(self, step: str, input_data: dict[str, Any]) -> dict[str, Any]:
+    def _run_text_agent(self, step: str, input_data: Any) -> dict[str, Any]:
         if self.llm_text is None:
             raise RuntimeError("缺少 text LLM 配置")
         base, out_name, prompt, default_prompt_version = AGENT_INFO[step]
         llm_cfg = self.config.llm
         provider = llm_cfg.get("text_llm_provider", "openai")
-        model = self.options.model or llm_cfg.get(f"text_{provider}_model_name")
+        model = self.options.model or llm_cfg.get("text_llm_model_name") or llm_cfg.get(f"text_{provider}_model_name")
         fallback = llm_cfg.get(f"text_{provider}_fallback_models", [])
         max_tokens = int(llm_cfg.get("text_llm_max_tokens", 16000) or 16000)
         prompt_version = self.options.prompt_version or default_prompt_version
@@ -1727,7 +2407,11 @@ class PipelineRunner:
         version, vdir = self._version_dir(step, base)
         ensure_dir(vdir)
         self._log_llm_input_size(step, input_data)
-        write_json(vdir / "input.json", input_data)
+        if isinstance(input_data, str):
+            write_text(vdir / "input.txt", input_data)
+            write_json(vdir / "input_meta.json", {"type": "text", "chars": len(input_data)})
+        else:
+            write_json(vdir / "input.json", input_data)
         write_text(vdir / "prompt.txt", prompt)
         result = self.llm_text.call_json(
             model=model,

@@ -69,7 +69,9 @@ def test_doubao_config_integration(tmp_path: Path) -> None:
     assert config.llm.get("vision_llm_provider") == "doubao"
     assert config.llm.get("text_llm_provider") == "doubao"
     assert config.llm.get("vision_doubao_model_name") == model_id
-    assert config.llm.get("text_doubao_model_name") == model_id
+    assert config.llm.get("vision_llm_model_name") == model_id
+    assert config.llm.get("text_doubao_model_name") == "ep-20260604155430-pt5bq"
+    assert config.llm.get("text_llm_model_name") == "ep-20260604155430-pt5bq"
 
     options = RunOptions(
         config=str(ROOT / "config.toml"),

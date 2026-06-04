@@ -175,6 +175,173 @@ VISION_CHUNK_PROMPT = """你是一名凤凰卫视新闻视频画面分析编辑�
 }"""
 
 
+ASR_DIGEST_PROMPT = """
+You are an ASR compression assistant for news video editing.
+Task: compress the raw ASR text into a shorter "speech" field for downstream video understanding and short-video planning.
+Rules:
+1. Use only facts present in the ASR text. Do not invent or correct uncertain facts.
+2. Do not filter by fixed news keywords.
+3. Preserve people, organizations, places, time, actions, results, positions, numbers, and key claims.
+4. Remove repeated filler, greetings, stutters, and clearly meaningless fragments.
+5. Keep the result near target_chars when possible.
+6. Output strict JSON only: {"speech":"..."}.
+"""
+
+
+CANDIDATE_REFINE_PROMPT = """
+You are a news short-video candidate-clip editor.
+Task: decide whether the candidate clip should enter AI voiceover planning or original-audio highlight reassembly.
+Judge only from the input. Do not invent facts.
+Return strict JSON only with these compact fields:
+{
+  "k": 1,
+  "u": "both",
+  "i": 1,
+  "c": 0,
+  "g": "g1",
+  "r": 1
+}
+Field meanings:
+k: keep, 1=keep, 0=drop.
+u: usage, av=AI voiceover, re=original-audio reassembly, both=suitable for both, drop=drop.
+i: independent, 1=can stand alone, 0=needs other material.
+c: needs_context, 1=needs nearby context, 0=no.
+g: story group, use short labels such as g1/g2/g3 for the same news chain.
+r: rank from 1 to 99, smaller is better.
+Do not output reason, usage, latency, or extra fields.
+"""
+
+
+MERGE_DECISION_PROMPT = """
+You are a news short-video editor.
+Task: decide whether multiple planned short-video scripts should be merged to avoid splitting one news chain into fragments.
+Merge when scripts share one event, topic, actor set, or news chain and separate videos would lack context.
+Do not merge clearly different events or angles.
+Return strict JSON only:
+{
+  "m": 1,
+  "groups": [["v_001", "v_002"]]
+}
+m: 1 means merge is recommended; 0 means do not merge.
+groups: script id groups to merge. Empty array when m=0.
+"""
+
+
+VOICEOVER_QUALITY_CHECK_PROMPT = """
+You are a news AI voiceover quality checker.
+Task: check whether the generated voiceover script covers the required facts, is not obviously too short, does not invent facts, and has a complete structure.
+Return strict JSON only:
+{
+  "ok": 1,
+  "rewrite": 0,
+  "missing": []
+}
+ok: 1=pass, 0=has serious issue.
+rewrite: 1=rewrite recommended, 0=no rewrite needed.
+missing: array of missing required fact numbers, for example [1,3].
+"""
+
+
+HIGHLIGHT_REASSEMBLY_TEXT_PROMPT = """
+You are an original-audio news highlight reassembly editor.
+Use the compact text input only.
+Select, order, and combine candidate clips into one or more original-audio highlight videos.
+Rules:
+1. Select only from candidate clips in the input.
+2. Do not invent timecodes.
+3. Do not select clips with k=0 or u=drop.
+4. Original-audio reassembly prefers u=re or u=both.
+5. If c=1, include needed same-group context or drop that clip.
+6. Keep clips from the same story_group together when useful.
+7. Output strict JSON only:
+{
+  "output_videos": [
+    {
+      "reassembly_id": "hr_001",
+      "title": "",
+      "selected_clips": [
+        {
+          "source_clip_id": "clip_001",
+          "source_id": "source_1",
+          "source_start": "00:00:00.000",
+          "source_end": "00:00:12.000",
+          "duration_seconds": 12,
+          "role": "",
+          "transition_after": "hard_cut"
+        }
+      ],
+      "excluded_clip_ids": []
+    }
+  ]
+}
+"""
+
+
+SHORT_VIDEO_EDIT_PLAN_TEXT_PROMPT = """
+You are a news AI voiceover short-video planning editor.
+Use the compact text input only.
+Default to one complete short video unless there are clearly different events or angles.
+Do not split one news chain into fragments.
+Use only candidate clip timecodes from the input.
+Do not select clips with k=0 or u=drop.
+AI voiceover mode prefers u=av or u=both.
+Return strict JSON only:
+{
+  "recommended_video_count": 1,
+  "scripts": [
+    {
+      "short_video_id": "v_001",
+      "topic": "",
+      "news_angle": "",
+      "title": "",
+      "target_duration_seconds": 55,
+      "source_clip_ids": ["clip_001"],
+      "must_keep_fact_points": [],
+      "editing_structure": [
+        {
+          "order": 1,
+          "shot_id": "v_001_s01",
+          "source_start": "00:00:00.000",
+          "source_end": "00:00:08.000",
+          "duration_seconds": 8,
+          "visual": "",
+          "fact": ""
+        }
+      ]
+    }
+  ],
+  "discarded_clip_ids": []
+}
+"""
+
+
+VOICEOVER_SCRIPT_TEXT_PROMPT = """
+You are a news AI voiceover script editor.
+Generate the final narration for one short_video_id from the compact shot script.
+Rules:
+1. Use only input facts; do not invent.
+2. Every narration_segment must correspond to a shot_id.
+3. Write a complete narration, not only title-like fragments.
+4. If target_duration_seconds >= 40, include opening, background, core facts, conflict/analysis, and ending.
+5. Sentences should be subtitle-friendly.
+6. Return strict JSON only:
+{
+  "scripts": [
+    {
+      "short_video_id": "v_001",
+      "narration_text": "",
+      "narration_segments": [
+        {
+          "shot_id": "v_001_s01",
+          "text": ""
+        }
+      ]
+    }
+  ]
+}
+"""
+
+
 VIDEO_UNDERSTANDING_PROMPT = NEWS_BACKGROUND + """
 请只读取输入中的 timeline_digest，不要要求或依赖完整 merged_timeline。
 
