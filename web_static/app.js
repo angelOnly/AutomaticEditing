@@ -96,6 +96,7 @@ const state = {
   contextMenu: null,
   latestDraft: null,
   drafts: [],
+  previewRequestId: 0,
   remoteVideos: [],
   remotePagination: { current: 1, pageSize: 10, total: 0 },
   remoteRecordStations: [],
@@ -317,10 +318,15 @@ function bindEvents() {
     state.previewIntent = "user-source";
     playSourceVideo();
   });
-  $("openDraft").addEventListener("click", () => {
+  $("openDraft").addEventListener("click", async () => {
     state.previewIntent = "user-draft";
     setPreviewMode("draft");
-    if (state.drafts.length) {
+    if (state.selectedTask) {
+      await loadLatestDraft(state.selectedTask, { updatePreview: true, force: true }).catch((error) => {
+        console.warn("成片预览刷新失败", error);
+        renderDraftList();
+      });
+    } else if (state.drafts.length) {
       renderDraftList();
       playDraft(state.drafts[0]);
     }
@@ -758,8 +764,8 @@ function selectRemoteVideo(video) {
   updateTaskSubtitle();
   clearTaskPanels();
   if (video.preview_url) {
-    $("videoPreview").src = video.preview_url;
-    $("videoPreview").load();
+    beginPreviewRequest();
+    setVideoPreviewSource(video.preview_url);
     $("fileViewer").textContent = "正在预览远程原片。";
   } else {
     $("fileViewer").textContent = "该远程素材没有可预览地址。";
@@ -1025,16 +1031,20 @@ async function loadManifest(taskId, options = {}) {
 }
 
 async function loadLatestDraft(taskId, options = {}) {
-  const { updatePreview = true } = options;
+  const { updatePreview = true, force = false } = options;
+  const requestId = updatePreview ? beginPreviewRequest() : state.previewRequestId;
   const drafts = await api(`/api/tasks/${taskId}/drafts`);
+  if (updatePreview && !isCurrentPreviewRequest(requestId)) return;
   state.drafts = drafts;
   state.latestDraft = drafts[0] || { exists: false, file: "", url: "" };
-  if (state.previewMode !== "draft" || state.previewIntent === "basket" || state.previewIntent === "user-source") return;
+  if (state.previewMode !== "draft" || (!force && (state.previewIntent === "basket" || state.previewIntent === "user-source"))) return;
   renderDraftList();
   if (!updatePreview) return;
   if (drafts.length) {
-    playDraft(drafts[0]);
+    playDraft(drafts[0], requestId);
   } else {
+    $("videoPreview").removeAttribute("src");
+    $("videoPreview").load();
     $("fileViewer").textContent = "当前任务还没有生成粗剪视频。";
   }
 }
@@ -1062,6 +1072,35 @@ function syncPreviewTabs() {
   updatePreviewListTitle();
 }
 
+function beginPreviewRequest() {
+  state.previewRequestId += 1;
+  return state.previewRequestId;
+}
+
+function isCurrentPreviewRequest(requestId) {
+  return requestId === state.previewRequestId;
+}
+
+function withPreviewCacheBuster(url) {
+  if (!url) return url;
+  try {
+    const parsed = new URL(url, window.location.origin);
+    parsed.searchParams.set("_preview_ts", String(Date.now()));
+    return parsed.origin === window.location.origin ? `${parsed.pathname}${parsed.search}${parsed.hash}` : parsed.toString();
+  } catch (_) {
+    const joiner = url.includes("?") ? "&" : "?";
+    return `${url}${joiner}_preview_ts=${Date.now()}`;
+  }
+}
+
+function setVideoPreviewSource(url, options = {}) {
+  const video = $("videoPreview");
+  if (!video || !url) return;
+  video.pause?.();
+  video.src = options.cacheBust ? withPreviewCacheBuster(url) : url;
+  video.load();
+}
+
 function updatePreviewListTitle() {
   const title = $("previewListTitle");
   if (!title) return;
@@ -1070,14 +1109,15 @@ function updatePreviewListTitle() {
 
 async function playSourceVideo(options = {}) {
   const { preferredIndex = null } = options;
+  const requestId = beginPreviewRequest();
   setPreviewMode("source");
   if (state.sourceBasket.length) {
     const sources = state.sourceBasket.map(sourceBasketPreviewItem);
     const previewItems = renderSourceVideoList(sources);
     const index = Number.isInteger(preferredIndex) ? preferredIndex : previewItems.length - 1;
-    playSourceItem(previewItems[index] || previewItems[0]);
+    if (isCurrentPreviewRequest(requestId)) playSourceItem(previewItems[index] || previewItems[0], requestId);
   } else if (state.selectedTask) {
-    await loadSourceVideos(state.selectedTask);
+    await loadSourceVideos(state.selectedTask, requestId);
   } else if (state.selectedRemoteVideo) {
     const url =
       state.selectedRemoteVideo.preview_url ||
@@ -1092,7 +1132,7 @@ async function playSourceVideo(options = {}) {
       list_index: 0,
     };
     renderSourceVideoList([item]);
-    if (url) playSourceItem(item);
+    if (url && isCurrentPreviewRequest(requestId)) playSourceItem(item, requestId);
   } else if (state.selectedVideo) {
     const item = {
       label: state.selectedVideo.name || state.selectedVideo.path,
@@ -1101,8 +1141,9 @@ async function playSourceVideo(options = {}) {
       list_index: 0,
     };
     renderSourceVideoList([item]);
-    playSourceItem(item);
+    if (isCurrentPreviewRequest(requestId)) playSourceItem(item, requestId);
   } else {
+    if (!isCurrentPreviewRequest(requestId)) return;
     renderSourceVideoList([]);
     $("videoPreview").removeAttribute("src");
     $("fileViewer").textContent = "请先选择一个原片或任务。";
@@ -1128,14 +1169,13 @@ function sourceBasketPreviewItem(item, index) {
   };
 }
 
-async function loadSourceVideos(taskId) {
+async function loadSourceVideos(taskId, requestId = beginPreviewRequest()) {
   const sources = await api(`/api/tasks/${taskId}/source-videos`).catch(() => []);
-  if (state.previewMode !== "source") return;
+  if (state.previewMode !== "source" || !isCurrentPreviewRequest(requestId)) return;
   if (!sources.length) {
     renderSourceVideoList([]);
     try {
-      $("videoPreview").src = `/api/tasks/${taskId}/preview`;
-      $("videoPreview").load();
+      setVideoPreviewSource(`/api/tasks/${taskId}/preview`, { cacheBust: true });
       $("fileViewer").textContent = "正在预览原片。";
     } catch (_) {
       $("fileViewer").textContent = "当前任务还没有可预览的原片，可能还在准备多源素材。";
@@ -1143,7 +1183,7 @@ async function loadSourceVideos(taskId) {
     return;
   }
   const previewItems = renderSourceVideoList(sources);
-  playSourceItem(previewItems[0]);
+  if (isCurrentPreviewRequest(requestId)) playSourceItem(previewItems[0], requestId);
 }
 
 function renderSourceVideoList(sources) {
@@ -1170,14 +1210,14 @@ function renderSourceVideoList(sources) {
   return items;
 }
 
-function playSourceItem(source) {
+function playSourceItem(source, requestId = beginPreviewRequest()) {
+  if (!isCurrentPreviewRequest(requestId)) return;
   if (!source?.url) {
     $("fileViewer").textContent = "该原片没有可预览地址。";
     return;
   }
   setPreviewMode("source");
-  $("videoPreview").src = source.url;
-  $("videoPreview").load();
+  setVideoPreviewSource(source.url);
   $("fileViewer").textContent = `正在预览原片：\n${source.label || source.file}`;
   document.querySelectorAll(".draft-item").forEach((item) => item.classList.remove("active"));
   document.querySelectorAll(".source-item").forEach((item) => {
@@ -1208,11 +1248,11 @@ function renderDraftList() {
   });
 }
 
-function playDraft(draft) {
+function playDraft(draft, requestId = beginPreviewRequest()) {
   if (!draft?.url) return;
+  if (!isCurrentPreviewRequest(requestId)) return;
   setPreviewMode("draft");
-  $("videoPreview").src = draft.url;
-  $("videoPreview").load();
+  setVideoPreviewSource(draft.url, { cacheBust: true });
   $("fileViewer").textContent = `正在预览粗剪成片：\n${draft.file}`;
   document.querySelectorAll(".draft-item").forEach((item) => {
     const current = state.drafts[Number(item.dataset.index)];
@@ -1528,8 +1568,8 @@ async function openTaskFile(path) {
   const url = `/api/tasks/${state.selectedTask}/file?path=${encodeURIComponent(path)}`;
   if (/\.(mp4|mov|mkv|wav|mp3|jpg|jpeg|png)$/i.test(path)) {
     if (/\.(mp4|mov|mkv)$/i.test(path)) {
-      $("videoPreview").src = url;
-      $("videoPreview").load();
+      beginPreviewRequest();
+      setVideoPreviewSource(url, { cacheBust: true });
       $("fileViewer").textContent = `正在预览视频：\n${path}`;
     } else {
       window.open(url, "_blank");

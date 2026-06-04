@@ -417,6 +417,9 @@ class PipelineRunner:
             selected = step_order[step_order.index(self.options.rerun_from) :]
         else:
             selected = step_order
+            reused_common_steps = set(self.manifest.get("reused_common_steps") or [])
+            if reused_common_steps:
+                selected = [step for step in selected if step not in reused_common_steps]
 
         if self.options.stop_after:
             if self.options.stop_after not in selected:
@@ -536,7 +539,53 @@ class PipelineRunner:
         self._save_manifest()
 
     def _user_facing_error_message(self, exc: Exception) -> str:
-        return str(exc).strip() or exc.__class__.__name__
+        text = str(exc).strip() or exc.__class__.__name__
+        if text.startswith("视频预处理失败："):
+            return text
+        if "ffmpeg" in text.lower() or "ffprobe" in text.lower():
+            return "\n".join([
+                "视频处理失败：系统调用 ffmpeg/ffprobe 时出错。",
+                "如果源视频在播放器里也无法正常播放，请重新导出或重新上传视频后再试。",
+                "如果源视频能正常播放，这更可能是系统处理或临时读取问题，请先重试；重试仍失败时再查看下面的原始错误。",
+                "原始错误：",
+                text,
+            ])
+        return text
+
+    def _source_media_error_message(
+        self,
+        source: Path,
+        metadata: dict[str, Any],
+        exc: Exception,
+        retry_exc: Exception | None = None,
+    ) -> str:
+        duration = float(metadata.get("duration") or 0)
+        width = int(metadata.get("width") or 0)
+        height = int(metadata.get("height") or 0)
+        video_codec = str(metadata.get("video_codec") or "")
+        audio_codec = str(metadata.get("audio_codec") or "")
+        source_size = source.stat().st_size if source.exists() else 0
+        hints = [
+            "视频预处理失败：系统无法从源视频中提取可用音频。",
+            f"源文件：{source}",
+            f"检测结果：大小 {source_size} 字节，时长 {duration:.3f}s，画面 {width}x{height}，视频编码 {video_codec or '未检测到'}，音频编码 {audio_codec or '未检测到'}。",
+        ]
+        if source_size < 1024 or duration <= 0 or not video_codec:
+            hints.extend([
+                "判断：源视频本身不像一个可用的视频文件，或者系统拿到了占位/损坏文件。",
+                "处理办法：请重新上传或重新导出视频；如果这是多源任务，请直接重试任务，让系统重新准备源文件。",
+            ])
+        else:
+            hints.extend([
+                "判断：视频有基本画面信息，但 ffmpeg 抽音频失败，可能是封装/音轨损坏或临时读取问题。",
+                "处理办法：可以先重试；如果仍失败，请用剪映/播放器/ffmpeg 重新导出为 H.264 + AAC 的 mp4 后再跑。",
+            ])
+        hints.append("原始错误：")
+        hints.append(str(exc).strip())
+        if retry_exc is not None:
+            hints.append("容错重试仍失败：")
+            hints.append(str(retry_exc).strip())
+        return "\n".join(hints)
 
     def _mark_downstream_stale(self, step: str) -> None:
         if self.options.rerun != step and not self.options.rerun_from:
@@ -639,9 +688,29 @@ class PipelineRunner:
         version, vdir = self._version_dir("audio_extract", "preprocess/audio")
         ensure_dir(vdir)
         out = vdir / "audio.wav"
-        run_cmd(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(source), "-vn", "-ac", "1", "-ar", "16000", str(out)])
-        self._write_status(vdir, self._base_status("audio_extract", version, input_hash, [out]))
-        self._record_step(step="audio_extract", version=version, status="success", output=relpath(out, self.task_dir), input_hash=input_hash, output_files=[out])
+        metadata = self._load_step_json("metadata")
+        extra: dict[str, Any] = {}
+        try:
+            run_cmd(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(source), "-vn", "-ac", "1", "-ar", "16000", str(out)])
+        except Exception as exc:
+            duration = float(metadata.get("duration") or 0)
+            has_video = bool(metadata.get("width") or metadata.get("height") or metadata.get("video_codec"))
+            has_audio = bool(metadata.get("audio_codec"))
+            if duration > 0 and has_video and has_audio:
+                try:
+                    run_cmd(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-fflags", "+genpts", "-err_detect", "ignore_err", "-i", str(source), "-vn", "-ac", "1", "-ar", "16000", str(out)])
+                    extra = {"degraded": True, "warning": "audio_extract first attempt failed; retry with tolerant ffmpeg flags succeeded"}
+                except Exception as retry_exc:
+                    raise RuntimeError(self._source_media_error_message(source, metadata, exc, retry_exc)) from retry_exc
+            elif duration > 0 and has_video and not has_audio:
+                run_cmd(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "anullsrc=channel_layout=mono:sample_rate=16000", "-t", str(duration), str(out)])
+                extra = {"degraded": True, "warning": f"source has no audio track; generated {duration:.3f}s silent audio fallback"}
+            else:
+                raise RuntimeError(self._source_media_error_message(source, metadata, exc)) from exc
+        status = self._base_status("audio_extract", version, input_hash, [out])
+        status.update(extra)
+        self._write_status(vdir, status)
+        self._record_step(step="audio_extract", version=version, status="success", output=relpath(out, self.task_dir), input_hash=input_hash, output_files=[out], extra=extra)
         print("完成: audio_extract")
 
     def step_frame_extract(self) -> None:
@@ -2634,11 +2703,43 @@ class PipelineRunner:
         if status == "failed":
             raise RuntimeError("reassembly_render has no available videos")
 
+    def _resolve_reassembly_clip_source(self, clip: dict[str, Any]) -> tuple[Path, float, float]:
+        start = timecode_to_seconds(clip.get("source_start"))
+        end = timecode_to_seconds(clip.get("source_end"))
+        if end <= start:
+            raise RuntimeError(f"invalid reassembly clip time range: {clip.get('clip_id') or ''}")
+
+        manifest_value = str(self.manifest.get("source_manifest") or "").strip()
+        source_manifest_path = Path(manifest_value)
+        if not source_manifest_path.is_absolute():
+            source_manifest_path = self.task_dir / source_manifest_path
+        source_manifest = read_json(source_manifest_path, {})
+        if source_manifest.get("source_mode") != "multi_source_concat_proxy":
+            return self._source_video(), start, end
+
+        for item in source_manifest.get("sources") or []:
+            virtual_start = float(item.get("virtual_start_seconds") or 0)
+            virtual_end = float(item.get("virtual_end_seconds") or 0)
+            if virtual_start <= start and end <= virtual_end:
+                normalized = str(item.get("normalized_file") or "")
+                if not normalized:
+                    break
+                source_path = Path(normalized)
+                if not source_path.is_absolute():
+                    source_path = self.task_dir / source_path
+                return source_path, start - virtual_start, end - virtual_start
+
+        raise RuntimeError(
+            "视频重组渲染失败：选中的高光片段跨越了多个源视频，当前无法直接从占位拼接文件导出。\n"
+            "处理办法：请重试高光重组，或调整片段边界避免跨源；后续应自动拆分跨源片段后再合并。\n"
+            f"片段：{clip.get('clip_id') or ''} {clip.get('source_start')} - {clip.get('source_end')}"
+        )
+
     def _render_reassembly_one(self, video: dict[str, Any], output_path: Path) -> None:
-        source = self._source_video()
         temp_dir = ensure_dir(output_path.parent / "_clips")
         clip_files = []
         for idx, clip in enumerate(video.get("clips", []), start=1):
+            source, local_start, local_end = self._resolve_reassembly_clip_source(clip)
             clip_file = temp_dir / f"{video['reassembly_id']}_{idx:03d}.mp4"
             run_cmd([
                 "ffmpeg",
@@ -2647,9 +2748,9 @@ class PipelineRunner:
                 "-loglevel",
                 "error",
                 "-ss",
-                clip["source_start"],
+                seconds_to_timecode(local_start, ms=True),
                 "-to",
-                clip["source_end"],
+                seconds_to_timecode(local_end, ms=True),
                 "-i",
                 str(source),
                 "-vf",
@@ -2777,12 +2878,12 @@ class PipelineRunner:
             raise RuntimeError("render has no available videos; all candidates were blocked by cut_plan")
 
     def _render_one(self, video: dict[str, Any], output_path: Path) -> None:
-        source = self._source_video()
         temp_dir = ensure_dir(output_path.parent / "_clips")
         clip_files = []
         voice = video.get("voiceover", {})
         voiceover_enabled = bool(voice.get("enabled") and voice.get("file"))
         for idx, clip in enumerate(video.get("clips", []), start=1):
+            source, local_start, local_end = self._resolve_reassembly_clip_source(clip)
             clip_file = temp_dir / f"{video['short_video_id']}_{idx:03d}.mp4"
             vf = self._video_filter(video)
             vol = float(clip.get("original_audio_volume", 1.0))
@@ -2797,9 +2898,9 @@ class PipelineRunner:
                 "-loglevel",
                 "error",
                 "-ss",
-                clip["source_start"],
+                seconds_to_timecode(local_start, ms=True),
                 "-to",
-                clip["source_end"],
+                seconds_to_timecode(local_end, ms=True),
                 "-i",
                 str(source),
                 "-vf",

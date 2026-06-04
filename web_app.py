@@ -14,6 +14,7 @@ from datetime import datetime
 from pathlib import Path
 from threading import RLock
 from typing import Any
+from urllib.parse import quote
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
@@ -773,6 +774,12 @@ def get_task_tree(task_id: str) -> list[dict[str, Any]]:
     return files[:2000]
 
 
+def _task_file_url(task_id: str, task_dir: Path, path: Path) -> str:
+    relative = relpath(path, task_dir)
+    version = path.stat().st_mtime_ns if path.exists() else 0
+    return f"/api/tasks/{task_id}/file?path={quote(relative, safe='/')}&v={version}"
+
+
 @app.get("/api/tasks/{task_id}/file")
 def get_task_file(task_id: str, path: str):
     task_dir = _task_dir(task_id)
@@ -868,7 +875,7 @@ def latest_video(task_id: str) -> dict[str, Any]:
     return {
         "exists": True,
         "file": relpath(latest, task_dir),
-        "url": f"/api/tasks/{task_id}/file?path={relpath(latest, task_dir)}",
+        "url": _task_file_url(task_id, task_dir, latest),
     }
 
 
@@ -879,7 +886,7 @@ def list_draft_videos(task_id: str) -> list[dict[str, Any]]:
     return [
         {
             "file": relpath(path, task_dir),
-            "url": f"/api/tasks/{task_id}/file?path={relpath(path, task_dir)}",
+            "url": _task_file_url(task_id, task_dir, path),
             "name": path.name,
             "type": "highlight_reassembly_draft" if "reassembly_drafts" in path.parts else "ai_voiceover_draft",
             "size_mb": round(path.stat().st_size / 1024 / 1024, 2),

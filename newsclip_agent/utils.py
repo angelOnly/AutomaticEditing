@@ -108,17 +108,23 @@ def srt_time(seconds: float) -> str:
 
 
 def run_cmd(cmd: list[str], cwd: str | Path | None = None, timeout: int | None = None) -> subprocess.CompletedProcess:
-    return subprocess.run(
+    proc = subprocess.run(
         cmd,
         cwd=cwd,
         timeout=timeout,
-        check=True,
+        check=False,
         text=True,
         encoding="utf-8",
         errors="replace",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
+    if proc.returncode != 0:
+        stderr = (proc.stderr or "").strip()
+        stdout = (proc.stdout or "").strip()
+        details = stderr or stdout or "no command output"
+        raise RuntimeError(f"Command failed with exit code {proc.returncode}: {cmd}\n{details}")
+    return proc
 
 
 def require_exe(name: str) -> str:
