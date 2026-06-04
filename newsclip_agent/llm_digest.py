@@ -116,10 +116,18 @@ def build_chunk_flags(item: dict[str, Any]) -> list[str]:
         flags.append("archive_footage")
     if item.get("is_live_scene"):
         flags.append("live_scene")
-    if float(item.get("hook_score") or 0) >= 7:
-        flags.append("good_opening")
-    if float(item.get("visual_value_score") or item.get("visual_score") or 0) >= 7:
-        flags.append("strong_visual")
+    try:
+        if float(item.get("hook_score") or 0) >= 7:
+            flags.append("good_opening")
+    except (ValueError, TypeError):
+        pass
+    
+    try:
+        if float(item.get("visual_value_score") or item.get("visual_score") or 0) >= 7:
+            flags.append("strong_visual")
+    except (ValueError, TypeError):
+        pass
+        
     if item.get("visible_people") or item.get("people"):
         flags.append("people_visible")
     return flags

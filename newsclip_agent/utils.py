@@ -68,7 +68,7 @@ def output_hash(paths: list[str | Path]) -> str:
     for path in paths:
         p = Path(path)
         if p.exists() and p.is_file():
-            data.append({"path": str(p), "sha256": file_hash(p), "size": p.stat().st_size})
+            data.append({"name": p.name, "sha256": file_hash(p), "size": p.stat().st_size})
     return stable_hash(data)
 
 

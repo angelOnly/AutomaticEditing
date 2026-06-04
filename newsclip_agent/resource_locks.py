@@ -39,11 +39,24 @@ def file_slot_lock(name: str, slots: int = 1, poll_seconds: float = 1.0, stale_a
 
 
 def _remove_stale_lock(path: Path, stale_after_seconds: float) -> None:
+    is_dead = False
+    try:
+        content = path.read_text(encoding="utf-8").splitlines()
+        if content:
+            pid = int(content[0].strip())
+            try:
+                os.kill(pid, 0)
+            except OSError:
+                is_dead = True
+    except Exception:
+        pass
+
     try:
         age = time.time() - path.stat().st_mtime
     except FileNotFoundError:
         return
-    if age < stale_after_seconds:
+        
+    if not is_dead and age < stale_after_seconds:
         return
     try:
         path.unlink()

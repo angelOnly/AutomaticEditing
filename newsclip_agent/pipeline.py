@@ -391,17 +391,8 @@ class PipelineRunner:
 
     def _resolve_selected_steps(self) -> list[str]:
         step_order = self._active_step_order()
-        if self.options.rerun and self.options.rerun_from:
-            raise ValueError("--rerun 与 --rerun-from 不能同时使用")
-        if self.options.rerun:
-            if self.options.rerun not in step_order:
-                raise ValueError(f"未知步骤: {self.options.rerun}")
-            selected = [self.options.rerun]
-        elif self.options.rerun_from:
-            if self.options.rerun_from not in step_order:
-                raise ValueError(f"未知步骤: {self.options.rerun_from}")
-            selected = step_order[step_order.index(self.options.rerun_from) :]
-        elif self.options.common_only:
+        
+        if self.options.common_only:
             common_steps = [
                 "metadata",
                 "audio_extract",
@@ -412,7 +403,18 @@ class PipelineRunner:
                 "timeline",
                 "timeline_digest",
             ]
-            selected = [step for step in common_steps if step in step_order]
+            step_order = [step for step in common_steps if step in step_order]
+
+        if self.options.rerun and self.options.rerun_from:
+            raise ValueError("--rerun 与 --rerun-from 不能同时使用")
+        if self.options.rerun:
+            if self.options.rerun not in step_order:
+                raise ValueError(f"未知步骤: {self.options.rerun}")
+            selected = [self.options.rerun]
+        elif self.options.rerun_from:
+            if self.options.rerun_from not in step_order:
+                raise ValueError(f"未知步骤: {self.options.rerun_from}")
+            selected = step_order[step_order.index(self.options.rerun_from) :]
         else:
             selected = step_order
 
@@ -549,6 +551,69 @@ class PipelineRunner:
                 entry["status"] = "stale"
                 entry["reason"] = f"upstream {step} updated"
 
+    def _update_step_progress(self, step: str, message: str, extra: dict[str, Any] | None = None) -> None:
+        data = {
+            "step_name": step,
+            "status": "running",
+            "updated_at": now_iso(),
+            "can_rerun": False,
+            "message": message,
+        }
+        if extra:
+            data.update(extra)
+        self.manifest.setdefault("steps", {}).setdefault(step, {}).update(data)
+        self._save_manifest()
+
+    def _cut_audio_segment(self, audio: Path, out: Path, start: float, end: float) -> None:
+        ensure_dir(out.parent)
+        run_cmd([
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-ss", str(max(0.0, start)),
+            "-to", str(max(start, end)),
+            "-i", str(audio),
+            "-ac", "1",
+            "-ar", "16000",
+            str(out),
+        ])
+
+    def _asr_windows_from_chunks(self, audio_duration: float | None = None) -> list[dict[str, Any]]:
+        funasr_cfg = self.config.funasr
+        segment_seconds = float(funasr_cfg.get("segment_seconds", 60))
+        overlap = float(funasr_cfg.get("segment_overlap_seconds", 0))
+        max_segment_seconds = float(funasr_cfg.get("max_segment_seconds", 90))
+        segment_seconds = min(segment_seconds, max_segment_seconds)
+
+        try:
+            chunks = self._load_step_json("chunk_build").get("chunks", [])
+        except Exception:
+            chunks = []
+
+        if chunks:
+            windows = []
+            for chunk in chunks:
+                start = float(chunk.get("start", 0))
+                end = float(chunk.get("end", start))
+                if end <= start:
+                    continue
+                windows.append({
+                    "id": chunk.get("chunk_id") or f"asr_{len(windows)+1:04d}",
+                    "start": max(0.0, start - overlap),
+                    "end": end + overlap,
+                    "chunk_id": chunk.get("chunk_id", ""),
+                })
+            return windows
+
+        if not audio_duration:
+            return [{"id": "asr_0001", "start": 0.0, "end": 0.0, "chunk_id": ""}]
+
+        windows = []
+        t = 0.0
+        while t < audio_duration:
+            end = min(audio_duration, t + segment_seconds)
+            windows.append({"id": f"asr_{len(windows)+1:04d}", "start": t, "end": end, "chunk_id": ""})
+            t = max(end - overlap, end)
+        return windows
+
     def step_metadata(self) -> None:
         source = self._source_video()
         input_hash = stable_hash({"source": str(source), "size": source.stat().st_size, "mtime": source.stat().st_mtime})
@@ -567,7 +632,7 @@ class PipelineRunner:
 
     def step_audio_extract(self) -> None:
         source = self._source_video()
-        input_hash = stable_hash({"source": self._step_output("metadata"), "audio": "mono_16k_wav"})
+        input_hash = stable_hash({"source": self._step_content_hash("metadata"), "audio": "mono_16k_wav"})
         if self._can_reuse("audio_extract", input_hash):
             print("复用缓存: audio_extract")
             return
@@ -582,7 +647,7 @@ class PipelineRunner:
     def step_frame_extract(self) -> None:
         source = self._source_video()
         interval = 1 if self.options.mode == "dense" else self.options.frame_interval
-        input_hash = stable_hash({"source": self._step_output("metadata"), "interval": interval})
+        input_hash = stable_hash({"source": self._step_content_hash("metadata"), "interval": interval})
         if self._can_reuse("frame_extract", input_hash):
             print("复用缓存: frame_extract")
             return
@@ -607,7 +672,7 @@ class PipelineRunner:
         metadata = self._load_step_json("metadata")
         frames = self._load_step_json("frame_extract")
         chunk_seconds = self.options.chunk_seconds
-        input_hash = stable_hash({"metadata": metadata.get("duration"), "frames": self._step_version("frame_extract"), "chunk_seconds": chunk_seconds})
+        input_hash = stable_hash({"metadata": metadata.get("duration"), "frames": self._step_content_hash("frame_extract"), "chunk_seconds": chunk_seconds})
         if self._can_reuse("chunk_build", input_hash):
             print("复用缓存: chunk_build")
             return
@@ -634,32 +699,115 @@ class PipelineRunner:
 
     def step_asr(self) -> None:
         audio = self.task_dir / self._step_output("audio_extract")
-        input_hash = stable_hash({"audio": self._step_output("audio_extract"), "funasr": self.config.funasr})
+        input_hash = stable_hash({
+            "audio": self._step_content_hash("audio_extract"),
+            "funasr": self.config.funasr,
+            "mode": "segmented_asr_v1",
+            "windows": self._asr_windows_from_chunks(),
+        })
         if self._can_reuse("asr", input_hash):
             print("复用缓存: asr")
             return
+
         version, vdir = self._version_dir("asr", "asr")
         ensure_dir(vdir)
         write_json(vdir / "input.json", {"audio": relpath(audio, self.task_dir), "config": self.config.funasr})
+
+        all_segments: list[dict[str, Any]] = []
+        full_text_parts: list[str] = []
+        raw_results: list[dict[str, Any]] = []
+        err = ""
+        out = vdir / "asr_segments.json"
+
         try:
             asr_slots = int(self.config.raw.get("gpu_limits", {}).get("asr_slots", 1))
+            windows = self._asr_windows_from_chunks()
+
+            self._update_step_progress("asr", "等待 ASR GPU 锁", {
+                "total_segments": len(windows),
+                "processed_segments": 0,
+            })
+            print("ASR: waiting gpu slot...", flush=True)
+
             with file_slot_lock("asr", slots=asr_slots):
+                self._update_step_progress("asr", "加载 FunASR 模型", {
+                    "total_segments": len(windows),
+                    "processed_segments": 0,
+                })
+                print("ASR: loading FunASR model...", flush=True)
                 engine = self._get_asr_engine()
-                result = engine.transcribe(str(audio))
-            if not result.get("success"):
-                raise RuntimeError(result.get("error") or "FunASR failed")
-            segments = self._normalize_asr_segments(result.get("segments", []), result.get("text", ""))
-            asr = {"language": "zh", "segments": segments, "full_text": result.get("text", ""), "raw_result": result}
+
+                for index, window in enumerate(windows, start=1):
+                    wid = str(window["id"])
+                    start = float(window["start"])
+                    end = float(window["end"])
+                    seg_audio = vdir / "segments_audio" / f"{wid}.wav"
+
+                    self._update_step_progress("asr", f"切分音频 {index}/{len(windows)}", {
+                        "current_segment": wid,
+                        "processed_segments": index - 1,
+                        "total_segments": len(windows),
+                        "current_range": [start, end],
+                    })
+                    self._cut_audio_segment(audio, seg_audio, start, end)
+
+                    self._update_step_progress("asr", f"FunASR 转写中 {index}/{len(windows)}", {
+                        "current_segment": wid,
+                        "processed_segments": index - 1,
+                        "total_segments": len(windows),
+                        "current_range": [start, end],
+                    })
+                    print(f"ASR: transcribing {wid} {index}/{len(windows)} {start:.1f}-{end:.1f}s", flush=True)
+
+                    result = engine.transcribe(str(seg_audio))
+                    raw_results.append({"id": wid, "range": [start, end], "result": result})
+
+                    if not result.get("success"):
+                        raise RuntimeError(f"{wid} ASR failed: {result.get('error')}")
+
+                    full_text_parts.append(result.get("text", ""))
+                    for seg in result.get("segments", []):
+                        local_start = float(seg.get("start") or 0)
+                        local_end = float(seg.get("end") or 0)
+                        text = str(seg.get("text") or "").strip()
+                        if not text:
+                            continue
+                        all_segments.append({
+                            "start": start + local_start,
+                            "end": start + local_end if local_end > 0 else end,
+                            "text": text,
+                            "asr_segment_id": wid,
+                            "chunk_id": window.get("chunk_id", ""),
+                        })
+
+                    self._update_step_progress("asr", f"FunASR 已完成 {index}/{len(windows)}", {
+                        "current_segment": wid,
+                        "processed_segments": index,
+                        "total_segments": len(windows),
+                    })
+
+            full_text = " ".join(x for x in full_text_parts if x).strip()
+            segments = self._normalize_asr_segments(all_segments, full_text)
+            asr = {
+                "language": "zh",
+                "segments": segments,
+                "full_text": full_text,
+                "raw_result": {
+                    "mode": "segmented_asr_v1",
+                    "segment_count": len(windows),
+                    "results": raw_results,
+                },
+            }
             out = write_json(vdir / "asr_segments.json", asr)
             write_text(vdir / "full_text.txt", asr["full_text"])
             status = "success"
-            err = ""
         except Exception as exc:
-            asr = {"language": "zh", "segments": [], "full_text": "", "error": str(exc)}
+            err = str(exc)
+            asr = {"language": "zh", "segments": [], "full_text": "", "error": err, "raw_result": raw_results}
             out = write_json(vdir / "asr_segments.json", asr)
             write_text(vdir / "full_text.txt", "")
             status = "failed"
-            err = str(exc)
+
         step_status = self._base_status("asr", version, input_hash, [out])
         if err:
             step_status["error"] = err
@@ -667,7 +815,7 @@ class PipelineRunner:
         self._record_step(step="asr", version=version, status=status, output=relpath(out, self.task_dir), input_hash=input_hash, output_files=[out])
         if status != "success":
             raise RuntimeError(f"ASR 失败: {err}")
-        print("完成: asr")
+        print("完成: asr", flush=True)
 
     def _get_asr_engine(self):
         if self._asr_engine is not None:
@@ -695,8 +843,8 @@ class PipelineRunner:
         fallback = llm_cfg.get(f"vision_{provider}_fallback_models", [])
         prompt_version = self.options.prompt_version or "vision_chunk_v1"
         base_input_hash = stable_hash({
-            "chunks": self._step_version("chunk_build"),
-            "asr": self._step_version("asr"),
+            "chunks": self._step_content_hash("chunk_build"),
+            "asr": self._step_content_hash("asr"),
             "model": model,
             "fallback": fallback,
             "prompt_version": prompt_version,
@@ -831,7 +979,11 @@ class PipelineRunner:
         asr = self._load_step_json("asr")
         vision = self._load_step_json("vision")
         chunks = self._load_step_json("chunk_build")
-        input_hash = stable_hash({"asr": self._step_version("asr"), "vision": self._step_version("vision"), "chunks": self._step_version("chunk_build")})
+        input_hash = stable_hash({
+            "asr": self._step_content_hash("asr"),
+            "vision": self._step_content_hash("vision"),
+            "chunks": self._step_content_hash("chunk_build"),
+        })
         if self._can_reuse("timeline", input_hash):
             print("复用缓存: timeline")
             return
@@ -861,7 +1013,7 @@ class PipelineRunner:
                 "risk_tags": vr.get("risk_tags", []),
                 "notes": vr.get("notes", ""),
             })
-        out = write_json(vdir / "merged_timeline.json", {"timeline": timeline, "source_versions": {"asr": self._step_version("asr"), "vision": self._step_version("vision")}})
+        out = write_json(vdir / "merged_timeline.json", {"timeline": timeline, "source_versions": {"asr": self._step_content_hash("asr"), "vision": self._step_content_hash("vision")}})
         self._write_status(vdir, self._base_status("timeline", version, input_hash, [out]))
         self._record_step(step="timeline", version=version, status="success", output=relpath(out, self.task_dir), input_hash=input_hash, output_files=[out])
         print("完成: timeline")
@@ -871,9 +1023,13 @@ class PipelineRunner:
         timeline = timeline_data.get("timeline", [])
         llm_input_cfg = self.config.raw.get("llm_input", {})
         digest_version = "llm_timeline_digest_v1"
-        input_hash = stable_hash({"timeline": self._step_version("timeline"), "digest_version": digest_version, "llm_input": llm_input_cfg})
+        input_hash = stable_hash({
+            "timeline": self._step_content_hash("timeline"),
+            "digest_version": digest_version,
+            "llm_input": llm_input_cfg,
+        })
         if self._can_reuse("timeline_digest", input_hash):
-            print("澶嶇敤缂撳瓨: timeline_digest")
+            print("复用缓存: timeline_digest")
             return
         version, vdir = self._version_dir("timeline_digest", "timeline")
         ensure_dir(vdir)
@@ -895,14 +1051,14 @@ class PipelineRunner:
             })
         output = {
             "version": digest_version,
-            "source_versions": {"timeline": self._step_version("timeline")},
+            "source_versions": {"timeline": self._step_content_hash("timeline")},
             "video_duration_seconds": max((float(x.get("end_seconds") or 0) for x in chunks), default=0.0),
             "chunks": chunks,
         }
         out = write_json(vdir / "llm_timeline_digest.json", output)
         self._write_status(vdir, self._base_status("timeline_digest", version, input_hash, [out]))
         self._record_step(step="timeline_digest", version=version, status="success", output=relpath(out, self.task_dir), input_hash=input_hash, output_files=[out], extra={"summary": {"chunks": len(chunks)}})
-        print("瀹屾垚: timeline_digest")
+        print("完成: timeline_digest")
 
     def step_content_analysis(self) -> None:
         result = self._run_text_agent("content_analysis", {
@@ -1000,7 +1156,7 @@ class PipelineRunner:
 
     def _write_compat_agent_output(self, step: str, output: dict[str, Any], source_step: str) -> None:
         base, out_name, _prompt, prompt_version = AGENT_INFO[step]
-        input_hash = stable_hash({"compat_source_step": source_step, "compat_source_version": self._step_version(source_step), "output": output})
+        input_hash = stable_hash({"compat_source_step": source_step, "compat_source_version": self._step_content_hash(source_step), "output": output})
         version, vdir = self._version_dir(step, base)
         ensure_dir(vdir)
         write_json(vdir / "model_output.json", output)
@@ -1109,7 +1265,7 @@ class PipelineRunner:
         output_mode = getattr(options, "output_mode", "single")
         if output_mode == "multiple":
             normalized = dict(edit_plan)
-            max_count = max(2, min(int(getattr(options, "max_output_videos", 5) or 5), 10))
+            max_count = max(2, min(int(getattr(options, "max_output_videos", 5) or 5), 5))
             normalized["scripts"] = scripts[:max_count]
             normalized["recommended_video_count"] = len(normalized["scripts"])
             normalized["auto_merge_applied"] = False
@@ -1652,8 +1808,8 @@ class PipelineRunner:
         }
         voice_config = self._resolve_voice_config()
         input_hash = stable_hash({
-            "voiceover": self._step_version("voiceover_script"),
-            "editing": self._step_version("editing_script"),
+            "voiceover": self._step_content_hash("voiceover_script"),
+            "editing": self._step_content_hash("editing_script"),
             "voice_config": {
                 "voice_id": voice_config.get("voice_id"),
                 "reference_audio": voice_config.get("reference_audio"),
@@ -2003,8 +2159,8 @@ class PipelineRunner:
         tts = self._load_optional_step_json("tts", {"outputs": []})
         scripts = voiceover.get("scripts", []) if isinstance(voiceover, dict) else []
         input_hash = stable_hash({
-            "voiceover": self._step_version("voiceover_script"),
-            "tts": self._step_version("tts"),
+            "voiceover": self._step_content_hash("voiceover_script"),
+            "tts": self._step_content_hash("tts"),
             "subtitle_config": self._subtitle_config(),
             "aspect_ratio": self.options.aspect_ratio,
         })
@@ -2041,9 +2197,9 @@ class PipelineRunner:
         tts = self._load_optional_step_json("tts", {"outputs": []})
         subtitles = self._load_optional_step_json("subtitles", {"outputs": []})
         input_hash = stable_hash({
-            "editing": self._step_version("editing_script"),
-            "tts": self._step_version("tts"),
-            "subtitles": self._step_version("subtitles"),
+            "editing": self._step_content_hash("editing_script"),
+            "tts": self._step_content_hash("tts"),
+            "subtitles": self._step_content_hash("subtitles"),
             "aspect": self.options.aspect_ratio,
             "target_duration_seconds": self.options.target_duration_seconds,
             "allow_long_video": self.options.allow_long_video,
@@ -2332,7 +2488,7 @@ class PipelineRunner:
     def step_reassembly_cut_plan(self) -> None:
         plan = self._load_step_json("highlight_reassembly_plan")
         input_hash = stable_hash({
-            "highlight_reassembly_plan": self._step_version("highlight_reassembly_plan"),
+            "reassembly_cut_plan": self._step_content_hash("highlight_reassembly_plan"),
             "aspect": self.options.aspect_ratio,
             "reassembly_options": self._reassembly_options_payload(),
         })
@@ -2445,7 +2601,7 @@ class PipelineRunner:
 
     def _step_reassembly_render_impl(self) -> None:
         plan = self._load_step_json("reassembly_cut_plan")
-        input_hash = stable_hash({"reassembly_cut_plan": self._step_version("reassembly_cut_plan")})
+        input_hash = stable_hash({"reassembly_cut_plan": self._step_content_hash("reassembly_cut_plan")})
         if self._can_reuse("reassembly_render", input_hash):
             print("reuse cache: reassembly_render")
             return
@@ -2568,7 +2724,7 @@ class PipelineRunner:
 
     def _step_render_impl(self) -> None:
         plan = self._load_step_json("cut_plan")
-        input_hash = stable_hash({"cut_plan": self._step_version("cut_plan")})
+        input_hash = stable_hash({"cut_plan": self._step_content_hash("cut_plan")})
         if self._can_reuse("render", input_hash):
             print("复用缓存: render")
             return
@@ -3002,6 +3158,9 @@ class PipelineRunner:
     def _step_version(self, step: str) -> str:
         return self.manifest.get("current_versions", {}).get(step, "")
 
+    def _step_content_hash(self, step: str) -> str:
+        return self.manifest.get("steps", {}).get(step, {}).get("output_hash", "")
+
     def _step_output(self, step: str) -> str:
         out = self.manifest.get("steps", {}).get(step, {}).get("output")
         if not out:
@@ -3047,7 +3206,7 @@ class PipelineRunner:
         return selected
 
     def _apply_manual_override(self, version_dir: Path, model_output: dict[str, Any], step: str, target_id: str) -> dict[str, Any]:
-        override_path = self.task_dir / step / self._step_version(step) / target_id / "manual_override.json"
+        override_path = self.task_dir / step / self.manifest.get("current_versions", {}).get(step, "") / target_id / "manual_override.json"
         return self._merge_manual(model_output, read_json(override_path, {}))
 
     def _merge_manual(self, model_output: Any, override: dict[str, Any]) -> Any:
@@ -3116,7 +3275,7 @@ def parse_args(argv: list[str] | None = None) -> RunOptions:
     if args.output_mode == "single":
         args.max_output_videos = 1
     else:
-        args.max_output_videos = max(2, min(int(args.max_output_videos or 5), 10))
+        args.max_output_videos = max(2, min(int(args.max_output_videos or 5), 5))
     if args.production_mode == "highlight_reassembly":
         args.audio_policy = "original"
         args.skip_tts = True

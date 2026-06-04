@@ -55,6 +55,13 @@ enabled = true
 # 音频转文字
 [funasr]
 asr_model_path = "models/iic"
+device = "cuda:0"
+segment_seconds = 60
+segment_overlap_seconds = 1.0
+max_segment_seconds = 90
+startup_check = true
+startup_smoke_test = false
+smoke_test_seconds = 3
 
 # 工作流与网页默认配置
 [workflow]
@@ -150,7 +157,7 @@ blur = 0
 box_padding_chars = 0
 
 [web_concurrency]
-max_running_jobs = 3
+max_running_jobs = 4
 max_pending_jobs = 20
 same_task_policy = "reject"
 

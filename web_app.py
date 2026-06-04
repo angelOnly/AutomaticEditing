@@ -744,6 +744,16 @@ def get_manifest(task_id: str) -> dict[str, Any]:
             },
         }
     _hydrate_manifest_options(task_dir, manifest)
+    
+    job_status = _active_job_status_for_task(task_id)
+    if manifest.get("status") == "running" and job_status != "running":
+        manifest["status"] = "failed"
+        manifest["user_message"] = "任务意外终止或后台服务已重启。"
+        try:
+            write_json(task_dir / "manifest.json", manifest)
+        except Exception:
+            pass
+
     return manifest
 
 
@@ -800,11 +810,12 @@ def list_source_videos(task_id: str) -> list[dict[str, Any]]:
         if pending_previews:
             return pending_previews
     if source:
+        source_url = f"/api/tasks/{task_id}/file?path={source}" if (task_dir / source).exists() else ""
         sources.append(
             {
                 "label": "拼接原片" if manifest.get("source_mode") == "multi_source_concat_proxy" else "原片",
                 "file": source,
-                "url": f"/api/tasks/{task_id}/file?path={source}",
+                "url": source_url,
                 "source_index": 0,
                 "source_type": "concat" if manifest.get("source_mode") == "multi_source_concat_proxy" else "single",
             }
@@ -813,7 +824,7 @@ def list_source_videos(task_id: str) -> list[dict[str, Any]]:
         if not isinstance(item, dict):
             continue
         file_ref = item.get("normalized_file") or ""
-        url = f"/api/tasks/{task_id}/file?path={file_ref}" if file_ref else ""
+        url = f"/api/tasks/{task_id}/file?path={file_ref}" if file_ref and (task_dir / file_ref).exists() else ""
         original = item.get("original_path") or ""
         if not url and original:
             try:
@@ -959,6 +970,8 @@ def run_pipeline(req: RunRequest) -> dict[str, Any]:
             task_id = _resolve_run_task_id(req)
         task_id = _with_mode_suffix(task_id, req.production_mode)
         task_dir = ensure_dir(OUTPUTS_DIR / task_id)
+        if (task_dir / "input" / "source_request.json").exists():
+            source_request_path = task_dir / "input" / "source_request.json"
     if req.remote_video:
         write_json(
             task_dir / "remote_source.json",
@@ -1112,12 +1125,15 @@ def _terminate_process_tree(pid: int) -> None:
     if pid <= 0:
         return
     if os.name == "nt":
-        subprocess.run(
-            ["taskkill", "/PID", str(pid), "/T", "/F"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        except Exception:
+            pass
         return
     try:
         os.killpg(pid, signal.SIGTERM)
@@ -1345,6 +1361,10 @@ def cancel_job(job_id: str) -> dict[str, Any]:
         process = job.get("process")
         if process:
             try:
+                process.terminate()
+            except Exception:
+                pass
+            try:
                 process.wait(timeout=3)
             except Exception:
                 pass
@@ -1570,7 +1590,7 @@ def _normalize_output_options(req: RunRequest) -> None:
     if req.output_mode == "single":
         req.max_output_videos = 1
     else:
-        req.max_output_videos = max(2, min(int(req.max_output_videos or 5), 10))
+        req.max_output_videos = max(2, min(int(req.max_output_videos or 5), 5))
     req.min_output_video_seconds = max(5, int(req.min_output_video_seconds or 30))
     req.max_output_video_seconds = max(req.min_output_video_seconds, int(req.max_output_video_seconds or 90))
     if req.production_mode == "highlight_reassembly":

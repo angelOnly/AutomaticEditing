@@ -83,6 +83,9 @@ def _sync_common_progress_to_child(
         if common_manifest.get(key):
             child_manifest[key] = common_manifest[key]
 
+    if "current_versions" in common_manifest:
+        child_manifest.setdefault("current_versions", {}).update(common_manifest["current_versions"])
+
     if common_manifest.get("status") == "failed":
         child_manifest["status"] = "failed"
         child_manifest["user_message"] = common_manifest.get("user_message", "")
@@ -153,7 +156,7 @@ def main(argv: list[str] | None = None) -> int:
                 task_dir=task_dir,
                 request=request,
             )
-            _ensure_common_analysis(common_dir=common_dir, request=request, args=args)
+            _ensure_common_analysis(common_dir=common_dir, request=request, args=args, passthrough=passthrough)
             _sync_common_progress_to_child(
                 common_dir=common_dir,
                 task_dir=task_dir,
@@ -222,12 +225,23 @@ def _append_common_log(common_dir: Path, message: str) -> None:
         f.write(f"[{timestamp}] {message}\n")
 
 
-def _ensure_common_analysis(*, common_dir: Path, request: dict[str, Any], args: argparse.Namespace) -> None:
+def _ensure_common_analysis(*, common_dir: Path, request: dict[str, Any], args: argparse.Namespace, passthrough: list[str]) -> None:
     ensure_dir(common_dir)
     ensure_dir(common_dir / "web_jobs")
     lock_name = f"common_source_{common_dir.name}"
+    
+    rerun = ""
+    rerun_from = ""
+    for index, item in enumerate(passthrough):
+        if item == "--rerun" and index + 1 < len(passthrough):
+            rerun = passthrough[index + 1]
+        if item == "--rerun-from" and index + 1 < len(passthrough):
+            rerun_from = passthrough[index + 1]
+            
+    force_rerun_common = bool(rerun in COMMON_REUSABLE_STEPS or rerun_from in COMMON_REUSABLE_STEPS)
+    
     with file_slot_lock(lock_name, slots=1):
-        if _common_analysis_ready(common_dir):
+        if not force_rerun_common and _common_analysis_ready(common_dir):
             print(f"Reuse common analysis outputs: {common_dir}")
             _append_common_log(common_dir, "reuse common analysis outputs")
             return
@@ -275,6 +289,11 @@ def _ensure_common_analysis(*, common_dir: Path, request: dict[str, Any], args: 
             "ai_voiceover",
             "--common-only",
         ]
+        
+        if rerun and rerun in COMMON_REUSABLE_STEPS:
+            pipeline_args.extend(["--rerun", rerun])
+        if rerun_from and rerun_from in COMMON_REUSABLE_STEPS:
+            pipeline_args.extend(["--rerun-from", rerun_from])
         try:
             _append_common_log(common_dir, "run common pipeline: " + " ".join(map(str, pipeline_args)))
             result = pipeline_main(pipeline_args)
@@ -298,7 +317,7 @@ def _common_analysis_ready(common_dir: Path) -> bool:
 
 def _copy_common_outputs_to_task(*, common_dir: Path, task_dir: Path, request: dict[str, Any]) -> None:
     ensure_dir(task_dir)
-    copied_dirs = ["input", "metadata", "preprocess", "asr", "vision", "timeline"]
+    copied_dirs = ["input", "preprocess"] + COMMON_REUSABLE_STEPS
     for name in copied_dirs:
         src = common_dir / name
         if not src.exists():
@@ -326,6 +345,9 @@ def _copy_common_outputs_to_task(*, common_dir: Path, task_dir: Path, request: d
         if key in common_manifest:
             manifest[key] = common_manifest[key]
 
+    if "current_versions" in common_manifest:
+        manifest.setdefault("current_versions", {}).update(common_manifest["current_versions"])
+
     manifest["reused_common_steps"] = COMMON_REUSABLE_STEPS
     manifest.setdefault("steps", {})
 
@@ -351,6 +373,34 @@ def _run_mode_specific_pipeline(
     start_step = "video_understanding" if production_mode == "highlight_reassembly" else "content_analysis"
     source_video = _resolve_task_manifest_path(task_dir, "source_video")
     source_manifest = _resolve_task_manifest_path(task_dir, "source_manifest")
+    rerun = None
+    rerun_from = None
+    for i, arg in enumerate(passthrough):
+        if arg == "--rerun" and i + 1 < len(passthrough):
+            rerun = passthrough[i + 1]
+        elif arg == "--rerun-from" and i + 1 < len(passthrough):
+            rerun_from = passthrough[i + 1]
+            
+    child_rerun_args = []
+    if rerun and rerun not in COMMON_REUSABLE_STEPS:
+        child_rerun_args.extend(["--rerun", rerun])
+    if rerun_from:
+        if rerun_from not in COMMON_REUSABLE_STEPS:
+            child_rerun_args.extend(["--rerun-from", rerun_from])
+        else:
+            # If rerun_from is in common steps, the common pipeline already reran it.
+            # Downstream common steps were marked stale. We should force the child
+            # pipeline to rerun from its start step so that it picks up the new common outputs.
+            child_rerun_args.extend(["--rerun-from", start_step])
+            
+    # If the user requested to rerun a single common step, the common pipeline reran it.
+    # The child pipeline needs to rerun from its start_step to pick up the changes.
+    if rerun and rerun in COMMON_REUSABLE_STEPS:
+        child_rerun_args.extend(["--rerun-from", start_step])
+            
+    # Note: If no rerun options are provided, we do NOT force `--rerun-from start_step`.
+    # This allows normal resuming of child steps.
+    
     pipeline_args = [
         "--task-id",
         args.task_id,
@@ -360,8 +410,7 @@ def _run_mode_specific_pipeline(
         str(source_manifest),
         "--aspect-ratio",
         str(request.get("aspect_ratio") or args.aspect_ratio),
-        "--rerun-from",
-        start_step,
+        *child_rerun_args,
         *_strip_passthrough_rerun(passthrough),
     ]
     return pipeline_main(pipeline_args)

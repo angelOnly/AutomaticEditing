@@ -37,6 +37,23 @@ def build_multi_source_video(
     concat_file = input_dir / "concat_sources.txt"
     manifest_file = input_dir / "source_manifest.json"
 
+    from .utils import stable_hash, read_json
+    input_hash = stable_hash({
+        "sources": [{"id": s.source_id, "path": str(s.path.resolve()), "mtime": s.path.stat().st_mtime if s.path.exists() else 0} for s in sources],
+        "aspect_ratio": aspect_ratio,
+        "fps": fps,
+        "sample_rate": sample_rate,
+    })
+
+    if manifest_file.exists() and output_video.exists():
+        old_manifest = read_json(manifest_file, {})
+        if old_manifest.get("input_hash") == input_hash:
+            return {
+                "input_video": output_video,
+                "source_manifest": manifest_file,
+                "manifest": old_manifest,
+            }
+
     timeline_sources: list[dict[str, Any]] = []
     normalized_files: list[Path] = []
     cursor = 0.0
@@ -149,6 +166,7 @@ def build_multi_source_video(
 
     output_meta = ffprobe_json(output_video)
     manifest = {
+        "input_hash": input_hash,
         "source_mode": "multi_source_concat_proxy",
         "source_count": len(sources),
         "source_video": relpath(output_video, task_dir),

@@ -1,4 +1,4 @@
-﻿const AI_VOICEOVER_STEPS = [
+const AI_VOICEOVER_STEPS = [
   "source_prepare",
   "metadata",
   "audio_extract",
@@ -815,6 +815,12 @@ async function loadTasks() {
       child.addEventListener("click", async (event) => {
         event.stopPropagation();
         state.selectedTask = task.task_id;
+        if (state.activeJob) {
+          state.activeJob = null;
+          state.activeJobStatus = null;
+          updateUI();
+          updateStopJobButton();
+        }
         state.selectedVideo = null;
         state.selectedRemoteVideo = null;
         state.sourceBasket = [];
@@ -896,7 +902,7 @@ function taskChildStatus(task) {
   if (jobStatus === "cancelled") return { label: "已取消", detail, className: "cancelled" };
   if (failed > 0) return { label: "失败", detail, className: "failed" };
   if (total > 0 && done >= total) return { label: "成功", detail: `${done}/${total}`, className: "success" };
-  if (done > 0) return { label: "进行中", detail, className: "running" };
+  if (done > 0) return { label: "已中断", detail, className: "cancelled" };
   return { label: "未开始", detail: total ? `${done}/${total}` : "等待启动", className: "pending" };
 }
 
@@ -952,7 +958,6 @@ async function deleteVideo(video) {
     await loadVideos();
   });
 }
-
 async function deleteTask(task) {
   if (!confirm(`确定删除任务及其全部输出？\n${displayTaskId(task.task_id)}`)) return;
   await runListDelete(async () => {
@@ -960,6 +965,9 @@ async function deleteTask(task) {
     if (state.selectedTask === task.task_id) {
       state.selectedTask = null;
       state.manifest = null;
+      state.activeJob = null;
+      state.activeJobStatus = null;
+      updateUI();
       clearTaskPanels();
       $("activeTitle").textContent = "请选择视频或任务";
     }
@@ -1311,6 +1319,7 @@ function renderManifest() {
     else if (renderStatus === "skipped") $("metricJob").textContent = "已完成，未生成粗剪";
     else if (done >= activeSteps.length) $("metricJob").textContent = "已完成";
   }
+  updateStopJobButton();
 }
 
 function updateProgress(done, total, completed = 0, skipped = 0, failed = 0) {
@@ -1448,9 +1457,14 @@ async function adoptRunningJob(taskId) {
   if (!taskId || state.activeJob) return;
   const jobs = await api("/api/jobs").catch(() => []);
   const job = jobs.find((item) => item.task_id === taskId && ["pending", "running"].includes(item.status));
-  if (!job) return;
+  if (!job) {
+    updateUI(); // ensure UI is updated even if no job is found
+    return;
+  }
   state.activeJob = job.job_id;
+  state.activeJobStatus = job;
   setRunControlsBusy(false);
+  updateUI();
   $("metricJob").textContent = jobStatusLabel(job.status);
   startJobPolling();
   await refreshLog().catch(() => {});

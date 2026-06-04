@@ -7,8 +7,15 @@ FunASREngine - FunASR 语音转文字引擎封装
 import os
 import time
 import torch
-from loguru import logger
+import logging
 
+logger = logging.getLogger("FunASREngine")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
 class FunASREngine:
     """FunASR 引擎封装，支持动态 GPU/CPU 切换"""
 
@@ -41,6 +48,13 @@ class FunASREngine:
 
         logger.info(f"FunASREngine initialized. Model: {model_name}, Default device: {device}")
 
+    def _assert_model_path(self, path: str, label: str):
+        if not path:
+            raise FileNotFoundError(f"{label} path is empty")
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"{label} not found: {path}")
+        logger.info(f"{label}: {path}")
+
     def _load_model(self, device=None):
         """加载或重新加载模型到指定设备"""
         target_device = device or self.default_device
@@ -57,6 +71,14 @@ class FunASREngine:
         start_time = time.time()
 
         try:
+            logger.info(f"Resolved ASR model: {self.model_name}")
+            logger.info(f"Resolved VAD model: {self.vad_model_name}")
+            logger.info(f"Resolved PUNC model: {self.punc_model_name}")
+
+            self._assert_model_path(self.model_name, "asr_model")
+            self._assert_model_path(self.vad_model_name, "vad_model")
+            self._assert_model_path(self.punc_model_name, "punc_model")
+
             from funasr import AutoModel
 
             self._model = AutoModel(
@@ -114,7 +136,9 @@ class FunASREngine:
 
         try:
             # 加载模型
+            logger.info("FunASR transcribe: loading model...")
             self._load_model(device)
+            logger.info("FunASR transcribe: model loaded, start generate...")
             result['device'] = self.current_device
 
             start_time = time.time()
@@ -125,6 +149,7 @@ class FunASREngine:
                 batch_size_s=batch_size_s,
                 language=language,
             )
+            logger.info("FunASR transcribe: generate finished")
 
             elapsed = time.time() - start_time
             result['elapsed'] = round(elapsed, 2)
