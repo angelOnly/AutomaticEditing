@@ -32,6 +32,7 @@ from newsclip_agent.remote_ucms import (
 )
 from newsclip_agent.utils import ensure_dir, read_json, relpath, write_json
 from newsclip_agent.tts_omnivoice import generate_omnivoice_audio
+from newsclip_agent.job_store import JobStore
 
 
 ROOT = Path(__file__).resolve().parent
@@ -48,6 +49,11 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 JOBS: dict[str, dict[str, Any]] = {}
 JOB_LOCK = RLock()
 PENDING_JOB_IDS: deque[str] = deque()
+JOB_STORE = JobStore(OUTPUTS_DIR / ".jobs")
+for job_id, job in JOB_STORE.load_jobs().items():
+    JOBS[job_id] = job
+    if job.get("status") == "pending":
+        PENDING_JOB_IDS.append(job_id)
 PROJECT_CONFIG = load_config(ROOT / "config.toml")
 WORKFLOW_DEFAULTS = PROJECT_CONFIG.workflow
 SHORT_VIDEO_DEFAULTS = PROJECT_CONFIG.short_video
@@ -57,93 +63,15 @@ REMOTE_STATION_COUNTS: dict[str, int] = {}
 REMOTE_STATION_COUNT_ERRORS: dict[str, str] = {}
 REMOTE_STATION_COUNT_LOCK = RLock()
 WEB_CONCURRENCY = PROJECT_CONFIG.raw.get("web_concurrency", {})
-MAX_RUNNING_JOBS = int(WEB_CONCURRENCY.get("max_running_jobs", 2))
-MAX_PENDING_JOBS = int(WEB_CONCURRENCY.get("max_pending_jobs", 20))
+MAX_RUNNING_JOBS = int(os.environ.get("WEB_MAX_RUNNING_JOBS", WEB_CONCURRENCY.get("max_running_jobs", 2)))
+MAX_PENDING_JOBS = int(os.environ.get("WEB_MAX_PENDING_JOBS", WEB_CONCURRENCY.get("max_pending_jobs", 20)))
 SAME_TASK_POLICY = str(WEB_CONCURRENCY.get("same_task_policy", "reject"))
 
 
-LEGACY_SINGLE_COMMON_REUSABLE_STEPS = [
-    "source_prepare",
-    "metadata",
-    "audio_extract",
-    "frame_extract",
-    "chunk_build",
-    "asr",
-    "asr_digest",
-    "vision",
-    "timeline",
-    "timeline_digest",
-]
-
-UNIFIED_SOURCE_COMMON_REUSABLE_STEPS = [
-    "source_prepare",
-    "source_analysis",
-    "source_aggregate",
-]
-
-COMMON_REUSABLE_STEPS = LEGACY_SINGLE_COMMON_REUSABLE_STEPS
-
-LEGACY_SINGLE_AI_VOICEOVER_STEP_ORDER = [
-    "source_prepare",
-    "metadata",
-    "audio_extract",
-    "frame_extract",
-    "chunk_build",
-    "asr",
-    "asr_digest",
-    "vision",
-    "timeline",
-    "timeline_digest",
-    "content_analysis",
-    "short_video_edit_plan",
-    "voiceover_script",
-    "tts",
-    "subtitles",
-    "cut_plan",
-    "render",
-]
-
-LEGACY_SINGLE_HIGHLIGHT_REASSEMBLY_STEP_ORDER = [
-    "source_prepare",
-    "metadata",
-    "audio_extract",
-    "frame_extract",
-    "chunk_build",
-    "asr",
-    "asr_digest",
-    "vision",
-    "timeline",
-    "timeline_digest",
-    "video_understanding",
-    "highlight_detection",
-    "highlight_reassembly_plan",
-    "reassembly_cut_plan",
-    "reassembly_render",
-]
-
-UNIFIED_AI_VOICEOVER_STEP_ORDER = [
-    "source_prepare",
-    "source_analysis",
-    "source_aggregate",
-    "content_analysis",
-    "short_video_edit_plan",
-    "voiceover_script",
-    "tts",
-    "subtitles",
-    "cut_plan",
-    "render",
-]
-
-UNIFIED_HIGHLIGHT_REASSEMBLY_STEP_ORDER = [
-    "source_prepare",
-    "source_analysis",
-    "source_aggregate",
-    "video_understanding",
-    "highlight_detection",
-    "highlight_reassembly_plan",
-    "reassembly_cut_plan",
-    "reassembly_render",
-]
+from newsclip_agent.workflow_registry import (
+    step_order,
+    common_reusable_steps,
+)
 
 
 def _use_unified_source_pipeline(config: Any = PROJECT_CONFIG) -> bool:
@@ -156,9 +84,8 @@ def _common_reusable_steps_for_request(
     source_count: int,
     use_unified_source_pipeline: bool,
 ) -> list[str]:
-    if use_unified_source_pipeline or source_count > 1:
-        return UNIFIED_SOURCE_COMMON_REUSABLE_STEPS
-    return LEGACY_SINGLE_COMMON_REUSABLE_STEPS
+    unified = bool(use_unified_source_pipeline or source_count > 1)
+    return common_reusable_steps(unified=unified)
 
 
 def _step_order_for_production_mode(
@@ -167,14 +94,8 @@ def _step_order_for_production_mode(
     use_unified_source_pipeline: bool = True,
     source_count: int = 1,
 ) -> list[str]:
-    if use_unified_source_pipeline or source_count > 1:
-        if production_mode == "highlight_reassembly":
-            return UNIFIED_HIGHLIGHT_REASSEMBLY_STEP_ORDER
-        return UNIFIED_AI_VOICEOVER_STEP_ORDER
-
-    if production_mode == "highlight_reassembly":
-        return LEGACY_SINGLE_HIGHLIGHT_REASSEMBLY_STEP_ORDER
-    return LEGACY_SINGLE_AI_VOICEOVER_STEP_ORDER
+    unified = bool(use_unified_source_pipeline or source_count > 1)
+    return step_order(production_mode, unified=unified)
 
 
 def _init_multisource_child_manifest(
@@ -1360,7 +1281,9 @@ def _running_job_count() -> int:
 
 
 def _persist_job(job: dict[str, Any]) -> None:
-    write_json(OUTPUTS_DIR / job["task_id"] / "last_web_job.json", _public_job(job))
+    public_job = _public_job(job)
+    write_json(OUTPUTS_DIR / job["task_id"] / "last_web_job.json", public_job)
+    JOB_STORE.save_job(job["task_id"], public_job)
 
 
 def _save_web_run_options(task_dir: Path, req: RunRequest) -> None:

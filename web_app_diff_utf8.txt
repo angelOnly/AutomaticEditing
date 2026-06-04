@@ -1,0 +1,404 @@
+﻿diff --git a/web_app.py b/web_app.py
+index 72ebd04..e817f77 100644
+--- a/web_app.py
++++ b/web_app.py
+@@ -32,6 +32,15 @@ from newsclip_agent.remote_ucms import (
+ )
+ from newsclip_agent.utils import ensure_dir, read_json, relpath, write_json
+ from newsclip_agent.tts_omnivoice import generate_omnivoice_audio
++from newsclip_agent.job_store import JobStore
++
++
++ROOT = Path(__file__).resolve().parent
++OUTPUTS_DIR = ROOT / "outputs"
++COMMON_OUTPUTS_DIR = OUTPUTS_DIR / "__common__"
++VIDEOS_DIR = ROOT / "videos"
++STATIC_DIR = ROOT / "web_static"
++from newsclip_agent.job_store import JobStore
+ 
+ 
+ ROOT = Path(__file__).resolve().parent
+@@ -48,6 +57,11 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+ JOBS: dict[str, dict[str, Any]] = {}
+ JOB_LOCK = RLock()
+ PENDING_JOB_IDS: deque[str] = deque()
++JOB_STORE = JobStore(OUTPUTS_DIR / ".jobs")
++for job_id, job in JOB_STORE.load_jobs().items():
++    JOBS[job_id] = job
++    if job.get("status") == "pending":
++        PENDING_JOB_IDS.append(job_id)
+ PROJECT_CONFIG = load_config(ROOT / "config.toml")
+ WORKFLOW_DEFAULTS = PROJECT_CONFIG.workflow
+ SHORT_VIDEO_DEFAULTS = PROJECT_CONFIG.short_video
+@@ -57,109 +71,27 @@ REMOTE_STATION_COUNTS: dict[str, int] = {}
+ REMOTE_STATION_COUNT_ERRORS: dict[str, str] = {}
+ REMOTE_STATION_COUNT_LOCK = RLock()
+ WEB_CONCURRENCY = PROJECT_CONFIG.raw.get("web_concurrency", {})
+-MAX_RUNNING_JOBS = int(WEB_CONCURRENCY.get("max_running_jobs", 2))
+-MAX_PENDING_JOBS = int(WEB_CONCURRENCY.get("max_pending_jobs", 20))
++import os
++MAX_RUNNING_JOBS = int(os.environ.get("WEB_MAX_RUNNING_JOBS", WEB_CONCURRENCY.get("max_running_jobs", 2)))
++MAX_PENDING_JOBS = int(os.environ.get("WEB_MAX_PENDING_JOBS", WEB_CONCURRENCY.get("max_pending_jobs", 20)))
+ SAME_TASK_POLICY = str(WEB_CONCURRENCY.get("same_task_policy", "reject"))
+ 
+-
+-LEGACY_SINGLE_COMMON_REUSABLE_STEPS = [
+-    "source_prepare",
+-    "metadata",
+-    "audio_extract",
+-    "frame_extract",
+-    "chunk_build",
+-    "asr",
+-    "asr_digest",
+-    "vision",
+-    "timeline",
+-    "timeline_digest",
+-]
+-
+-UNIFIED_SOURCE_COMMON_REUSABLE_STEPS = [
+-    "source_prepare",
+-    "source_analysis",
+-    "source_aggregate",
+-]
+-
+-COMMON_REUSABLE_STEPS = LEGACY_SINGLE_COMMON_REUSABLE_STEPS
+-
+-LEGACY_SINGLE_AI_VOICEOVER_STEP_ORDER = [
+-    "source_prepare",
+-    "metadata",
+-    "audio_extract",
+-    "frame_extract",
+-    "chunk_build",
+-    "asr",
+-    "asr_digest",
+-    "vision",
+-    "timeline",
+-    "timeline_digest",
+-    "content_analysis",
+-    "short_video_edit_plan",
+-    "voiceover_script",
+-    "tts",
+-    "subtitles",
+-    "cut_plan",
+-    "render",
+-]
+-
+-LEGACY_SINGLE_HIGHLIGHT_REASSEMBLY_STEP_ORDER = [
+-    "source_prepare",
+-    "metadata",
+-    "audio_extract",
+-    "frame_extract",
+-    "chunk_build",
+-    "asr",
+-    "asr_digest",
+-    "vision",
+-    "timeline",
+-    "timeline_digest",
+-    "video_understanding",
+-    "highlight_detection",
+-    "highlight_reassembly_plan",
+-    "reassembly_cut_plan",
+-    "reassembly_render",
+-]
+-
+-UNIFIED_AI_VOICEOVER_STEP_ORDER = [
+-    "source_prepare",
+-    "source_analysis",
+-    "source_aggregate",
+-    "content_analysis",
+-    "short_video_edit_plan",
+-    "voiceover_script",
+-    "tts",
+-    "subtitles",
+-    "cut_plan",
+-    "render",
+-]
+-
+-UNIFIED_HIGHLIGHT_REASSEMBLY_STEP_ORDER = [
+-    "source_prepare",
+-    "source_analysis",
+-    "source_aggregate",
+-    "video_understanding",
+-    "highlight_detection",
+-    "highlight_reassembly_plan",
+-    "reassembly_cut_plan",
+-    "reassembly_render",
+-]
+-
++from newsclip_agent.workflow_registry import (
++    step_order,
++    common_reusable_steps,
++)
+ 
+ def _use_unified_source_pipeline(config: Any = PROJECT_CONFIG) -> bool:
+     workflow = config.raw.get("workflow", {}) if hasattr(config, "raw") else {}
+     return bool(workflow.get("use_unified_source_pipeline", True))
+ 
+-
+ def _common_reusable_steps_for_request(
+     *,
+     source_count: int,
+     use_unified_source_pipeline: bool,
+ ) -> list[str]:
+-    if use_unified_source_pipeline or source_count > 1:
+-        return UNIFIED_SOURCE_COMMON_REUSABLE_STEPS
+-    return LEGACY_SINGLE_COMMON_REUSABLE_STEPS
+-
++    unified = bool(use_unified_source_pipeline or source_count > 1)
++    return common_reusable_steps(unified=unified)
+ 
+ def _step_order_for_production_mode(
+     production_mode: str,
+@@ -167,14 +99,8 @@ def _step_order_for_production_mode(
+     use_unified_source_pipeline: bool = True,
+     source_count: int = 1,
+ ) -> list[str]:
+-    if use_unified_source_pipeline or source_count > 1:
+-        if production_mode == "highlight_reassembly":
+-            return UNIFIED_HIGHLIGHT_REASSEMBLY_STEP_ORDER
+-        return UNIFIED_AI_VOICEOVER_STEP_ORDER
+-
+-    if production_mode == "highlight_reassembly":
+-        return LEGACY_SINGLE_HIGHLIGHT_REASSEMBLY_STEP_ORDER
+-    return LEGACY_SINGLE_AI_VOICEOVER_STEP_ORDER
++    unified = bool(use_unified_source_pipeline or source_count > 1)
++    return step_order(production_mode, unified=unified)
+ 
+ 
+ def _init_multisource_child_manifest(
+@@ -1137,235 +1063,6 @@ def run_pipeline(req: RunRequest) -> dict[str, Any]:
+         _write_source_request_for_preview(task_dir, task_id, req, raw_source_items)
+ 
+     existing_job = _find_active_job_by_task_id(task_id)
+-    if existing_job and not (req.rerun or req.rerun_from):
+-        status = existing_job.get("status", "")
+-        status_text = "鎺掗槦涓? if status == "pending" else "杩愯涓?
+-        return {
+-            **_public_job(existing_job),
+-            "deduplicated": True,
+-            "message": f"璇ヨ棰戠殑{_mode_slug(req.production_mode)}浠诲姟姝ｅ湪{status_text}锛屽凡鍒囨崲鍒扮幇鏈変换鍔°€?,
+-        }
+-
+-    manifest = read_json(task_dir / "manifest.json", {})
+-    if not (req.rerun or req.rerun_from) and _is_task_already_completed(manifest, req.production_mode):
+-        return {
+-            "job_id": "",
+-            "task_id": task_id,
+-            "status": "success",
+-            "returncode": 0,
+-            "deduplicated": True,
+-            "message": "鐩稿悓浠诲姟宸插畬鎴愶紝鐩存帴澶嶇敤缁撴灉銆?,
+-        }
+-
+-    _seed_reusable_outputs(req, task_id, task_dir)
+-    job_id = f"job_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+-    log_dir = ensure_dir(task_dir / "web_jobs")
+-    log_path = log_dir / f"{job_id}.log"
+-
+-    cmd = _build_run_command(req, task_id, input_path, source_manifest_path, source_request_path)
+-    _save_web_run_options(task_dir, req)
+-
+-    with JOB_LOCK:
+-        active_job = _find_active_job_by_task_id(task_id)
+-        if active_job and SAME_TASK_POLICY == "reject":
+-            raise HTTPException(409, f"浠诲姟 {task_id} 宸叉湁杩愯涓垨鎺掗槦涓殑 job锛岃涓嶈瀵瑰悓涓€浠诲姟骞跺彂杩愯")
+-        pending_count = sum(1 for job in JOBS.values() if job.get("status") == "pending")
+-        if pending_count >= MAX_PENDING_JOBS:
+-            raise HTTPException(429, "绛夊緟闃熷垪宸叉弧锛岃绋嶅悗鍐嶆彁浜?)
+-        log_path.write_text(" ".join(cmd) + "\n\n=== job queued ===\n", encoding="utf-8", errors="replace")
+-        job = {
+-            "job_id": job_id,
+-            "task_id": task_id,
+-            "pid": None,
+-            "cmd": cmd,
+-            "log": relpath(log_path, ROOT),
+-            "log_path": str(log_path),
+-            "created_at": datetime.now().isoformat(timespec="seconds"),
+-            "started_at": "",
+-            "status": "pending",
+-            "returncode": None,
+-            "submitted_by": req.client_id or "anonymous",
+-            "task_fingerprint": fingerprint,
+-        }
+-        JOBS[job_id] = job
+-        PENDING_JOB_IDS.append(job_id)
+-        _persist_job(job)
+-
+-    _schedule_jobs()
+-    return _public_job(JOBS[job_id])
+-
+-
+-def _build_run_command(
+-    req: RunRequest,
+-    task_id: str,
+-    input_path: Path | None = None,
+-    source_manifest_path: Path | None = None,
+-    source_request_path: Path | None = None,
+-) -> list[str]:
+-    runner = MULTI_SOURCE_RUNNER if source_request_path else RUNNER
+-    cmd = [
+-        sys.executable,
+-        "-u",
+-        str(runner),
+-        "--task-id",
+-        task_id,
+-        "--chunk-seconds",
+-        str(req.chunk_seconds),
+-        "--frame-interval",
+-        str(req.frame_interval),
+-        "--aspect-ratio",
+-        req.aspect_ratio,
+-        "--target-duration",
+-        str(req.target_duration_seconds),
+-        "--audio-policy",
+-        req.audio_policy,
+-        "--production-mode",
+-        req.production_mode,
+-        "--output-mode",
+-        req.output_mode,
+-        "--max-output-videos",
+-        str(req.max_output_videos),
+-        "--min-output-video-seconds",
+-        str(req.min_output_video_seconds),
+-        "--max-output-video-seconds",
+-        str(req.max_output_video_seconds),
+-    ]
+-    if req.voice_id:
+-        cmd.extend(["--voice-id", req.voice_id])
+-    if req.production_mode == "highlight_reassembly":
+-        cmd.extend(["--reassembly-output-mode", req.reassembly_output_mode])
+-        cmd.extend(["--reassembly-sort-mode", req.reassembly_sort_mode])
+-        cmd.extend(["--reassembly-max-clip-count", str(req.reassembly_max_clip_count)])
+-        if req.reassembly_target_seconds:
+-            cmd.extend(["--reassembly-target-seconds", str(req.reassembly_target_seconds)])
+-        if req.reassembly_export_individual_clips:
+-            cmd.append("--reassembly-export-individual-clips")
+-    if input_path:
+-        cmd.extend(["--input", str(input_path)])
+-    if source_manifest_path:
+-        cmd.extend(["--source-manifest", str(source_manifest_path)])
+-    if source_request_path:
+-        cmd.extend(["--source-request", str(source_request_path)])
+-    if req.rerun:
+-        cmd.extend(["--rerun", req.rerun])
+-    if req.rerun_from:
+-        cmd.extend(["--rerun-from", req.rerun_from])
+-    if req.chunk:
+-        cmd.extend(["--chunk", req.chunk])
+-    if req.failed_only:
+-        cmd.append("--failed-only")
+-    if req.mode:
+-        cmd.extend(["--mode", req.mode])
+-    for version_spec in req.use_version:
+-        if version_spec.strip():
+-            cmd.extend(["--use-version", version_spec.strip()])
+-    if req.only_analysis:
+-        cmd.append("--only-analysis")
+-    if req.skip_tts:
+-        cmd.append("--skip-tts")
+-    if req.skip_render:
+-        cmd.append("--skip-render")
+-    if req.allow_long_video:
+-        cmd.append("--allow-long-video")
+-    if req.require_tts:
+-        cmd.append("--require-tts")
+-    else:
+-        cmd.append("--no-require-tts")
+-    return cmd
+-
+-
+-def _terminate_process_tree(pid: int) -> None:
+-    if pid <= 0:
+-        return
+-    if os.name == "nt":
+-        try:
+-            subprocess.run(
+-                ["taskkill", "/PID", str(pid), "/T", "/F"],
+-                stdout=subprocess.DEVNULL,
+-                stderr=subprocess.DEVNULL,
+-                check=False,
+-            )
+-        except Exception:
+-            pass
+-        return
+-    try:
+-        os.killpg(pid, signal.SIGTERM)
+-    except Exception:
+-        try:
+-            os.kill(pid, signal.SIGTERM)
+-        except ProcessLookupError:
+-            pass
+-
+-
+-def _start_job(job: dict[str, Any]) -> None:
+-    log_path = Path(job["log_path"])
+-    log_file = log_path.open("a", encoding="utf-8", errors="replace")
+-    log_file.write("\n=== job started ===\n")
+-    log_file.flush()
+-    env = os.environ.copy()
+-    env["PYTHONIOENCODING"] = "utf-8"
+-    env["PYTHONUTF8"] = "1"
+-    env["PYTHONUNBUFFERED"] = "1"
+-    process = subprocess.Popen(
+-        job["cmd"],
+-        cwd=str(ROOT),
+-        stdout=log_file,
+-        stderr=subprocess.STDOUT,
+-        text=True,
+-        encoding="utf-8",
+-        errors="replace",
+-        env=env,
+-        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+-        start_new_session=(os.name != "nt"),
+-    )
+-    job.update(
+-        {
+-            "pid": process.pid,
+-            "process": process,
+-            "log_file": log_file,
+-            "started_at": datetime.now().isoformat(timespec="seconds"),
+-            "status": "running",
+-            "returncode": None,
+-        }
+-    )
+-    _persist_job(job)
+-
+-
+-def _schedule_jobs() -> None:
+-    with JOB_LOCK:
+-        running = _running_job_count()
+-        while running < MAX_RUNNING_JOBS and PENDING_JOB_IDS:
+-            job_id = PENDING_JOB_IDS.popleft()
+-            job = JOBS.get(job_id)
+-            if not job or job.get("status") != "pending":
+-                continue
+-            try:
+-                _start_job(job)
+-                running += 1
+-            except Exception as exc:
+-                job["status"] = "failed"
+-                job["returncode"] = -1
+-                job["user_message"] = str(exc)
+-                job["finished_at"] = datetime.now().isoformat(timespec="seconds")
+-                _persist_job(job)
+-
+-
+-def _running_job_count() -> int:
+-    count = 0
+-    for job_id in list(JOBS):
+-        public = _refresh_job(job_id, schedule_next=False)
+-        if public.get("status") == "running":
+-            count += 1
+-    return count
+-
+-
+-def _persist_job(job: dict[str, Any]) -> None:
+-    write_json(OUTPUTS_DIR / job["task_id"] / "last_web_job.json", _public_job(job))
+-
+-
+-def _save_web_run_options(task_dir: Path, req: RunRequest) -> None:
+-    manifest_path = task_dir / "manifest.json"
+-    manifest = read_json(manifest_path, {})
+     web_options = req.model_dump()
+     web_options["updated_at"] = datetime.now().isoformat(timespec="seconds")
+     manifest.setdefault("task_id", task_dir.name)

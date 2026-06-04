@@ -37,13 +37,31 @@ def preflight() -> None:
     print("启动前检查通过")
 
 
-if __name__ == "__main__":
-    if "--no-preflight" not in sys.argv:
-        preflight()
-    else:
-        sys.argv.remove("--no-preflight")
+import argparse
+import os
 
-    host = "0.0.0.0"
-    port = find_free_port(host=host, start=7860)
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Run the NewsClip Web UI.")
+    parser.add_argument("--host", default="0.0.0.0", help="Host to bind to.")
+    parser.add_argument("--port", type=int, default=None, help="Port to bind to. Defaults to first available from 7860.")
+    parser.add_argument("--max-running", type=int, default=None, help="Max running jobs.")
+    parser.add_argument("--max-pending", type=int, default=None, help="Max pending jobs.")
+    parser.add_argument("--no-preflight", action="store_true", help="Skip ASR preflight check.")
+    args = parser.parse_args()
+
+    if not args.no_preflight:
+        preflight()
+
+    if args.max_running is not None:
+        os.environ["WEB_MAX_RUNNING_JOBS"] = str(args.max_running)
+    if args.max_pending is not None:
+        os.environ["WEB_MAX_PENDING_JOBS"] = str(args.max_pending)
+
+    host = args.host
+    if args.port is not None:
+        port = args.port
+    else:
+        port = find_free_port(host=host, start=7860)
+
     print(f"Web 工作台地址: http://{host}:{port}")
     uvicorn.run("web_app:app", host=host, port=port, reload=False)

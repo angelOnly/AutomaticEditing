@@ -44,6 +44,7 @@ from .llm_digest import (
     select_frames_for_vision,
 )
 from .text_policy import sanitize_reporter_bylines
+from .media_quality import build_source_quality_report
 from .tts_omnivoice import audio_metadata, generate_omnivoice_audio, release_omnivoice_models
 from .resource_locks import file_slot_lock
 from .utils import (
@@ -64,101 +65,11 @@ from .utils import (
 )
 
 
-AI_VOICEOVER_STEP_ORDER = [
-    "metadata",
-    "audio_extract",
-    "frame_extract",
-    "chunk_build",
-    "asr",
-    "asr_digest",
-    "vision",
-    "timeline",
-    "timeline_digest",
-    "content_analysis",
-    "short_video_edit_plan",
-    "voiceover_script",
-    "tts",
-    "subtitles",
-    "cut_plan",
-    "render",
-]
+from .workflow_registry import DEPENDENCIES, step_order, WORKFLOWS
 
-HIGHLIGHT_REASSEMBLY_STEP_ORDER = [
-    "metadata",
-    "audio_extract",
-    "frame_extract",
-    "chunk_build",
-    "asr",
-    "asr_digest",
-    "vision",
-    "timeline",
-    "timeline_digest",
-    "video_understanding",
-    "highlight_detection",
-    "highlight_reassembly_plan",
-    "reassembly_cut_plan",
-    "reassembly_render",
-]
-
-UNIFIED_AI_VOICEOVER_STEP_ORDER = [
-    "source_analysis",
-    "source_aggregate",
-    "content_analysis",
-    "short_video_edit_plan",
-    "voiceover_script",
-    "tts",
-    "subtitles",
-    "cut_plan",
-    "render",
-]
-
-UNIFIED_HIGHLIGHT_REASSEMBLY_STEP_ORDER = [
-    "source_analysis",
-    "source_aggregate",
-    "video_understanding",
-    "highlight_detection",
-    "highlight_reassembly_plan",
-    "reassembly_cut_plan",
-    "reassembly_render",
-]
-
-STEP_ORDER = AI_VOICEOVER_STEP_ORDER
 ALL_STEP_ORDER = list(dict.fromkeys(
-    AI_VOICEOVER_STEP_ORDER
-    + HIGHLIGHT_REASSEMBLY_STEP_ORDER
-    + UNIFIED_AI_VOICEOVER_STEP_ORDER
-    + UNIFIED_HIGHLIGHT_REASSEMBLY_STEP_ORDER
+    step for workflow in WORKFLOWS.values() for step in workflow
 ))
-
-
-DEPENDENCIES = {
-    "source_analysis": [],
-    "source_aggregate": ["source_analysis"],
-    "metadata": [],
-    "audio_extract": ["metadata"],
-    "frame_extract": ["metadata"],
-    "chunk_build": ["metadata", "frame_extract"],
-    "asr": ["audio_extract"],
-    "asr_digest": ["asr", "chunk_build"],
-    "vision": ["frame_extract", "chunk_build", "asr", "asr_digest"],
-    "timeline": ["asr", "asr_digest", "vision"],
-    "timeline_digest": ["timeline", "asr_digest"],
-    "content_analysis": ["timeline_digest", "source_aggregate"],
-    "short_video_edit_plan": ["content_analysis"],
-    "video_understanding": ["timeline_digest", "source_aggregate"],
-    "highlight_detection": ["timeline_digest", "source_aggregate", "video_understanding"],
-    "short_video_planning": ["highlight_detection", "video_understanding"],
-    "editing_script": ["short_video_planning", "highlight_detection", "timeline"],
-    "voiceover_script": ["short_video_edit_plan"],
-    "risk_review": ["editing_script", "voiceover_script", "video_understanding"],
-    "tts": ["voiceover_script"],
-    "subtitles": ["voiceover_script", "tts"],
-    "cut_plan": ["short_video_edit_plan", "voiceover_script", "subtitles", "tts"],
-    "render": ["cut_plan"],
-    "highlight_reassembly_plan": ["highlight_detection", "video_understanding"],
-    "reassembly_cut_plan": ["highlight_reassembly_plan"],
-    "reassembly_render": ["reassembly_cut_plan"],
-}
 
 
 AGENT_INFO = {
@@ -490,13 +401,10 @@ class PipelineRunner:
         return selected
 
     def _active_step_order(self) -> list[str]:
-        if self._is_virtual_source_manifest():
-            if self.options.production_mode == "highlight_reassembly":
-                return UNIFIED_HIGHLIGHT_REASSEMBLY_STEP_ORDER
-            return UNIFIED_AI_VOICEOVER_STEP_ORDER
-        if self.options.production_mode == "highlight_reassembly":
-            return HIGHLIGHT_REASSEMBLY_STEP_ORDER
-        return AI_VOICEOVER_STEP_ORDER
+        return step_order(
+            self.options.production_mode,
+            unified=self._is_virtual_source_manifest(),
+        )
 
     def _source_video(self) -> Path:
         source = self.manifest["source_video"]
@@ -1066,6 +974,38 @@ class PipelineRunner:
         if self._is_virtual_source_manifest():
             return self._step_content_hash("source_aggregate")
         return self._step_content_hash("timeline_digest")
+
+    def step_source_quality_check(self) -> None:
+        if self._is_virtual_multi_source():
+            # For unified pipeline, metadata is inside source_manifest.json built by source_analysis
+            manifest = self._load_step_json("source_analysis")
+            if not manifest:
+                manifest = read_json(self.manifest_path, {})
+            sources_metadata = [s.get("metadata", {}) for s in manifest.get("sources", [])]
+            input_hash = self._step_content_hash("source_analysis")
+        else:
+            # For legacy pipeline, metadata is inside metadata.json
+            metadata_info = self._load_step_json("metadata")
+            sources_metadata = [s.get("metadata", {}) for s in metadata_info.get("sources", [])] if metadata_info else []
+            input_hash = self._step_content_hash("metadata")
+
+        if self._can_reuse("source_quality_check", input_hash):
+            print("复用缓存: source_quality_check")
+            return
+            
+        version, vdir = self._version_dir("source_quality_check", "source_quality_check")
+        ensure_dir(vdir)
+        
+        report = build_source_quality_report(sources_metadata)
+        
+        result = {
+            "version": version,
+            "report": report,
+        }
+        self._overwrite_step_json("source_quality_check", result)
+        
+        if not report.get("is_pass"):
+            raise RuntimeError(f"Source quality check failed: {report.get('reason')}")
 
     def step_metadata(self) -> None:
         if self._is_virtual_multi_source():

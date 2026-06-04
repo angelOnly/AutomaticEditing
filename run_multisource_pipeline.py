@@ -21,23 +21,14 @@ ROOT = Path(__file__).resolve().parent
 OUTPUTS_DIR = ROOT / "outputs"
 COMMON_OUTPUTS_DIR = OUTPUTS_DIR / "__common__"
 
-COMMON_REUSABLE_STEPS = [
-    "source_analysis",
-    "source_aggregate",
-]
+from newsclip_agent.workflow_registry import (
+    UNIFIED_SOURCE_COMMON_REUSABLE_STEPS,
+    LEGACY_SINGLE_COMMON_REUSABLE_STEPS,
+)
+
+COMMON_REUSABLE_STEPS = UNIFIED_SOURCE_COMMON_REUSABLE_STEPS
 COMMON_PROGRESS_STEPS = ["source_prepare"] + COMMON_REUSABLE_STEPS
-LEGACY_COMMON_REUSABLE_STEPS = [
-    "source_prepare",
-    "metadata",
-    "audio_extract",
-    "frame_extract",
-    "chunk_build",
-    "asr",
-    "asr_digest",
-    "vision",
-    "timeline",
-    "timeline_digest",
-]
+LEGACY_COMMON_REUSABLE_STEPS = LEGACY_SINGLE_COMMON_REUSABLE_STEPS
 
 
 def _sync_common_progress_to_child(
