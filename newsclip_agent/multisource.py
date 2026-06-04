@@ -127,7 +127,7 @@ def build_multi_source_video(
         normalized_duration = float(normalized_meta.get("duration") or duration)
         timeline_sources.append(
             {
-                "source_id": item.source_id or f"src_{index:03d}",
+                "source_id": item.source_id or f"source_{index:03d}",
                 "source_index": index,
                 "source_type": item.source_type,
                 "display_name": item.display_name or source_path.name,
@@ -191,8 +191,8 @@ def prepare_multi_source_manifest(
     root_dir: Path,
     aspect_ratio: str = "16:9",
 ) -> dict[str, Any]:
-    if len(sources) < 2:
-        raise ValueError("prepare_multi_source_manifest requires at least 2 sources")
+    if not sources:
+        raise ValueError("prepare_multi_source_manifest requires at least 1 source")
 
     input_dir = ensure_dir(task_dir / "input")
     manifest_file = input_dir / "source_manifest.json"
@@ -230,7 +230,7 @@ def prepare_multi_source_manifest(
 
         timeline_sources.append(
             {
-                "source_id": item.source_id or f"src_{index:03d}",
+                "source_id": item.source_id or f"source_{index:03d}",
                 "source_index": index,
                 "source_type": item.source_type,
                 "display_name": item.display_name or source_path.name,

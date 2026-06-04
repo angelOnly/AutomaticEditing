@@ -62,7 +62,7 @@ MAX_PENDING_JOBS = int(WEB_CONCURRENCY.get("max_pending_jobs", 20))
 SAME_TASK_POLICY = str(WEB_CONCURRENCY.get("same_task_policy", "reject"))
 
 
-COMMON_REUSABLE_STEPS = [
+LEGACY_SINGLE_COMMON_REUSABLE_STEPS = [
     "source_prepare",
     "metadata",
     "audio_extract",
@@ -75,50 +75,114 @@ COMMON_REUSABLE_STEPS = [
     "timeline_digest",
 ]
 
+UNIFIED_SOURCE_COMMON_REUSABLE_STEPS = [
+    "source_prepare",
+    "source_analysis",
+    "source_aggregate",
+]
 
-def _step_order_for_production_mode(production_mode: str) -> list[str]:
+COMMON_REUSABLE_STEPS = LEGACY_SINGLE_COMMON_REUSABLE_STEPS
+
+LEGACY_SINGLE_AI_VOICEOVER_STEP_ORDER = [
+    "source_prepare",
+    "metadata",
+    "audio_extract",
+    "frame_extract",
+    "chunk_build",
+    "asr",
+    "asr_digest",
+    "vision",
+    "timeline",
+    "timeline_digest",
+    "content_analysis",
+    "candidate_refine",
+    "short_video_edit_plan",
+    "merge_decision",
+    "voiceover_script",
+    "voiceover_quality_check",
+    "tts",
+    "subtitles",
+    "cut_plan",
+    "render",
+]
+
+LEGACY_SINGLE_HIGHLIGHT_REASSEMBLY_STEP_ORDER = [
+    "source_prepare",
+    "metadata",
+    "audio_extract",
+    "frame_extract",
+    "chunk_build",
+    "asr",
+    "asr_digest",
+    "vision",
+    "timeline",
+    "timeline_digest",
+    "video_understanding",
+    "highlight_detection",
+    "candidate_refine",
+    "highlight_reassembly_plan",
+    "reassembly_cut_plan",
+    "reassembly_render",
+]
+
+UNIFIED_AI_VOICEOVER_STEP_ORDER = [
+    "source_prepare",
+    "source_analysis",
+    "source_aggregate",
+    "content_analysis",
+    "candidate_refine",
+    "short_video_edit_plan",
+    "merge_decision",
+    "voiceover_script",
+    "voiceover_quality_check",
+    "tts",
+    "subtitles",
+    "cut_plan",
+    "render",
+]
+
+UNIFIED_HIGHLIGHT_REASSEMBLY_STEP_ORDER = [
+    "source_prepare",
+    "source_analysis",
+    "source_aggregate",
+    "video_understanding",
+    "highlight_detection",
+    "candidate_refine",
+    "highlight_reassembly_plan",
+    "reassembly_cut_plan",
+    "reassembly_render",
+]
+
+
+def _use_unified_source_pipeline(config: Any = PROJECT_CONFIG) -> bool:
+    workflow = config.raw.get("workflow", {}) if hasattr(config, "raw") else {}
+    return bool(workflow.get("use_unified_source_pipeline", True))
+
+
+def _common_reusable_steps_for_request(
+    *,
+    source_count: int,
+    use_unified_source_pipeline: bool,
+) -> list[str]:
+    if use_unified_source_pipeline or source_count > 1:
+        return UNIFIED_SOURCE_COMMON_REUSABLE_STEPS
+    return LEGACY_SINGLE_COMMON_REUSABLE_STEPS
+
+
+def _step_order_for_production_mode(
+    production_mode: str,
+    *,
+    use_unified_source_pipeline: bool = True,
+    source_count: int = 1,
+) -> list[str]:
+    if use_unified_source_pipeline or source_count > 1:
+        if production_mode == "highlight_reassembly":
+            return UNIFIED_HIGHLIGHT_REASSEMBLY_STEP_ORDER
+        return UNIFIED_AI_VOICEOVER_STEP_ORDER
+
     if production_mode == "highlight_reassembly":
-        return [
-            "source_prepare",
-            "metadata",
-            "audio_extract",
-            "frame_extract",
-            "chunk_build",
-            "asr",
-            "asr_digest",
-            "vision",
-            "timeline",
-            "timeline_digest",
-            "video_understanding",
-            "highlight_detection",
-            "candidate_refine",
-            "highlight_reassembly_plan",
-            "reassembly_cut_plan",
-            "reassembly_render",
-        ]
-
-    return [
-        "source_prepare",
-        "metadata",
-        "audio_extract",
-        "frame_extract",
-        "chunk_build",
-        "asr",
-        "asr_digest",
-        "vision",
-        "timeline",
-        "timeline_digest",
-        "content_analysis",
-        "candidate_refine",
-        "short_video_edit_plan",
-        "merge_decision",
-        "voiceover_script",
-        "voiceover_quality_check",
-        "tts",
-        "subtitles",
-        "cut_plan",
-        "render",
-    ]
+        return LEGACY_SINGLE_HIGHLIGHT_REASSEMBLY_STEP_ORDER
+    return LEGACY_SINGLE_AI_VOICEOVER_STEP_ORDER
 
 
 def _init_multisource_child_manifest(
@@ -129,6 +193,7 @@ def _init_multisource_child_manifest(
     raw_source_items: list[dict[str, Any]],
     common_task_id: str,
     common_source_key: str,
+    use_unified_source_pipeline: bool = True,
 ) -> None:
     """Create a complete pending manifest for a multi-source child task.
 
@@ -141,10 +206,20 @@ def _init_multisource_child_manifest(
         return
 
     now = datetime.now().isoformat(timespec="seconds")
-    common_steps = set(COMMON_REUSABLE_STEPS)
+    source_count = len(raw_source_items)
+    common_steps = set(
+        _common_reusable_steps_for_request(
+            source_count=source_count,
+            use_unified_source_pipeline=use_unified_source_pipeline,
+        )
+    )
     steps: dict[str, dict[str, Any]] = {}
 
-    for step in _step_order_for_production_mode(req.production_mode):
+    for step in _step_order_for_production_mode(
+        req.production_mode,
+        source_count=source_count,
+        use_unified_source_pipeline=use_unified_source_pipeline,
+    ):
         item: dict[str, Any] = {
             "step_name": step,
             "status": "pending",
@@ -170,7 +245,7 @@ def _init_multisource_child_manifest(
             "production_mode": req.production_mode,
             "common_task_id": common_task_id,
             "common_source_key": common_source_key,
-            "source_count": len(raw_source_items),
+            "source_count": source_count,
             "last_web_run_options": req.model_dump(),
             "steps": steps,
         },
@@ -994,10 +1069,14 @@ def run_pipeline(req: RunRequest) -> dict[str, Any]:
         req.allow_original_audio_evidence = False
     _prepare_mode_switched_run(req)
     raw_source_items = _collect_source_items(req)
+    use_unified_source_pipeline = _use_unified_source_pipeline(PROJECT_CONFIG)
+    should_use_source_request = bool(raw_source_items) and (
+        use_unified_source_pipeline or len(raw_source_items) > 1
+    )
     source_items: list[MultiSourceItem] = []
     source_manifest_path: Path | None = None
     source_request_path: Path | None = None
-    if len(raw_source_items) > 1:
+    if should_use_source_request:
         _validate_source_request_items(raw_source_items)
         fingerprint = _source_request_fingerprint(req, raw_source_items)
         common_source_key = _common_source_key(req, raw_source_items)
@@ -1022,6 +1101,7 @@ def run_pipeline(req: RunRequest) -> dict[str, Any]:
             raw_source_items=raw_source_items,
             common_task_id=common_task_id,
             common_source_key=common_source_key,
+            use_unified_source_pipeline=use_unified_source_pipeline,
         )
         input_path = None
     else:
@@ -1061,7 +1141,7 @@ def run_pipeline(req: RunRequest) -> dict[str, Any]:
                 "updated_at": datetime.now().isoformat(timespec="seconds"),
             },
         )
-    if raw_source_items:
+    if raw_source_items and should_use_source_request:
         _write_source_request_for_preview(task_dir, task_id, req, raw_source_items)
 
     existing_job = _find_active_job_by_task_id(task_id)

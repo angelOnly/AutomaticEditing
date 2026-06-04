@@ -104,11 +104,44 @@ HIGHLIGHT_REASSEMBLY_STEP_ORDER = [
     "reassembly_render",
 ]
 
+UNIFIED_AI_VOICEOVER_STEP_ORDER = [
+    "source_analysis",
+    "source_aggregate",
+    "content_analysis",
+    "candidate_refine",
+    "short_video_edit_plan",
+    "merge_decision",
+    "voiceover_script",
+    "voiceover_quality_check",
+    "tts",
+    "subtitles",
+    "cut_plan",
+    "render",
+]
+
+UNIFIED_HIGHLIGHT_REASSEMBLY_STEP_ORDER = [
+    "source_analysis",
+    "source_aggregate",
+    "video_understanding",
+    "highlight_detection",
+    "candidate_refine",
+    "highlight_reassembly_plan",
+    "reassembly_cut_plan",
+    "reassembly_render",
+]
+
 STEP_ORDER = AI_VOICEOVER_STEP_ORDER
-ALL_STEP_ORDER = list(dict.fromkeys(AI_VOICEOVER_STEP_ORDER + HIGHLIGHT_REASSEMBLY_STEP_ORDER))
+ALL_STEP_ORDER = list(dict.fromkeys(
+    AI_VOICEOVER_STEP_ORDER
+    + HIGHLIGHT_REASSEMBLY_STEP_ORDER
+    + UNIFIED_AI_VOICEOVER_STEP_ORDER
+    + UNIFIED_HIGHLIGHT_REASSEMBLY_STEP_ORDER
+))
 
 
 DEPENDENCIES = {
+    "source_analysis": [],
+    "source_aggregate": ["source_analysis"],
     "metadata": [],
     "audio_extract": ["metadata"],
     "frame_extract": ["metadata"],
@@ -118,12 +151,12 @@ DEPENDENCIES = {
     "vision": ["frame_extract", "chunk_build", "asr", "asr_digest"],
     "timeline": ["asr", "asr_digest", "vision"],
     "timeline_digest": ["timeline", "asr_digest"],
-    "content_analysis": ["timeline_digest"],
-    "candidate_refine": ["timeline_digest"],
+    "content_analysis": ["timeline_digest", "source_aggregate"],
+    "candidate_refine": ["timeline_digest", "source_aggregate"],
     "short_video_edit_plan": ["content_analysis", "candidate_refine"],
     "merge_decision": ["short_video_edit_plan"],
-    "video_understanding": ["timeline_digest"],
-    "highlight_detection": ["timeline_digest", "video_understanding"],
+    "video_understanding": ["timeline_digest", "source_aggregate"],
+    "highlight_detection": ["timeline_digest", "source_aggregate", "video_understanding"],
     "short_video_planning": ["highlight_detection", "video_understanding"],
     "editing_script": ["short_video_planning", "highlight_detection", "timeline"],
     "voiceover_script": ["short_video_edit_plan", "merge_decision"],
@@ -429,17 +462,23 @@ class PipelineRunner:
         step_order = self._active_step_order()
         
         if self.options.common_only:
-            common_steps = [
-                "metadata",
-                "audio_extract",
-                "frame_extract",
-                "chunk_build",
-                "asr",
-                "asr_digest",
-                "vision",
-                "timeline",
-                "timeline_digest",
-            ]
+            if self._is_virtual_source_manifest():
+                common_steps = [
+                    "source_analysis",
+                    "source_aggregate",
+                ]
+            else:
+                common_steps = [
+                    "metadata",
+                    "audio_extract",
+                    "frame_extract",
+                    "chunk_build",
+                    "asr",
+                    "asr_digest",
+                    "vision",
+                    "timeline",
+                    "timeline_digest",
+                ]
             step_order = [step for step in common_steps if step in step_order]
 
         if self.options.rerun and self.options.rerun_from:
@@ -465,6 +504,10 @@ class PipelineRunner:
         return selected
 
     def _active_step_order(self) -> list[str]:
+        if self._is_virtual_source_manifest():
+            if self.options.production_mode == "highlight_reassembly":
+                return UNIFIED_HIGHLIGHT_REASSEMBLY_STEP_ORDER
+            return UNIFIED_AI_VOICEOVER_STEP_ORDER
         if self.options.production_mode == "highlight_reassembly":
             return HIGHLIGHT_REASSEMBLY_STEP_ORDER
         return AI_VOICEOVER_STEP_ORDER
@@ -477,7 +520,20 @@ class PipelineRunner:
         return p if p.is_absolute() else self.task_dir / p
 
     def _is_virtual_multi_source(self) -> bool:
-        return self.manifest.get("source_mode") == "multi_source_virtual"
+        return self._is_virtual_source_manifest()
+
+    def _is_virtual_source_manifest(self) -> bool:
+        manifest = getattr(self, "manifest", {}) or {}
+        source_videos = manifest.get("source_videos") or []
+        if manifest.get("source_mode") == "multi_source_virtual" and source_videos:
+            return True
+        if not manifest.get("source_manifest"):
+            return False
+        try:
+            source_manifest = read_json(self._source_manifest_path(), {})
+        except Exception:
+            return False
+        return source_manifest.get("timeline_mode") == "virtual" and bool(source_manifest.get("sources"))
 
     def _source_manifest_path(self) -> Path:
         manifest_path = self.manifest.get("source_manifest")
@@ -728,6 +784,249 @@ class PipelineRunner:
             windows.append({"id": f"asr_{len(windows)+1:04d}", "start": t, "end": end, "chunk_id": ""})
             t = max(end - overlap, end)
         return windows
+
+    def step_source_analysis(self) -> None:
+        sources = self._iter_source_items()
+        if not sources:
+            raise RuntimeError("source_analysis requires a virtual source manifest with at least 1 source")
+        input_hash = stable_hash({
+            "source_manifest": self._step_content_hash("source_prepare") or self.manifest.get("source_manifest", ""),
+            "sources": [
+                {
+                    "source_id": item.get("source_id"),
+                    "path": str(self._resolve_source_item_path(item)),
+                    "mtime": self._resolve_source_item_path(item).stat().st_mtime if self._resolve_source_item_path(item).exists() else 0,
+                    "duration": item.get("duration_seconds"),
+                }
+                for item in sources
+            ],
+            "chunk_seconds": self.options.chunk_seconds,
+            "frame_interval": self.options.frame_interval,
+            "mode": self.options.mode,
+            "aspect_ratio": self.options.aspect_ratio,
+        })
+        if self._can_reuse("source_analysis", input_hash):
+            print("复用缓存: source_analysis")
+            return
+
+        version, base_dir = self._version_dir("source_analysis", "source_analysis")
+        ensure_dir(base_dir)
+        cfg = self.config.raw.get("multi_source_analysis", {})
+        max_workers = max(1, int(cfg.get("source_max_workers", 3) or 3))
+        fail_policy = str(cfg.get("fail_policy") or "partial_success")
+        config_path = Path(self.options.config)
+        if not config_path.is_absolute():
+            config_path = self.root / config_path
+
+        def analyze_one(item: dict[str, Any]) -> dict[str, Any]:
+            source_id = str(item.get("source_id") or f"source_{len(sources) + 1:03d}")
+            source_dir = ensure_dir(base_dir / source_id)
+            work_root = ensure_dir(source_dir / "_work")
+            source_path = self._resolve_source_item_path(item)
+            child_options = RunOptions(
+                input=str(source_path),
+                task_id=source_id,
+                config=str(config_path),
+                outputs_dir=str(work_root),
+                resume=self.options.resume,
+                rerun_from="metadata" if self.options.rerun == "source_analysis" else None,
+                chunk_seconds=self.options.chunk_seconds,
+                frame_interval=self.options.frame_interval,
+                vision_max_workers=max(1, int(cfg.get("per_source_vision_max_workers", self.options.vision_max_workers) or self.options.vision_max_workers)),
+                vision_max_frames_per_chunk=self.options.vision_max_frames_per_chunk,
+                release_asr_after_task=self.options.release_asr_after_task,
+                aspect_ratio=self.options.aspect_ratio,
+                mode=self.options.mode,
+                common_only=True,
+                production_mode="ai_voiceover",
+            )
+            child_runner = PipelineRunner(child_options)
+            child_manifest = child_runner.run()
+            digest = child_runner._load_step_json("timeline_digest")
+            summary = self._build_source_summary(item, child_runner.task_dir, child_manifest, digest)
+            summary_path = write_json(source_dir / "source_summary.json", summary)
+            return {
+                "source_id": source_id,
+                "status": "success",
+                "display_name": item.get("display_name") or source_path.name,
+                "summary": relpath(summary_path, self.task_dir),
+                "work_task_dir": relpath(child_runner.task_dir, self.task_dir),
+                "chunk_count": len(digest.get("chunks") or []),
+            }
+
+        results: list[dict[str, Any]] = []
+        failures: list[dict[str, Any]] = []
+        with ThreadPoolExecutor(max_workers=min(max_workers, len(sources))) as executor:
+            future_map = {executor.submit(analyze_one, item): item for item in sources}
+            for future in as_completed(future_map):
+                item = future_map[future]
+                source_id = str(item.get("source_id") or "")
+                try:
+                    results.append(future.result())
+                except Exception as exc:
+                    failure = {
+                        "source_id": source_id,
+                        "display_name": item.get("display_name") or "",
+                        "status": "failed",
+                        "error": str(exc),
+                    }
+                    failures.append(failure)
+                    if fail_policy == "fail_fast":
+                        raise
+
+        results.sort(key=lambda item: str(item.get("source_id") or ""))
+        failures.sort(key=lambda item: str(item.get("source_id") or ""))
+        if not results:
+            raise RuntimeError("source_analysis failed for all sources")
+
+        out = write_json(base_dir / "source_analysis.json", {
+            "version": "source_analysis_v1",
+            "source_count": len(sources),
+            "success_count": len(results),
+            "failed_count": len(failures),
+            "sources": results,
+            "failed_sources": failures,
+            "fail_policy": fail_policy,
+        })
+        status = "partial_success" if failures else "success"
+        status_doc = self._base_status("source_analysis", version, input_hash, [out])
+        status_doc["status"] = status
+        self._write_status(base_dir, status_doc)
+        self._record_step(
+            step="source_analysis",
+            version=version,
+            status=status,
+            output=relpath(out, self.task_dir),
+            input_hash=input_hash,
+            output_files=[out] + [self.task_dir / item["summary"] for item in results if item.get("summary")],
+            extra={"failed_sources": failures} if failures else None,
+        )
+        print(f"完成: source_analysis ({status})")
+
+    def _build_source_summary(
+        self,
+        item: dict[str, Any],
+        child_task_dir: Path,
+        child_manifest: dict[str, Any],
+        digest: dict[str, Any],
+    ) -> dict[str, Any]:
+        chunks = [chunk for chunk in digest.get("chunks", []) if isinstance(chunk, dict)]
+        speech_parts = [str(chunk.get("speech") or "").strip() for chunk in chunks if str(chunk.get("speech") or "").strip()]
+        visual_parts = [str(chunk.get("visual") or "").strip() for chunk in chunks if str(chunk.get("visual") or "").strip()]
+        key_facts = compact_list(speech_parts + visual_parts, max_items=8, max_chars_each=160)
+        summary_text = compact_text(" ".join(speech_parts[:6] + visual_parts[:4]), max_chars=800)
+        return {
+            "version": "source_summary_v1",
+            "source_id": item.get("source_id"),
+            "source_index": item.get("source_index"),
+            "display_name": item.get("display_name") or Path(str(item.get("original_path") or "")).name,
+            "source_type": item.get("source_type", ""),
+            "original_path": item.get("original_path", ""),
+            "duration_seconds": item.get("duration_seconds"),
+            "virtual_start_seconds": item.get("virtual_start_seconds"),
+            "virtual_end_seconds": item.get("virtual_end_seconds"),
+            "summary": summary_text,
+            "key_facts": key_facts,
+            "timeline_digest": digest,
+            "work_task_dir": relpath(child_task_dir, self.task_dir),
+            "work_manifest": relpath(child_task_dir / "manifest.json", self.task_dir),
+            "work_current_versions": child_manifest.get("current_versions", {}),
+        }
+
+    def step_source_aggregate(self) -> None:
+        analysis = self._load_step_json("source_analysis")
+        input_hash = stable_hash({
+            "source_analysis": self._step_content_hash("source_analysis"),
+            "limits": self.config.raw.get("multi_source_analysis", {}),
+        })
+        if self._can_reuse("source_aggregate", input_hash):
+            print("复用缓存: source_aggregate")
+            return
+
+        version, vdir = self._version_dir("source_aggregate", "source_aggregate")
+        ensure_dir(vdir)
+        summaries: list[dict[str, Any]] = []
+        chunks: list[dict[str, Any]] = []
+        source_items_by_id = {str(item.get("source_id") or ""): item for item in self._iter_source_items()}
+
+        for source_result in analysis.get("sources") or []:
+            if not isinstance(source_result, dict) or source_result.get("status") != "success":
+                continue
+            summary_rel = str(source_result.get("summary") or "")
+            summary_doc = read_json(self.task_dir / summary_rel, {}) if summary_rel else {}
+            source_id = str(summary_doc.get("source_id") or source_result.get("source_id") or "")
+            source_item = source_items_by_id.get(source_id, {})
+            virtual_start = float(source_item.get("virtual_start_seconds") or summary_doc.get("virtual_start_seconds") or 0)
+            source_summary = {
+                "source_id": source_id,
+                "source_index": source_item.get("source_index") or summary_doc.get("source_index"),
+                "display_name": summary_doc.get("display_name") or source_result.get("display_name") or "",
+                "source_type": summary_doc.get("source_type") or source_item.get("source_type") or "",
+                "duration_seconds": summary_doc.get("duration_seconds") or source_item.get("duration_seconds"),
+                "virtual_start_seconds": source_item.get("virtual_start_seconds", summary_doc.get("virtual_start_seconds")),
+                "virtual_end_seconds": source_item.get("virtual_end_seconds", summary_doc.get("virtual_end_seconds")),
+                "summary": summary_doc.get("summary", ""),
+                "key_facts": summary_doc.get("key_facts", []),
+            }
+            summaries.append(source_summary)
+
+            digest = summary_doc.get("timeline_digest") or {}
+            for index, chunk in enumerate(digest.get("chunks") or [], start=1):
+                if not isinstance(chunk, dict):
+                    continue
+                local_start = float(chunk.get("local_start_seconds", chunk.get("start_seconds", chunk.get("start", 0))) or 0)
+                local_end = float(chunk.get("local_end_seconds", chunk.get("end_seconds", chunk.get("end", local_start))) or local_start)
+                global_start = virtual_start + local_start
+                global_end = virtual_start + local_end
+                chunk_id = str(chunk.get("chunk_id") or f"chunk_{index:04d}")
+                global_chunk_id = f"{source_id}_{chunk_id}"
+                chunks.append({
+                    **chunk,
+                    "chunk_id": global_chunk_id,
+                    "global_chunk_id": global_chunk_id,
+                    "local_chunk_id": chunk_id,
+                    "source_id": source_id,
+                    "source_index": source_summary.get("source_index"),
+                    "local_start_seconds": round(local_start, 3),
+                    "local_end_seconds": round(local_end, 3),
+                    "start_seconds": round(global_start, 3),
+                    "end_seconds": round(global_end, 3),
+                    "start": round(global_start, 3),
+                    "end": round(global_end, 3),
+                    "source_start": seconds_to_timecode(global_start, ms=True),
+                    "source_end": seconds_to_timecode(global_end, ms=True),
+                })
+
+        chunks.sort(key=lambda item: (float(item.get("start_seconds") or 0), str(item.get("chunk_id") or "")))
+        total_duration = max((float(item.get("end_seconds") or 0) for item in chunks), default=0.0)
+        aggregate = {
+            "version": "source_aggregate_v1",
+            "source_count": len(self._iter_source_items()),
+            "successful_source_count": len(summaries),
+            "failed_sources": analysis.get("failed_sources", []),
+            "sources": summaries,
+            "timeline_digest": {
+                "version": "multi_source_timeline_digest_v1",
+                "video_duration_seconds": round(total_duration, 3),
+                "chunks": chunks,
+            },
+        }
+        out = write_json(vdir / "source_aggregate.json", aggregate)
+        self._write_status(vdir, self._base_status("source_aggregate", version, input_hash, [out]))
+        self._record_step(step="source_aggregate", version=version, status="success", output=relpath(out, self.task_dir), input_hash=input_hash, output_files=[out], extra={"summary": {"chunks": len(chunks), "sources": len(summaries)}})
+        print("完成: source_aggregate")
+
+    def _load_current_timeline_digest(self) -> dict[str, Any]:
+        if self._is_virtual_source_manifest():
+            aggregate = self._load_step_json("source_aggregate")
+            digest = aggregate.get("timeline_digest") if isinstance(aggregate, dict) else {}
+            return digest if isinstance(digest, dict) else {"chunks": []}
+        return self._load_step_json("timeline_digest")
+
+    def _current_timeline_digest_hash(self) -> str:
+        if self._is_virtual_source_manifest():
+            return self._step_content_hash("source_aggregate")
+        return self._step_content_hash("timeline_digest")
 
     def step_metadata(self) -> None:
         if self._is_virtual_multi_source():
@@ -1474,20 +1773,23 @@ class PipelineRunner:
 
     def step_content_analysis(self) -> None:
         result = self._run_text_agent("content_analysis", {
-            "timeline_digest": self._load_step_json("timeline_digest"),
+            "timeline_digest": self._load_current_timeline_digest(),
+            "source_aggregate": self._load_optional_step_json("source_aggregate", {}) if self._is_virtual_source_manifest() else {},
             "run_options": self._run_options_payload_minimal(),
         })
         self._write_compat_content_analysis(result)
 
     def step_video_understanding(self) -> None:
         self._run_text_agent("video_understanding", {
-            "timeline_digest": self._load_step_json("timeline_digest"),
+            "timeline_digest": self._load_current_timeline_digest(),
+            "source_aggregate": self._load_optional_step_json("source_aggregate", {}) if self._is_virtual_source_manifest() else {},
         })
 
     def step_highlight_detection(self) -> None:
         self._run_text_agent("highlight_detection", {
-            "timeline_digest": self._load_step_json("timeline_digest"),
+            "timeline_digest": self._load_current_timeline_digest(),
             "video_analysis": self._load_step_json("video_understanding"),
+            "source_aggregate": self._load_optional_step_json("source_aggregate", {}) if self._is_virtual_source_manifest() else {},
         })
 
     def step_candidate_refine(self) -> None:
@@ -1501,7 +1803,7 @@ class PipelineRunner:
         input_hash = stable_hash({
             "production_mode": self.options.production_mode,
             "candidate_source": self._candidate_source_hash(),
-            "timeline_digest": self._step_content_hash("timeline_digest"),
+            "timeline_digest": self._current_timeline_digest_hash(),
             "model": model,
             "fallback": fallback,
             "cfg": cfg,
@@ -2136,7 +2438,10 @@ class PipelineRunner:
         return "\n".join(parts[:4])
 
     def _build_timeline_context_index(self) -> list[dict[str, Any]]:
-        digest = self._load_optional_step_json("timeline_digest", {})
+        try:
+            digest = self._load_current_timeline_digest()
+        except Exception:
+            digest = {}
         out: list[dict[str, Any]] = []
         for item in digest.get("chunks", []):
             if not isinstance(item, dict):
@@ -3199,10 +3504,7 @@ class PipelineRunner:
         sub_by_id = {x["short_video_id"]: x for x in subtitles.get("outputs", [])}
         voice_by_id = {x.get("short_video_id"): x for x in voiceover_script.get("scripts", []) if isinstance(x, dict)}
         output_videos = []
-        try:
-            source_duration = float(ffprobe_json(self._source_video()).get("duration") or 0)
-        except Exception:
-            source_duration = 0.0
+        source_duration = self._current_source_duration_seconds()
         for script in editing.get("scripts", []):
             sid = script.get("short_video_id") or f"SV{len(output_videos)+1:03d}"
             clips = []
@@ -3240,22 +3542,26 @@ class PipelineRunner:
                     "original_audio_transcript_summary": seg.get("original_audio_transcript_summary", ""),
                     "crop_mode": "fit_blur" if self.options.aspect_ratio == "9:16" else "original",
                 }
-                clip = normalize_audio_mode_for_policy(
-                    raw_clip,
-                    audio_policy=self.options.audio_policy,
-                    settings=self.duration_settings,
-                    allow_original_audio_evidence=self.options.allow_original_audio_evidence,
-                )
-                original_volume = original_audio_volume_for_clip(
-                    clip,
-                    audio_policy=self.options.audio_policy,
-                    settings=self.duration_settings,
-                    allow_original_audio_evidence=self.options.allow_original_audio_evidence,
-                )
-                clip["original_audio_volume"] = original_volume
-                clip["keep_original_audio"] = original_volume > 0
-                clips.append(clip)
-                target += clip_duration
+                normalized_raw_clips = self._normalize_reassembly_clip_to_source_boundaries(raw_clip, start, end)
+                for normalized_raw_clip in normalized_raw_clips:
+                    normalized_duration = float(normalized_raw_clip.get("duration_seconds") or clip_duration)
+                    normalized_raw_clip["target_start"] = seconds_to_timecode(target, ms=True)
+                    clip = normalize_audio_mode_for_policy(
+                        normalized_raw_clip,
+                        audio_policy=self.options.audio_policy,
+                        settings=self.duration_settings,
+                        allow_original_audio_evidence=self.options.allow_original_audio_evidence,
+                    )
+                    original_volume = original_audio_volume_for_clip(
+                        clip,
+                        audio_policy=self.options.audio_policy,
+                        settings=self.duration_settings,
+                        allow_original_audio_evidence=self.options.allow_original_audio_evidence,
+                    )
+                    clip["original_audio_volume"] = original_volume
+                    clip["keep_original_audio"] = original_volume > 0
+                    clips.append(clip)
+                    target += normalized_duration
             video_duration = round(target, 3)
             tts_segments = tts_item.get("segments", []) if isinstance(tts_item.get("segments"), list) else []
             if tts_success and tts_item.get("timeline_mode") == "compact_segmented" and tts_segments:
@@ -3431,6 +3737,23 @@ class PipelineRunner:
         if status == "failed":
             detail = f": {blocked_error}" if blocked_error else ""
             raise RuntimeError(f"cut_plan blocked by duration/TTS/audio policy; check cut_plan.json{detail}")
+
+    def _current_source_duration_seconds(self) -> float:
+        if self._is_virtual_source_manifest():
+            aggregate = self._load_optional_step_json("source_aggregate", {})
+            digest = aggregate.get("timeline_digest", {}) if isinstance(aggregate, dict) else {}
+            duration = float(digest.get("video_duration_seconds") or 0)
+            if duration > 0:
+                return duration
+            try:
+                source_manifest = read_json(self._source_manifest_path(), {})
+                return float(source_manifest.get("total_duration_seconds") or 0)
+            except Exception:
+                return 0.0
+        try:
+            return float(ffprobe_json(self._source_video()).get("duration") or 0)
+        except Exception:
+            return 0.0
 
     def _compact_clips_to_voiceover_segments(
         self,
@@ -3708,7 +4031,7 @@ class PipelineRunner:
         - 如果片段跨源：自动拆成多段
         - 如果片段完全超出所有源：返回空数组
         """
-        if not self._is_virtual_multi_source():
+        if not self._is_virtual_source_manifest():
             return [dict(clip, _normalized_start=start, _normalized_end=end)]
 
         normalized: list[dict[str, Any]] = []
@@ -3756,7 +4079,7 @@ class PipelineRunner:
         if end <= start:
             raise RuntimeError(f"invalid reassembly clip time range: {clip.get('clip_id') or ''}")
 
-        if self._is_virtual_multi_source():
+        if self._is_virtual_source_manifest():
             source_id = clip.get("source_id")
             for item in self._iter_source_items():
                 if source_id and item.get("source_id") != source_id:

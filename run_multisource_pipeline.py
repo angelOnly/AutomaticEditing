@@ -22,6 +22,11 @@ OUTPUTS_DIR = ROOT / "outputs"
 COMMON_OUTPUTS_DIR = OUTPUTS_DIR / "__common__"
 
 COMMON_REUSABLE_STEPS = [
+    "source_analysis",
+    "source_aggregate",
+]
+COMMON_PROGRESS_STEPS = ["source_prepare"] + COMMON_REUSABLE_STEPS
+LEGACY_COMMON_REUSABLE_STEPS = [
     "source_prepare",
     "metadata",
     "audio_extract",
@@ -64,12 +69,12 @@ def _sync_common_progress_to_child(
         "production_mode",
         child_manifest.get("production_mode", "ai_voiceover"),
     )
-    child_manifest["source_count"] = len(request.get("source_items") or [])
+    child_manifest["source_count"] = len(_request_source_items(request))
     child_manifest.setdefault("steps", {})
 
     common_steps = common_manifest.get("steps", {}) or {}
 
-    for step in COMMON_REUSABLE_STEPS:
+    for step in COMMON_PROGRESS_STEPS:
         common_step = common_steps.get(step)
         if not common_step:
             continue
@@ -90,11 +95,11 @@ def _sync_common_progress_to_child(
     if common_manifest.get("status") == "failed":
         child_manifest["status"] = "failed"
         child_manifest["user_message"] = common_manifest.get("user_message", "")
-    elif any((common_steps.get(step) or {}).get("status") == "running" for step in COMMON_REUSABLE_STEPS):
+    elif any((common_steps.get(step) or {}).get("status") == "running" for step in COMMON_PROGRESS_STEPS):
         child_manifest["status"] = "running"
     elif all(
         (common_steps.get(step) or {}).get("status") in {"success", "partial_success", "skipped"}
-        for step in COMMON_REUSABLE_STEPS
+        for step in COMMON_PROGRESS_STEPS
         if step in common_steps
     ):
         # Common part is ready, but mode-specific steps may still be pending/running.
@@ -237,7 +242,7 @@ def _ensure_common_analysis(*, common_dir: Path, request: dict[str, Any], args: 
         if item == "--rerun-from" and index + 1 < len(passthrough):
             rerun_from = passthrough[index + 1]
             
-    force_rerun_common = bool(rerun in COMMON_REUSABLE_STEPS or rerun_from in COMMON_REUSABLE_STEPS)
+    force_rerun_common = bool(_is_common_rerun_step(rerun) or _is_common_rerun_step(rerun_from))
     
     with file_slot_lock(lock_name, slots=1):
         if not force_rerun_common and _common_analysis_ready(common_dir):
@@ -245,7 +250,11 @@ def _ensure_common_analysis(*, common_dir: Path, request: dict[str, Any], args: 
             _append_common_log(common_dir, "reuse common analysis outputs")
             return
 
-        print(f"Start common analysis: {common_dir}")
+        source_count = len(_request_source_items(request))
+        if source_count == 1:
+            print(f"Start common analysis: {common_dir} (single source unified pipeline)")
+        else:
+            print(f"Start common analysis: {common_dir} ({source_count} sources)")
         _append_common_log(common_dir, "start common analysis")
         _mark_source_prepare(common_dir, "running", request=request)
         try:
@@ -287,10 +296,10 @@ def _ensure_common_analysis(*, common_dir: Path, request: dict[str, Any], args: 
         if built.get("input_video"):
             pipeline_args.extend(["--input", str(built["input_video"])])
         
-        if rerun and rerun in COMMON_REUSABLE_STEPS:
-            pipeline_args.extend(["--rerun", rerun])
-        if rerun_from and rerun_from in COMMON_REUSABLE_STEPS:
-            pipeline_args.extend(["--rerun-from", rerun_from])
+        if rerun and _is_common_rerun_step(rerun):
+            pipeline_args.extend(["--rerun", _map_common_rerun_step(rerun)])
+        if rerun_from and _is_common_rerun_step(rerun_from):
+            pipeline_args.extend(["--rerun-from", _map_common_rerun_step(rerun_from)])
         try:
             _append_common_log(common_dir, "run common pipeline: " + " ".join(map(str, pipeline_args)))
             result = pipeline_main(pipeline_args)
@@ -299,7 +308,7 @@ def _ensure_common_analysis(*, common_dir: Path, request: dict[str, Any], args: 
                 raise RuntimeError(f"common analysis failed with return code {result}")
 
             if not _common_analysis_ready(common_dir):
-                raise RuntimeError("common analysis finished but timeline_digest is not ready")
+                raise RuntimeError("common analysis finished but source_aggregate is not ready")
             _append_common_log(common_dir, "common analysis ready")
         except Exception as exc:
             _append_common_log(common_dir, f"common analysis failed: {exc}")
@@ -348,7 +357,7 @@ def _copy_common_outputs_to_task(*, common_dir: Path, task_dir: Path, request: d
     manifest["reused_common_steps"] = COMMON_REUSABLE_STEPS
     manifest.setdefault("steps", {})
 
-    for step in COMMON_REUSABLE_STEPS:
+    for step in COMMON_PROGRESS_STEPS:
         status = dict((common_manifest.get("steps") or {}).get(step, {}))
         if status:
             status["reused_from"] = relpath(common_dir, ROOT)
@@ -379,10 +388,10 @@ def _run_mode_specific_pipeline(
             rerun_from = passthrough[i + 1]
             
     child_rerun_args = []
-    if rerun and rerun not in COMMON_REUSABLE_STEPS:
+    if rerun and not _is_common_rerun_step(rerun):
         child_rerun_args.extend(["--rerun", rerun])
     if rerun_from:
-        if rerun_from not in COMMON_REUSABLE_STEPS:
+        if not _is_common_rerun_step(rerun_from):
             child_rerun_args.extend(["--rerun-from", rerun_from])
         else:
             # If rerun_from is in common steps, the common pipeline already reran it.
@@ -392,7 +401,7 @@ def _run_mode_specific_pipeline(
             
     # If the user requested to rerun a single common step, the common pipeline reran it.
     # The child pipeline needs to rerun from its start_step to pick up the changes.
-    if rerun and rerun in COMMON_REUSABLE_STEPS:
+    if rerun and _is_common_rerun_step(rerun):
         child_rerun_args.extend(["--rerun-from", start_step])
             
     # Note: If no rerun options are provided, we do NOT force `--rerun-from start_step`.
@@ -453,11 +462,23 @@ def _strip_passthrough_rerun(passthrough: list[str]) -> list[str]:
     return stripped
 
 
+def _is_common_rerun_step(step: str | None) -> bool:
+    return bool(step and (step in COMMON_REUSABLE_STEPS or step in LEGACY_COMMON_REUSABLE_STEPS))
+
+
+def _map_common_rerun_step(step: str) -> str:
+    if step in COMMON_REUSABLE_STEPS:
+        return step
+    if step == "source_prepare":
+        return "source_analysis"
+    return "source_analysis"
+
+
 def _resolve_sources(request: dict[str, Any], config: Any) -> list[MultiSourceItem]:
     remote_config = load_remote_ucms_config(config)
     force_remote_download = bool(request.get("force_remote_download"))
     resolved: list[MultiSourceItem] = []
-    for index, item in enumerate(request.get("source_items") or [], start=1):
+    for index, item in enumerate(_request_source_items(request), start=1):
         if not isinstance(item, dict):
             raise ValueError(f"source_items[{index}] must be an object")
         source_type = str(item.get("source_type") or item.get("type") or "local")
@@ -468,7 +489,7 @@ def _resolve_sources(request: dict[str, Any], config: Any) -> list[MultiSourceIt
             path = _resolve_project_file(str(path_value))
             resolved.append(
                 MultiSourceItem(
-                    source_id=str(item.get("source_id") or f"src_{index:03d}"),
+                    source_id=str(item.get("source_id") or f"source_{index:03d}"),
                     source_type="local",
                     path=path,
                     display_name=str(item.get("display_name") or path.name),
@@ -489,7 +510,7 @@ def _resolve_sources(request: dict[str, Any], config: Any) -> list[MultiSourceIt
             path = _resolve_project_file(str(cached["path"]))
             resolved.append(
                 MultiSourceItem(
-                    source_id=str(item.get("source_id") or remote_video.get("remote_id") or remote_video.get("id") or f"src_{index:03d}"),
+                    source_id=str(item.get("source_id") or remote_video.get("remote_id") or remote_video.get("id") or f"source_{index:03d}"),
                     source_type="remote_ucms",
                     path=path,
                     display_name=str(item.get("display_name") or remote_video.get("display_name") or remote_video.get("name") or path.name),
@@ -499,8 +520,8 @@ def _resolve_sources(request: dict[str, Any], config: Any) -> list[MultiSourceIt
             continue
 
         raise ValueError(f"unsupported source_type: {source_type}")
-    if len(resolved) < 2:
-        raise ValueError("multi-source run requires at least 2 source items")
+    if not resolved:
+        raise ValueError("source_request 至少需要 1 个 source")
     return resolved
 
 
@@ -545,11 +566,18 @@ def _mark_source_prepare(
         "status": status,
         "output": output,
         "updated_at": now,
-        "source_count": len(request.get("source_items") or []),
+        "source_count": len(_request_source_items(request)),
     }
     if error:
         manifest["steps"]["source_prepare"]["error"] = error
     write_json(manifest_path, manifest)
+
+
+def _request_source_items(request: dict[str, Any]) -> list[dict[str, Any]]:
+    items = request.get("source_items")
+    if items is None:
+        items = request.get("sources")
+    return [item for item in (items or []) if isinstance(item, dict)]
 
 
 if __name__ == "__main__":
