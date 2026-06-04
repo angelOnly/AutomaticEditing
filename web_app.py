@@ -1850,6 +1850,21 @@ def _source_request_preview_items(task_dir: Path, task_id: str) -> list[dict[str
     return previews
 
 
+def _existing_task_source_request(task_dir: Path) -> dict[str, Any]:
+    request_path = task_dir / "input" / "source_request.json"
+    if not request_path.exists() or not request_path.is_file():
+        return {}
+    data = read_json(request_path, {})
+    return data if isinstance(data, dict) else {}
+
+
+def _valid_source_request_items(source_request: dict[str, Any]) -> list[dict[str, Any]]:
+    items = source_request.get("source_items") or []
+    if not isinstance(items, list):
+        return []
+    return [item for item in items if isinstance(item, dict)]
+
+
 def _prepare_mode_switched_run(req: RunRequest) -> None:
     if _collect_source_items(req) or req.rerun or req.rerun_from or not req.task_id:
         return
@@ -1857,13 +1872,39 @@ def _prepare_mode_switched_run(req: RunRequest) -> None:
     source_task_id = req.task_id.strip()
     if not source_task_id:
         return
-    task_dir = _task_dir(source_task_id)
-    manifest = read_json(task_dir / "manifest.json", {})
-    current_mode = _task_id_production_mode(source_task_id) or _manifest_production_mode(manifest)
+
+    source_task_dir = _task_dir(source_task_id)
+    source_manifest = read_json(source_task_dir / "manifest.json", {})
+
+    current_mode = _task_id_production_mode(source_task_id) or _manifest_production_mode(source_manifest)
     if current_mode == req.production_mode:
         return
 
-    req.input_video = str(_existing_task_source_video(task_dir, manifest))
+    source_request = _existing_task_source_request(source_task_dir)
+    source_items = _valid_source_request_items(source_request)
+
+    if source_items:
+        req.source_items = source_items
+        req.input_video = None
+        req.input_videos = []
+        req.remote_video = None
+        req.remote_videos = []
+
+        if source_request.get("aspect_ratio"):
+            req.aspect_ratio = str(source_request.get("aspect_ratio"))
+        if source_request.get("chunk_seconds"):
+            req.chunk_seconds = int(source_request.get("chunk_seconds"))
+        if source_request.get("frame_interval"):
+            req.frame_interval = int(source_request.get("frame_interval"))
+        if source_request.get("mode"):
+            req.mode = str(source_request.get("mode"))
+
+        req.force_remote_download = bool(source_request.get("force_remote_download", req.force_remote_download))
+        req.task_id = _with_mode_suffix(source_task_id, req.production_mode)
+        req.reuse_from_task_id = source_task_id
+        return
+
+    req.input_video = str(_existing_task_source_video(source_task_dir, source_manifest))
     req.task_id = _with_mode_suffix(source_task_id, req.production_mode)
     req.reuse_from_task_id = source_task_id
 
@@ -1891,7 +1932,10 @@ def _existing_task_source_video(task_dir: Path, manifest: dict[str, Any]) -> Pat
         return Path(original).resolve()
     source = manifest.get("source_video")
     if not source:
-        raise HTTPException(400, "existing task source video missing")
+        raise HTTPException(
+            400,
+            "已有任务缺少源视频，并且没有 input/source_request.json，无法从该任务切换生产模式。请重新选择原始素材后再启动目标模式。"
+        )
     return _resolve_task_source(task_dir, source)
 
 

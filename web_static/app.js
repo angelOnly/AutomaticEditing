@@ -857,7 +857,6 @@ async function loadTasks() {
         if (state.activeJob) {
           state.activeJob = null;
           state.activeJobStatus = null;
-          updateUI();
           updateStopJobButton();
         }
         state.selectedVideo = null;
@@ -1006,9 +1005,22 @@ async function deleteTask(task) {
       state.manifest = null;
       state.activeJob = null;
       state.activeJobStatus = null;
-      updateUI();
+      state.latestDraft = null;
+      state.drafts = [];
+      state.previewMode = "draft";
+      state.previewIntent = "auto";
+
       clearTaskPanels();
       $("activeTitle").textContent = "请选择视频或任务";
+      updateTaskSubtitle();
+      updateStopJobButton();
+      $("metricJob").textContent = "空闲";
+      $("metricCurrentStep").textContent = "-";
+      $("metricSteps").textContent = "-";
+      $("progressLabel").textContent = "-";
+      $("progressBreakdown").textContent = "成功 0 · 跳过 0 · 失败 0";
+      $("progressPercent").textContent = "0%";
+      $("progressFill").style.width = "0%";
     }
     await loadTasks();
   });
@@ -1536,13 +1548,15 @@ async function adoptRunningJob(taskId) {
   const jobs = await api("/api/jobs").catch(() => []);
   const job = jobs.find((item) => item.task_id === taskId && ["pending", "running"].includes(item.status));
   if (!job) {
-    updateUI(); // ensure UI is updated even if no job is found
+    updateStopJobButton();
+    updateTaskSubtitle();
     return;
   }
   state.activeJob = job.job_id;
   state.activeJobStatus = job;
   setRunControlsBusy(false);
-  updateUI();
+  updateStopJobButton();
+  updateTaskSubtitle();
   $("metricJob").textContent = jobStatusLabel(job.status);
   startJobPolling();
   await refreshLog().catch(() => {});
@@ -1676,6 +1690,7 @@ async function runSelected() {
     req.task_id = null;
   } else if (state.selectedTask) {
     req.task_id = state.selectedTask;
+    req.reuse_from_task_id = state.selectedTask;
   } else {
     alert("请选择一个本地视频、远程素材或已有任务。");
     return;
