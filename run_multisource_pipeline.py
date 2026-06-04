@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from newsclip_agent.config import load_config
-from newsclip_agent.multisource import MultiSourceItem, build_multi_source_video
+from newsclip_agent.multisource import MultiSourceItem, build_multi_source_video, prepare_multi_source_manifest
 from newsclip_agent.pipeline import main as pipeline_main
 from newsclip_agent.resource_locks import file_slot_lock
 from newsclip_agent.remote_ucms import download_ucms_video, load_remote_ucms_config
@@ -190,13 +190,11 @@ def main(argv: list[str] | None = None) -> int:
         config = load_config(ROOT / "config.toml")
         sources = _resolve_sources(request, config)
         multi_source_config = config.raw.get("multi_source", {})
-        built = build_multi_source_video(
+        built = prepare_multi_source_manifest(
             sources=sources,
             task_dir=task_dir,
             root_dir=ROOT,
             aspect_ratio=str(request.get("aspect_ratio") or args.aspect_ratio),
-            fps=int(multi_source_config.get("fps", 25)),
-            sample_rate=int(multi_source_config.get("sample_rate", 48000)),
         )
         _mark_source_prepare(task_dir, "success", request=request, built=built)
     except Exception as exc:
@@ -206,14 +204,14 @@ def main(argv: list[str] | None = None) -> int:
     pipeline_args = [
         "--task-id",
         args.task_id,
-        "--input",
-        str(built["input_video"]),
         "--source-manifest",
         str(built["source_manifest"]),
         "--aspect-ratio",
         str(request.get("aspect_ratio") or args.aspect_ratio),
         *passthrough,
     ]
+    if built.get("input_video"):
+        pipeline_args.extend(["--input", str(built["input_video"])])
     return pipeline_main(pipeline_args)
 
 
@@ -253,13 +251,11 @@ def _ensure_common_analysis(*, common_dir: Path, request: dict[str, Any], args: 
             config = load_config(ROOT / "config.toml")
             sources = _resolve_sources(request, config)
             multi_source_config = config.raw.get("multi_source", {})
-            built = build_multi_source_video(
+            built = prepare_multi_source_manifest(
                 sources=sources,
                 task_dir=common_dir,
                 root_dir=ROOT,
                 aspect_ratio=str(request.get("aspect_ratio") or args.aspect_ratio),
-                fps=int(multi_source_config.get("fps", 25)),
-                sample_rate=int(multi_source_config.get("sample_rate", 48000)),
             )
             _append_common_log(common_dir, f"source_prepare success: {built.get('input_video')}")
             _mark_source_prepare(common_dir, "success", request=request, built=built)
@@ -273,8 +269,6 @@ def _ensure_common_analysis(*, common_dir: Path, request: dict[str, Any], args: 
             common_dir.name,
             "--outputs-dir",
             str(common_dir.parent),
-            "--input",
-            str(built["input_video"]),
             "--source-manifest",
             str(built["source_manifest"]),
             "--aspect-ratio",
@@ -289,6 +283,8 @@ def _ensure_common_analysis(*, common_dir: Path, request: dict[str, Any], args: 
             "ai_voiceover",
             "--common-only",
         ]
+        if built.get("input_video"):
+            pipeline_args.extend(["--input", str(built["input_video"])])
         
         if rerun and rerun in COMMON_REUSABLE_STEPS:
             pipeline_args.extend(["--rerun", rerun])
@@ -371,7 +367,7 @@ def _run_mode_specific_pipeline(
 ) -> int:
     production_mode = str(request.get("production_mode") or _production_mode_from_passthrough(passthrough) or "ai_voiceover")
     start_step = "video_understanding" if production_mode == "highlight_reassembly" else "content_analysis"
-    source_video = _resolve_task_manifest_path(task_dir, "source_video")
+    source_video = _try_resolve_task_manifest_path(task_dir, "source_video")
     source_manifest = _resolve_task_manifest_path(task_dir, "source_manifest")
     rerun = None
     rerun_from = None
@@ -404,8 +400,6 @@ def _run_mode_specific_pipeline(
     pipeline_args = [
         "--task-id",
         args.task_id,
-        "--input",
-        str(source_video),
         "--source-manifest",
         str(source_manifest),
         "--aspect-ratio",
@@ -413,6 +407,8 @@ def _run_mode_specific_pipeline(
         *child_rerun_args,
         *_strip_passthrough_rerun(passthrough),
     ]
+    if source_video:
+        pipeline_args.extend(["--input", str(source_video)])
     return pipeline_main(pipeline_args)
 
 
@@ -421,6 +417,15 @@ def _resolve_task_manifest_path(task_dir: Path, key: str) -> Path:
     value = str(manifest.get(key) or "").strip()
     if not value:
         raise RuntimeError(f"manifest.{key} is missing")
+    path = Path(value)
+    return path if path.is_absolute() else task_dir / path
+
+
+def _try_resolve_task_manifest_path(task_dir: Path, key: str) -> Path | None:
+    manifest = read_json(task_dir / "manifest.json", {})
+    value = str(manifest.get(key) or "").strip()
+    if not value:
+        return None
     path = Path(value)
     return path if path.is_absolute() else task_dir / path
 
@@ -528,7 +533,10 @@ def _mark_source_prepare(
     if built:
         built_manifest = built.get("manifest") or {}
         manifest["source_mode"] = built_manifest.get("source_mode", "multi_source_concat_proxy")
-        manifest["source_video"] = relpath(Path(built["input_video"]), task_dir)
+        if built.get("input_video"):
+            manifest["source_video"] = relpath(Path(built["input_video"]), task_dir)
+        else:
+            manifest["source_video"] = ""
         manifest["source_manifest"] = relpath(Path(built["source_manifest"]), task_dir)
         manifest["source_videos"] = built_manifest.get("sources", [])
         output = manifest["source_manifest"]

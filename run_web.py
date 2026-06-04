@@ -43,7 +43,7 @@ if __name__ == "__main__":
     else:
         sys.argv.remove("--no-preflight")
 
-    host = "127.0.0.1"
+    host = "0.0.0.0"
     port = find_free_port(host=host, start=7860)
     print(f"Web 工作台地址: http://{host}:{port}")
     uvicorn.run("web_app:app", host=host, port=port, reload=False)

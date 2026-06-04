@@ -184,6 +184,86 @@ def build_multi_source_video(
     }
 
 
+def prepare_multi_source_manifest(
+    *,
+    sources: list[MultiSourceItem],
+    task_dir: Path,
+    root_dir: Path,
+    aspect_ratio: str = "16:9",
+) -> dict[str, Any]:
+    if len(sources) < 2:
+        raise ValueError("prepare_multi_source_manifest requires at least 2 sources")
+
+    input_dir = ensure_dir(task_dir / "input")
+    manifest_file = input_dir / "source_manifest.json"
+
+    from .utils import stable_hash, read_json
+    input_hash = stable_hash({
+        "sources": [{"id": s.source_id, "path": str(s.path.resolve()), "mtime": s.path.stat().st_mtime if s.path.exists() else 0} for s in sources],
+        "aspect_ratio": aspect_ratio,
+        "mode": "virtual",
+    })
+
+    if manifest_file.exists():
+        old_manifest = read_json(manifest_file, {})
+        if old_manifest.get("input_hash") == input_hash:
+            return {
+                "input_video": "",
+                "source_manifest": manifest_file,
+                "manifest": old_manifest,
+            }
+
+    timeline_sources: list[dict[str, Any]] = []
+    cursor = 0.0
+
+    for index, item in enumerate(sources, start=1):
+        source_path = item.path.resolve()
+        if not source_path.exists() or not source_path.is_file():
+            raise FileNotFoundError(f"source not found: {source_path}")
+        if source_path.suffix.lower() not in VIDEO_SUFFIXES:
+            raise ValueError(f"unsupported video type: {source_path.name}")
+
+        metadata = ffprobe_json(source_path)
+        duration = float(metadata.get("duration") or 0)
+        if duration <= 0:
+            raise ValueError(f"invalid duration: {source_path.name}")
+
+        timeline_sources.append(
+            {
+                "source_id": item.source_id or f"src_{index:03d}",
+                "source_index": index,
+                "source_type": item.source_type,
+                "display_name": item.display_name or source_path.name,
+                "original_path": str(source_path),
+                "original_duration_seconds": round(duration, 3),
+                "duration_seconds": round(duration, 3),
+                "virtual_start_seconds": round(cursor, 3),
+                "virtual_end_seconds": round(cursor + duration, 3),
+                "virtual_start": seconds_to_timecode(cursor, ms=True),
+                "virtual_end": seconds_to_timecode(cursor + duration, ms=True),
+                "remote": item.remote or {},
+            }
+        )
+        cursor += duration
+
+    manifest = {
+        "input_hash": input_hash,
+        "source_mode": "multi_source_virtual",
+        "timeline_mode": "virtual",
+        "source_count": len(sources),
+        "source_video": "",
+        "total_duration_seconds": round(cursor, 3),
+        "aspect_ratio": aspect_ratio,
+        "sources": timeline_sources,
+    }
+    write_json(manifest_file, manifest)
+    return {
+        "input_video": "",
+        "source_manifest": manifest_file,
+        "manifest": manifest,
+    }
+
+
 def _normalize_video_filter(aspect_ratio: str) -> str:
     if aspect_ratio == "9:16":
         return "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,setsar=1"

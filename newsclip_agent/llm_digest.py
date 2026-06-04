@@ -151,10 +151,14 @@ def select_frames_for_vision(frame_paths: list[str], max_frames: int = 6) -> lis
 
 
 def compact_chunk_for_vision(chunk: dict[str, Any]) -> dict[str, Any]:
-    return {
+    res = {
         "chunk_id": chunk.get("chunk_id", ""),
         "start": chunk.get("start", 0),
         "end": chunk.get("end", 0),
         "time_range": chunk.get("time_range", ""),
         "frame_count": len(chunk.get("frames", []) or []),
     }
+    if "source_id" in chunk:
+        res["source_id"] = chunk["source_id"]
+        res["local_time_range"] = f"{chunk.get('local_start_seconds', 0):.1f}-{chunk.get('local_end_seconds', 0):.1f}"
+    return res

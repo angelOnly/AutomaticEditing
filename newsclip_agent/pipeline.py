@@ -272,21 +272,30 @@ class PipelineRunner:
                 self.manifest.setdefault("steps", {}).setdefault("source_prepare", {"status": "skipped", "reason": "single_source"})
                 self._save_manifest()
             return
-        if not self.options.input:
-            raise ValueError("首次运行必须提供 --input，断点续跑可只提供 --task-id")
-        source = Path(self.options.input).resolve()
         source_manifest = read_json(Path(self.options.source_manifest), {}) if self.options.source_manifest else {}
-        input_dst = self.task_dir / "input" / ("source" + source.suffix.lower())
-        copy_or_link(source, input_dst)
+        is_virtual = source_manifest.get("source_mode") == "multi_source_virtual"
+        
+        if not self.options.input and not is_virtual:
+            raise ValueError("首次运行必须提供 --input，断点续跑可只提供 --task-id")
+            
         task = {
             "task_id": self.task_id,
             "created_at": now_iso(),
-            "source_video_original": str(source),
-            "source_video": relpath(input_dst, self.task_dir),
             "source_mode": source_manifest.get("source_mode", "single_source"),
             "source_manifest": relpath(Path(self.options.source_manifest), self.task_dir) if self.options.source_manifest else "",
             "source_videos": source_manifest.get("sources", []),
         }
+
+        if self.options.input:
+            source = Path(self.options.input).resolve()
+            input_dst = self.task_dir / "input" / ("source" + source.suffix.lower())
+            copy_or_link(source, input_dst)
+            task["source_video_original"] = str(source)
+            task["source_video"] = relpath(input_dst, self.task_dir)
+        else:
+            task["source_video_original"] = ""
+            task["source_video"] = ""
+
         if self.options.source_manifest:
             sm_path = Path(self.options.source_manifest).resolve()
             sm_dst = self.task_dir / "input" / "source_manifest.json"
@@ -434,7 +443,29 @@ class PipelineRunner:
 
     def _source_video(self) -> Path:
         source = self.manifest["source_video"]
+        if not source:
+            raise RuntimeError("source_video not found (are you calling this in virtual multi-source mode?)")
         p = Path(source)
+        return p if p.is_absolute() else self.task_dir / p
+
+    def _is_virtual_multi_source(self) -> bool:
+        return self.manifest.get("source_mode") == "multi_source_virtual"
+
+    def _source_manifest_path(self) -> Path:
+        manifest_path = self.manifest.get("source_manifest")
+        if not manifest_path:
+            raise RuntimeError("missing source_manifest")
+        p = Path(manifest_path)
+        return p if p.is_absolute() else self.task_dir / p
+
+    def _iter_source_items(self) -> list[dict[str, Any]]:
+        return self.manifest.get("source_videos", [])
+
+    def _resolve_source_item_path(self, item: dict[str, Any]) -> Path:
+        path = item.get("original_path")
+        if not path:
+            raise RuntimeError(f"missing original_path in source item: {item.get('source_id')}")
+        p = Path(path)
         return p if p.is_absolute() else self.task_dir / p
 
     def _version_dir(self, step: str, base: str) -> tuple[str, Path]:
@@ -644,12 +675,19 @@ class PipelineRunner:
                 end = float(chunk.get("end", start))
                 if end <= start:
                     continue
-                windows.append({
+                w = {
                     "id": chunk.get("chunk_id") or f"asr_{len(windows)+1:04d}",
                     "start": max(0.0, start - overlap),
                     "end": end + overlap,
                     "chunk_id": chunk.get("chunk_id", ""),
-                })
+                }
+                if "source_id" in chunk:
+                    w["source_id"] = chunk["source_id"]
+                    local_start = float(chunk.get("local_start_seconds", chunk.get("local_start", 0)))
+                    local_end = float(chunk.get("local_end_seconds", chunk.get("local_end", local_start)))
+                    w["local_start"] = max(0.0, local_start - overlap)
+                    w["local_end"] = local_end + overlap
+                windows.append(w)
             return windows
 
         if not audio_duration:
@@ -664,6 +702,36 @@ class PipelineRunner:
         return windows
 
     def step_metadata(self) -> None:
+        if self._is_virtual_multi_source():
+            sources = self._iter_source_items()
+            input_hash = stable_hash({"sources": [{"id": s.get("source_id"), "mtime": self._resolve_source_item_path(s).stat().st_mtime if self._resolve_source_item_path(s).exists() else 0} for s in sources]})
+            if self._can_reuse("metadata", input_hash):
+                print("复用缓存: metadata")
+                return
+            version, vdir = self._version_dir("metadata", "metadata")
+            ensure_dir(vdir)
+            metadata_list = []
+            for item in sources:
+                source = self._resolve_source_item_path(item)
+                meta = ffprobe_json(source)
+                metadata_list.append({
+                    "source_id": item.get("source_id"),
+                    "metadata": meta,
+                    "virtual_start_seconds": item.get("virtual_start_seconds"),
+                    "virtual_end_seconds": item.get("virtual_end_seconds"),
+                })
+            metadata = {
+                "source_mode": "multi_source_virtual",
+                "duration": sum(m.get("duration_seconds", 0) for m in sources),
+                "sources": metadata_list,
+            }
+            out = write_json(vdir / "video_metadata.json", metadata)
+            status = self._base_status("metadata", version, input_hash, [out])
+            self._write_status(vdir, status)
+            self._record_step(step="metadata", version=version, status="success", output=relpath(out, self.task_dir), input_hash=input_hash, output_files=[out])
+            print("完成: metadata")
+            return
+
         source = self._source_video()
         input_hash = stable_hash({"source": str(source), "size": source.stat().st_size, "mtime": source.stat().st_mtime})
         if self._can_reuse("metadata", input_hash):
@@ -680,6 +748,49 @@ class PipelineRunner:
         print("完成: metadata")
 
     def step_audio_extract(self) -> None:
+        if self._is_virtual_multi_source():
+            input_hash = stable_hash({"source": self._step_content_hash("metadata"), "audio": "mono_16k_wav"})
+            if self._can_reuse("audio_extract", input_hash):
+                print("复用缓存: audio_extract")
+                return
+            version, vdir = self._version_dir("audio_extract", "preprocess/audio")
+            ensure_dir(vdir)
+            metadata = self._load_step_json("metadata")
+            sources_meta = {m["source_id"]: m["metadata"] for m in metadata.get("sources", [])}
+            manifest_items = []
+            output_files = []
+            for item in self._iter_source_items():
+                source_id = item["source_id"]
+                source = self._resolve_source_item_path(item)
+                source_dir = ensure_dir(vdir / source_id)
+                out = source_dir / "audio.wav"
+                meta = sources_meta.get(source_id, {})
+                try:
+                    run_cmd(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(source), "-vn", "-ac", "1", "-ar", "16000", str(out)])
+                except Exception as exc:
+                    duration = float(meta.get("duration") or 0)
+                    has_video = bool(meta.get("width") or meta.get("height") or meta.get("video_codec"))
+                    has_audio = bool(meta.get("audio_codec"))
+                    if duration > 0 and has_video and has_audio:
+                        try:
+                            run_cmd(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-fflags", "+genpts", "-err_detect", "ignore_err", "-i", str(source), "-vn", "-ac", "1", "-ar", "16000", str(out)])
+                        except Exception as retry_exc:
+                            raise RuntimeError(self._source_media_error_message(source, meta, exc, retry_exc)) from retry_exc
+                    elif duration > 0 and has_video and not has_audio:
+                        run_cmd(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "anullsrc=channel_layout=mono:sample_rate=16000", "-t", str(duration), str(out)])
+                    else:
+                        raise RuntimeError(self._source_media_error_message(source, meta, exc)) from exc
+                manifest_items.append({"source_id": source_id, "audio": relpath(out, self.task_dir)})
+                output_files.append(out)
+            
+            manifest_out = write_json(vdir / "audio_manifest.json", {"sources": manifest_items})
+            output_files.append(manifest_out)
+            status = self._base_status("audio_extract", version, input_hash, output_files)
+            self._write_status(vdir, status)
+            self._record_step(step="audio_extract", version=version, status="success", output=relpath(manifest_out, self.task_dir), input_hash=input_hash, output_files=output_files)
+            print("完成: audio_extract")
+            return
+
         source = self._source_video()
         input_hash = stable_hash({"source": self._step_content_hash("metadata"), "audio": "mono_16k_wav"})
         if self._can_reuse("audio_extract", input_hash):
@@ -714,6 +825,50 @@ class PipelineRunner:
         print("完成: audio_extract")
 
     def step_frame_extract(self) -> None:
+        interval = 1 if self.options.mode == "dense" else self.options.frame_interval
+
+        if self._is_virtual_multi_source():
+            input_hash = stable_hash({"source": self._step_content_hash("metadata"), "interval": interval})
+            if self._can_reuse("frame_extract", input_hash):
+                print("复用缓存: frame_extract")
+                return
+            version, vdir = self._version_dir("frame_extract", "preprocess/frames")
+            ensure_dir(vdir)
+            all_frames = []
+            output_files = []
+            
+            for item in self._iter_source_items():
+                source_id = item["source_id"]
+                source = self._resolve_source_item_path(item)
+                source_dir = ensure_dir(vdir / source_id)
+                pattern = str(source_dir / "frame_%06d.jpg")
+                run_cmd(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(source), "-vf", f"fps=1/{interval}", "-q:v", "3", pattern])
+                frames = sorted(source_dir.glob("*.jpg"))
+                
+                virtual_start = item.get("virtual_start_seconds", 0)
+                for i, p in enumerate(frames):
+                    local_seconds = i * interval
+                    all_frames.append({
+                        "source_id": source_id,
+                        "index": i + 1,
+                        "time": seconds_to_timecode(local_seconds, ms=True),
+                        "seconds": local_seconds,
+                        "virtual_seconds": virtual_start + local_seconds,
+                        "file": relpath(p, self.task_dir)
+                    })
+                output_files.extend(frames[:5])
+
+            manifest = {
+                "frame_interval_seconds": interval,
+                "frames": all_frames,
+            }
+            out = write_json(vdir / "frames.json", manifest)
+            output_files.insert(0, out)
+            self._write_status(vdir, self._base_status("frame_extract", version, input_hash, output_files))
+            self._record_step(step="frame_extract", version=version, status="success", output=relpath(out, self.task_dir), input_hash=input_hash, output_files=[out])
+            print(f"完成: frame_extract，共 {len(all_frames)} 帧")
+            return
+
         source = self._source_video()
         interval = 1 if self.options.mode == "dense" else self.options.frame_interval
         input_hash = stable_hash({"source": self._step_content_hash("metadata"), "interval": interval})
@@ -741,6 +896,46 @@ class PipelineRunner:
         metadata = self._load_step_json("metadata")
         frames = self._load_step_json("frame_extract")
         chunk_seconds = self.options.chunk_seconds
+        
+        if self._is_virtual_multi_source():
+            input_hash = stable_hash({"metadata": self._step_content_hash("metadata"), "frames": self._step_content_hash("frame_extract"), "chunk_seconds": chunk_seconds})
+            if self._can_reuse("chunk_build", input_hash):
+                print("复用缓存: chunk_build")
+                return
+            version, vdir = self._version_dir("chunk_build", "preprocess/chunks")
+            ensure_dir(vdir)
+            chunks = []
+            frame_items = frames.get("frames", [])
+            for s_idx, source in enumerate(metadata.get("sources", [])):
+                source_id = source.get("source_id")
+                duration = float(source.get("metadata", {}).get("duration") or 0)
+                virtual_start = float(source.get("virtual_start_seconds", 0))
+                source_frames = [f for f in frame_items if f.get("source_id") == source_id]
+                for idx in range(max(1, math.ceil(duration / chunk_seconds))):
+                    local_start = idx * chunk_seconds
+                    local_end = min(duration, (idx + 1) * chunk_seconds)
+                    chunk_frames = [f for f in source_frames if local_start <= float(f.get("seconds", 0)) < local_end]
+                    chunk_id = f"chunk_{s_idx + 1:03d}_{idx + 1:04d}"
+                    chunks.append({
+                        "source_id": source_id,
+                        "chunk_id": chunk_id,
+                        "local_start_seconds": local_start,
+                        "local_end_seconds": local_end,
+                        "local_start": local_start, # compat
+                        "local_end": local_end, # compat
+                        "virtual_start_seconds": virtual_start + local_start,
+                        "virtual_end_seconds": virtual_start + local_end,
+                        "start": virtual_start + local_start,
+                        "end": virtual_start + local_end,
+                        "time_range": f"{seconds_to_timecode(virtual_start + local_start)}-{seconds_to_timecode(virtual_start + local_end)}",
+                        "frames": [f["file"] for f in chunk_frames],
+                    })
+            out = write_json(vdir / "chunks.json", {"chunks": chunks})
+            self._write_status(vdir, self._base_status("chunk_build", version, input_hash, [out]))
+            self._record_step(step="chunk_build", version=version, status="success", output=relpath(out, self.task_dir), input_hash=input_hash, output_files=[out])
+            print(f"完成: chunk_build，共 {len(chunks)} 个片段")
+            return
+
         input_hash = stable_hash({"metadata": metadata.get("duration"), "frames": self._step_content_hash("frame_extract"), "chunk_seconds": chunk_seconds})
         if self._can_reuse("chunk_build", input_hash):
             print("复用缓存: chunk_build")
@@ -812,13 +1007,27 @@ class PipelineRunner:
                     end = float(window["end"])
                     seg_audio = vdir / "segments_audio" / f"{wid}.wav"
 
-                    self._update_step_progress("asr", f"切分音频 {index}/{len(windows)}", {
-                        "current_segment": wid,
-                        "processed_segments": index - 1,
-                        "total_segments": len(windows),
-                        "current_range": [start, end],
-                    })
-                    self._cut_audio_segment(audio, seg_audio, start, end)
+                    source_id = window.get("source_id")
+                    if source_id:
+                        audio_manifest = self._load_step_json("audio_extract")
+                        source_audio = next((Path(self.task_dir) / s["audio"] for s in audio_manifest.get("sources", []) if s["source_id"] == source_id), audio)
+                        local_start = float(window["local_start"])
+                        local_end = float(window["local_end"])
+                        self._update_step_progress("asr", f"切分音频 {index}/{len(windows)}", {
+                            "current_segment": wid,
+                            "processed_segments": index - 1,
+                            "total_segments": len(windows),
+                            "current_range": [start, end],
+                        })
+                        self._cut_audio_segment(source_audio, seg_audio, local_start, local_end)
+                    else:
+                        self._update_step_progress("asr", f"切分音频 {index}/{len(windows)}", {
+                            "current_segment": wid,
+                            "processed_segments": index - 1,
+                            "total_segments": len(windows),
+                            "current_range": [start, end],
+                        })
+                        self._cut_audio_segment(audio, seg_audio, start, end)
 
                     self._update_step_progress("asr", f"FunASR 转写中 {index}/{len(windows)}", {
                         "current_segment": wid,
@@ -1063,7 +1272,7 @@ class PipelineRunner:
         for chunk in chunks.get("chunks", []):
             vr = self._apply_manual_override(vdir, visual_by_id.get(chunk["chunk_id"], {}), "vision", chunk["chunk_id"])
             segs = self._segments_in_range(asr.get("segments", []), chunk["start"], chunk["end"])
-            timeline.append({
+            t_entry = {
                 "chunk_id": chunk["chunk_id"],
                 "start": seconds_to_timecode(chunk["start"], ms=True),
                 "end": seconds_to_timecode(chunk["end"], ms=True),
@@ -1081,7 +1290,12 @@ class PipelineRunner:
                 "hook_score": vr.get("hook_score", 0),
                 "risk_tags": vr.get("risk_tags", []),
                 "notes": vr.get("notes", ""),
-            })
+            }
+            if "source_id" in chunk:
+                t_entry["source_id"] = chunk["source_id"]
+                t_entry["local_start_seconds"] = chunk.get("local_start_seconds", chunk.get("local_start", 0))
+                t_entry["local_end_seconds"] = chunk.get("local_end_seconds", chunk.get("local_end", 0))
+            timeline.append(t_entry)
         out = write_json(vdir / "merged_timeline.json", {"timeline": timeline, "source_versions": {"asr": self._step_content_hash("asr"), "vision": self._step_content_hash("vision")}})
         self._write_status(vdir, self._base_status("timeline", version, input_hash, [out]))
         self._record_step(step="timeline", version=version, status="success", output=relpath(out, self.task_dir), input_hash=input_hash, output_files=[out])
@@ -2708,6 +2922,20 @@ class PipelineRunner:
         end = timecode_to_seconds(clip.get("source_end"))
         if end <= start:
             raise RuntimeError(f"invalid reassembly clip time range: {clip.get('clip_id') or ''}")
+
+        if self._is_virtual_multi_source():
+            source_id = clip.get("source_id")
+            for item in self._iter_source_items():
+                if source_id and item.get("source_id") != source_id:
+                    continue
+                virtual_start = float(item.get("virtual_start_seconds") or 0)
+                virtual_end = float(item.get("virtual_end_seconds") or 0)
+                if virtual_start <= start and end <= virtual_end:
+                    source_path = self._resolve_source_item_path(item)
+                    return source_path, start - virtual_start, end - virtual_start
+            raise RuntimeError(
+                f"clip {clip.get('clip_id') or ''} ({start}-{end}) exceeds source boundaries"
+            )
 
         manifest_value = str(self.manifest.get("source_manifest") or "").strip()
         source_manifest_path = Path(manifest_value)
