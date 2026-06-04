@@ -75,11 +75,8 @@ AI_VOICEOVER_STEP_ORDER = [
     "timeline",
     "timeline_digest",
     "content_analysis",
-    "candidate_refine",
     "short_video_edit_plan",
-    "merge_decision",
     "voiceover_script",
-    "voiceover_quality_check",
     "tts",
     "subtitles",
     "cut_plan",
@@ -98,7 +95,6 @@ HIGHLIGHT_REASSEMBLY_STEP_ORDER = [
     "timeline_digest",
     "video_understanding",
     "highlight_detection",
-    "candidate_refine",
     "highlight_reassembly_plan",
     "reassembly_cut_plan",
     "reassembly_render",
@@ -108,11 +104,8 @@ UNIFIED_AI_VOICEOVER_STEP_ORDER = [
     "source_analysis",
     "source_aggregate",
     "content_analysis",
-    "candidate_refine",
     "short_video_edit_plan",
-    "merge_decision",
     "voiceover_script",
-    "voiceover_quality_check",
     "tts",
     "subtitles",
     "cut_plan",
@@ -124,7 +117,6 @@ UNIFIED_HIGHLIGHT_REASSEMBLY_STEP_ORDER = [
     "source_aggregate",
     "video_understanding",
     "highlight_detection",
-    "candidate_refine",
     "highlight_reassembly_plan",
     "reassembly_cut_plan",
     "reassembly_render",
@@ -152,21 +144,18 @@ DEPENDENCIES = {
     "timeline": ["asr", "asr_digest", "vision"],
     "timeline_digest": ["timeline", "asr_digest"],
     "content_analysis": ["timeline_digest", "source_aggregate"],
-    "candidate_refine": ["timeline_digest", "source_aggregate"],
-    "short_video_edit_plan": ["content_analysis", "candidate_refine"],
-    "merge_decision": ["short_video_edit_plan"],
+    "short_video_edit_plan": ["content_analysis"],
     "video_understanding": ["timeline_digest", "source_aggregate"],
     "highlight_detection": ["timeline_digest", "source_aggregate", "video_understanding"],
     "short_video_planning": ["highlight_detection", "video_understanding"],
     "editing_script": ["short_video_planning", "highlight_detection", "timeline"],
-    "voiceover_script": ["short_video_edit_plan", "merge_decision"],
-    "voiceover_quality_check": ["voiceover_script", "short_video_edit_plan"],
+    "voiceover_script": ["short_video_edit_plan"],
     "risk_review": ["editing_script", "voiceover_script", "video_understanding"],
-    "tts": ["voiceover_script", "voiceover_quality_check"],
+    "tts": ["voiceover_script"],
     "subtitles": ["voiceover_script", "tts"],
     "cut_plan": ["short_video_edit_plan", "voiceover_script", "subtitles", "tts"],
     "render": ["cut_plan"],
-    "highlight_reassembly_plan": ["highlight_detection", "video_understanding", "candidate_refine"],
+    "highlight_reassembly_plan": ["highlight_detection", "video_understanding"],
     "reassembly_cut_plan": ["highlight_reassembly_plan"],
     "reassembly_render": ["reassembly_cut_plan"],
 }
@@ -175,14 +164,11 @@ DEPENDENCIES = {
 AGENT_INFO = {
     "video_understanding": ("agents/video_understanding", "video_analysis.json", prompts.VIDEO_UNDERSTANDING_PROMPT, "video_understanding_v1"),
     "highlight_detection": ("agents/highlight_detection", "candidate_clips.json", prompts.HIGHLIGHT_DETECTION_PROMPT, "highlight_detection_v1"),
-    "short_video_planning": ("agents/short_video_planning", "short_video_plan.json", prompts.SHORT_VIDEO_PLANNER_PROMPT, "short_video_planning_v1"),
-    "editing_script": ("agents/editing_script", "editing_script.json", prompts.EDITING_DIRECTOR_PROMPT, "editing_script_v1"),
+    "short_video_planning": ("agents/short_video_planning", "short_video_plan.json", prompts.SHORT_VIDEO_EDIT_PLAN_TEXT_PROMPT, "short_video_planning_compat_v2"),
+    "editing_script": ("agents/editing_script", "editing_script.json", prompts.SHORT_VIDEO_EDIT_PLAN_TEXT_PROMPT, "editing_script_compat_v2"),
     "content_analysis": ("agents/content_analysis", "content_analysis.json", prompts.CONTENT_ANALYSIS_PROMPT, "content_analysis_v1"),
     "short_video_edit_plan": ("agents/short_video_edit_plan", "short_video_edit_plan.json", prompts.SHORT_VIDEO_EDIT_PLAN_TEXT_PROMPT, "short_video_edit_plan_text_v1"),
-    "merge_decision": ("agents/merge_decision", "merge_decision.json", prompts.MERGE_DECISION_PROMPT, "merge_decision_v1"),
     "voiceover_script": ("agents/voiceover_script", "voiceover_script.json", prompts.VOICEOVER_SCRIPT_TEXT_PROMPT, "voiceover_script_text_v1"),
-    "voiceover_quality_check": ("agents/voiceover_quality_check", "voiceover_quality_check.json", prompts.VOICEOVER_QUALITY_CHECK_PROMPT, "voiceover_quality_check_v1"),
-    "risk_review": ("agents/risk_review", "review_report.json", prompts.RISK_REVIEW_PROMPT, "risk_review_v1"),
     "highlight_reassembly_plan": ("agents/highlight_reassembly", "highlight_reassembly_plan.json", prompts.HIGHLIGHT_REASSEMBLY_TEXT_PROMPT, "highlight_reassembly_text_v1"),
 }
 
@@ -1522,12 +1508,15 @@ class PipelineRunner:
             raw_text = asr_by_chunk_id.get(chunk_id, "")
             ts = self._format_chunk_ts(chunk)
             if not raw_text.strip():
-                return index, {"chunk_id": chunk_id, "ts": ts, "speech": ""}
+                return index, {"chunk_id": chunk_id, "speech": ""}
 
             target_chars = int(cfg.get("target_chars_per_chunk", 320) or 320)
             input_data = {
-                "target_chars": target_chars,
+                "chunk_id": chunk_id,
+                "time_range": ts,
                 "asr_text": raw_text[: int(cfg.get("max_input_chars_per_chunk", 4000) or 4000)],
+                "source_id": chunk.get("source_id", ""),
+                "language": str(cfg.get("language", "") or "zh"),
             }
             write_json(vdir / chunk_id / "input.json", input_data)
             try:
@@ -1549,7 +1538,7 @@ class PipelineRunner:
             except Exception as exc:
                 write_json(vdir / "_errors" / f"{chunk_id}.json", {"chunk_id": chunk_id, "error": str(exc), "created_at": now_iso()})
                 speech = compact_asr_for_llm(raw_text, max_chars=target_chars)
-            return index, {"chunk_id": chunk_id, "ts": ts, "speech": speech}
+            return index, {"chunk_id": chunk_id, "speech": speech}
 
         results: list[tuple[int, dict[str, Any]]] = []
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -1635,10 +1624,11 @@ class PipelineRunner:
             frame_paths = [str(self.task_dir / f) for f in chunk.get("frames", []) if (self.task_dir / f).exists()]
             frame_paths = select_frames_for_vision(frame_paths, max_frames=max(1, int(self.options.vision_max_frames_per_chunk or 1)))
             input_data = {
-                "chunk": compact_chunk_for_vision(chunk),
+                "chunk_id": cid,
+                "time_range": chunk.get("time_range", ""),
+                "source_id": chunk.get("source_id", ""),
+                "frames": f"{len(frame_paths)} key frames attached as images",
                 "asr_text": asr_digest_by_id.get(cid) or compact_asr_for_llm(" ".join(s.get("text", "") for s in asr_segments), max_chars=500),
-                "prompt_version": prompt_version,
-                "model": model,
             }
             write_json(cdir / "input.json", input_data)
             write_text(cdir / "prompt.txt", prompts.VISION_CHUNK_PROMPT)
@@ -1653,9 +1643,7 @@ class PipelineRunner:
                     debug_dir=cdir / "_llm_debug",
                 )
                 parsed = result.parsed
-                if isinstance(parsed, dict):
-                    parsed.setdefault("chunk_id", cid)
-                    parsed.setdefault("time_range", chunk["time_range"])
+                parsed = self._materialize_vision_chunk_result(parsed, chunk_id=cid, time_range=chunk["time_range"])
                 raw = {
                     "model": result.model,
                     "created_at": now_iso(),
@@ -1762,7 +1750,7 @@ class PipelineRunner:
                 "asr_digest": asr_digest_by_id.get(str(chunk["chunk_id"]), ""),
                 "asr_segments": segs,
                 "scene_type": vr.get("scene_type", ""),
-                "visual_summary": vr.get("visual_summary", ""),
+                "visual_summary": vr.get("visual_summary") or vr.get("visual", ""),
                 "screen_text": vr.get("screen_text", []),
                 "visible_people": vr.get("visible_people", []),
                 "is_live_scene": vr.get("is_live_scene", False),
@@ -1850,20 +1838,20 @@ class PipelineRunner:
             chunks = chunks[:max_chunks]
         
         lines = [
-            "格式说明：片段=素材序号 时间段，随后两行依次为声音内容、画面内容。",
+            "格式说明：每个片段都包含 chunk_id、source_id、时间段，随后两行依次为声音内容、画面内容。",
             "",
             "片段列表："
         ]
         for c in chunks:
-            idx = c.get("source_index", "")
-            if not idx:
-                idx = "1"
-            start = seconds_to_timecode(c.get("start", 0))
-            end = seconds_to_timecode(c.get("end", 0))
+            chunk_id = c.get("chunk_id", "")
+            source_id = c.get("source_id") or "source_1"
+            source_index = c.get("source_index", "")
+            start = seconds_to_timecode(float(c.get("start_seconds", c.get("start", 0)) or 0), ms=True)
+            end = seconds_to_timecode(float(c.get("end_seconds", c.get("end", 0)) or 0), ms=True)
             speech = str(c.get("speech") or "").strip() or "无"
             visual = str(c.get("visual") or "").strip() or "无"
             
-            lines.append(f"{idx} {start}-{end}：")
+            lines.append(f"[{chunk_id}] source_id={source_id} source_index={source_index} time={start}-{end}")
             lines.append(speech)
             lines.append(visual)
             lines.append("")
@@ -1875,15 +1863,13 @@ class PipelineRunner:
         opts = self._run_options_payload_minimal()
         
         lines = [
-            "任务：请判断这些素材的新闻主题、素材关系、可剪方向，并提取候选短视频角度。",
+            "任务：请判断这些素材的新闻主题、素材关系，并提取适合 AI 配音解说的候选片段。",
             ""
         ]
         if opts:
-            lines.append("要求：")
-            if opts.get("target_duration_seconds"):
-                lines.append(f"- 目标时长：{opts['target_duration_seconds']}秒")
-            if opts.get("allow_long_video"):
-                lines.append("- 允许长视频")
+            lines.append("运行参数：")
+            lines.append(f"- output_mode：{opts.get('output_mode')}")
+            lines.append(f"- max_output_videos：{opts.get('max_output_videos')}")
             lines.append("")
             
         src_text = self._format_source_aggregate_text(aggregate)
@@ -1918,9 +1904,14 @@ class PipelineRunner:
             "任务：请从以下片段中找适合原声重组的高光片段。",
             ""
         ]
-        if video_analysis and video_analysis.get("overall_understanding"):
+        if video_analysis:
             lines.append("整体理解：")
-            lines.append(str(video_analysis["overall_understanding"]))
+            lines.append(json.dumps({
+                "main_topic": video_analysis.get("main_topic", ""),
+                "video_type": video_analysis.get("video_type", ""),
+                "summary": video_analysis.get("summary") or video_analysis.get("understanding", ""),
+                "key_facts": video_analysis.get("key_facts", []),
+            }, ensure_ascii=False))
             lines.append("")
             
         lines.append(self._format_timeline_chunks_text(digest))
@@ -1929,116 +1920,29 @@ class PipelineRunner:
     def step_content_analysis(self) -> None:
         text_input = self._build_content_analysis_brief_text()
         result = self._run_text_agent("content_analysis", text_input)
+        result = self._materialize_candidate_clips_from_chunks(result, source_step="content_analysis")
+        self._overwrite_step_json("content_analysis", result, materialized=True)
         self._write_compat_content_analysis(result)
 
     def step_video_understanding(self) -> None:
         text_input = self._build_video_understanding_brief_text()
-        self._run_text_agent("video_understanding", text_input)
+        result = self._run_text_agent("video_understanding", text_input)
+        result = self._materialize_video_understanding(result)
+        self._overwrite_step_json("video_understanding", result, materialized=True)
 
     def step_highlight_detection(self) -> None:
         text_input = self._build_highlight_detection_brief_text()
-        self._run_text_agent("highlight_detection", text_input)
+        result = self._run_text_agent("highlight_detection", text_input)
+        result = self._materialize_candidate_clips_from_chunks(result, source_step="highlight_detection")
+        self._overwrite_step_json("highlight_detection", result, materialized=True)
 
     def step_candidate_refine(self) -> None:
-        cfg = self.config.raw.get("candidate_refine", {})
-        candidate_clips = self._load_candidate_clips_for_current_mode()
-        topic = self._load_video_topic_or_brief()
-        context_index = self._build_timeline_context_index()
-        model = str(cfg.get("model_name") or self._text_model_name())
-        fallback = list(cfg.get("fallback_models") or [])
-        max_workers = max(1, int(cfg.get("max_workers", 4) or 4))
-        input_hash = stable_hash({
-            "production_mode": self.options.production_mode,
-            "candidate_source": self._candidate_source_hash(),
-            "timeline_digest": self._current_timeline_digest_hash(),
-            "model": model,
-            "fallback": fallback,
-            "cfg": cfg,
-        })
-        if self._can_reuse("candidate_refine", input_hash):
-            print("澶嶇敤缂撳瓨: candidate_refine")
-            return
-
-        version, vdir = self._version_dir("candidate_refine", "candidate_refine")
-        ensure_dir(vdir)
-
-        def refine_one(index: int, clip: dict[str, Any]) -> tuple[int, dict[str, Any]]:
-            clip_id = self._clip_id(clip, index)
-            input_data = {
-                "topic": topic,
-                "clip": {
-                    "id": clip_id,
-                    "t": self._format_clip_time(clip),
-                    "dur": clip.get("duration_seconds"),
-                    "sum": compact_text(str(clip.get("summary") or clip.get("reason") or ""), max_chars=500),
-                    "visual": compact_text(str(clip.get("visual") or clip.get("visual_summary") or clip.get("why_this_visual_matters") or ""), max_chars=500),
-                    "speech": compact_text(str(clip.get("speech") or clip.get("asr_text") or clip.get("original_audio_transcript_summary") or ""), max_chars=500),
-                    "score": self._compact_clip_score(clip),
-                },
-                "ctx": self._nearby_context_for_clip(
-                    clip,
-                    context_index,
-                    max_chunks=int(cfg.get("max_context_chunks", 3) or 3),
-                ),
-            }
-            write_json(vdir / clip_id / "input.json", input_data)
-            try:
-                if self.llm_text is None:
-                    raise RuntimeError("missing text llm")
-                result = self.llm_text.call_json(
-                    model=model,
-                    fallback_models=fallback,
-                    prompt=prompts.CANDIDATE_REFINE_PROMPT,
-                    input_data=input_data,
-                    temperature=float(cfg.get("temperature", 0.0) or 0.0),
-                    max_tokens=int(cfg.get("max_tokens", 300) or 300),
-                    debug_dir=vdir / "_llm_debug" / clip_id,
-                )
-                parsed = result.parsed if isinstance(result.parsed, dict) else {}
-                item = self._normalize_candidate_refine_output(
-                    clip_id=clip_id,
-                    parsed=parsed,
-                    fallback_rank=index + 1,
-                )
-            except Exception as exc:
-                write_json(vdir / "_errors" / f"{clip_id}.json", {"clip_id": clip_id, "error": str(exc), "created_at": now_iso()})
-                item = {
-                    "clip_id": clip_id,
-                    "k": 1,
-                    "u": "both",
-                    "i": 0,
-                    "c": 0,
-                    "g": "g1",
-                    "r": index + 1,
-                }
-            return index, item
-
-        results: list[tuple[int, dict[str, Any]]] = []
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [executor.submit(refine_one, index, clip) for index, clip in enumerate(candidate_clips)]
-            for future in as_completed(futures):
-                results.append(future.result())
-
-        results.sort(key=lambda x: x[0])
-        output = {
-            "version": "candidate_refine_v1",
-            "clips": [item for _index, item in results],
-        }
-        out = write_json(vdir / "candidate_refine.json", output)
-        self._write_status(vdir, self._base_status("candidate_refine", version, input_hash, [out]))
-        self._record_step(
-            step="candidate_refine",
-            version=version,
-            status="success",
-            output=relpath(out, self.task_dir),
-            input_hash=input_hash,
-            output_files=[out],
-            extra={"summary": {"clips": len(output["clips"]), "max_workers": max_workers}, "model": model},
-        )
-        print("瀹屾垚: candidate_refine")
+        self._mark_skipped("candidate_refine", "已删除：候选筛选前移到 content_analysis/highlight_detection，并由代码 materialize。")
 
     def step_highlight_reassembly_plan(self) -> None:
-        self._run_text_agent("highlight_reassembly_plan", self._build_highlight_reassembly_plan_text())
+        result = self._run_text_agent("highlight_reassembly_plan", self._build_highlight_reassembly_plan_text())
+        result = self._materialize_highlight_reassembly_plan(result)
+        self._overwrite_step_json("highlight_reassembly_plan", result, materialized=True)
 
     def step_short_video_planning(self) -> None:
         self._run_text_agent("short_video_planning", {
@@ -2059,59 +1963,12 @@ class PipelineRunner:
 
     def step_short_video_edit_plan(self) -> None:
         result = self._run_text_agent("short_video_edit_plan", self._build_short_video_edit_plan_text())
+        result = self._materialize_short_video_edit_plan(result)
+        self._overwrite_step_json("short_video_edit_plan", result, materialized=True)
         self._write_compat_short_video_plan_and_editing_script(result)
 
     def step_merge_decision(self) -> None:
-        cfg = self.config.raw.get("merge_decision", {})
-        edit_plan = self._load_step_json("short_video_edit_plan")
-        scripts = [x for x in edit_plan.get("scripts", []) if isinstance(x, dict)]
-        model = str(cfg.get("model_name") or self._text_model_name())
-        fallback = list(cfg.get("fallback_models") or [])
-        input_text = self._build_merge_decision_text(edit_plan)
-        input_hash = stable_hash({
-            "short_video_edit_plan": self._step_content_hash("short_video_edit_plan"),
-            "model": model,
-            "fallback": fallback,
-            "cfg": cfg,
-            "input": input_text,
-        })
-        if self._can_reuse("merge_decision", input_hash):
-            print("澶嶇敤缂撳瓨: merge_decision")
-            return
-        version, vdir = self._version_dir("merge_decision", "agents/merge_decision")
-        ensure_dir(vdir)
-        write_text(vdir / "input.txt", input_text)
-        write_text(vdir / "prompt.txt", prompts.MERGE_DECISION_PROMPT)
-        if len(scripts) <= 1:
-            decision = {"version": "merge_decision_v1", "m": 0, "groups": []}
-        else:
-            try:
-                if self.llm_text is None:
-                    raise RuntimeError("missing text llm")
-                result = self.llm_text.call_json(
-                    model=model,
-                    fallback_models=fallback,
-                    prompt=prompts.MERGE_DECISION_PROMPT,
-                    input_data=input_text,
-                    temperature=float(cfg.get("temperature", 0.0) or 0.0),
-                    max_tokens=int(cfg.get("max_tokens", 300) or 300),
-                    debug_dir=vdir / "_llm_debug",
-                )
-                decision = self._normalize_merge_decision(result.parsed)
-            except Exception as exc:
-                write_json(vdir / "_errors" / "main.json", {"error": str(exc), "created_at": now_iso()})
-                should_merge = self._should_merge_short_video_scripts(scripts)
-                decision = {"version": "merge_decision_v1", "m": 1 if should_merge else 0, "groups": [[str(s.get("short_video_id") or f"v_{i + 1:03d}") for i, s in enumerate(scripts)]] if should_merge else [], "fallback": "rules"}
-        final_plan = self._apply_merge_decision_to_edit_plan(edit_plan, decision)
-        if final_plan != edit_plan:
-            plan_path = write_json(self.task_dir / self._step_output("short_video_edit_plan"), final_plan)
-            self.manifest.setdefault("steps", {}).setdefault("short_video_edit_plan", {})["output_hash"] = output_hash([plan_path])
-            self._save_manifest()
-            self._write_compat_short_video_plan_and_editing_script(final_plan)
-        out = write_json(vdir / "merge_decision.json", decision)
-        self._write_status(vdir, self._base_status("merge_decision", version, input_hash, [out]) | {"model": model})
-        self._record_step(step="merge_decision", version=version, status="success", output=relpath(out, self.task_dir), input_hash=input_hash, output_files=[out], extra={"model": model})
-        print("瀹屾垚: merge_decision")
+        self._mark_skipped("merge_decision", "已删除：不要乱拆的规则已前移到 short_video_edit_plan。")
 
     def step_voiceover_script(self) -> None:
         edit_plan = self._load_step_json("short_video_edit_plan")
@@ -2154,6 +2011,8 @@ class PipelineRunner:
                 )
                 parsed = result.parsed if isinstance(result.parsed, dict) else {}
                 items = [x for x in parsed.get("scripts", []) if isinstance(x, dict)]
+                if not items and parsed.get("short_video_id"):
+                    items = [parsed]
                 if not items:
                     items = [self._fallback_voiceover_script(script, short_video_id)]
             except Exception as exc:
@@ -2184,80 +2043,7 @@ class PipelineRunner:
         self._enforce_long_video_confirmation_after_voiceover(final_output)
 
     def step_voiceover_quality_check(self) -> None:
-        cfg = self.config.raw.get("voiceover_quality_check", {})
-        voiceover = self._load_step_json("voiceover_script")
-        edit_plan = self._load_step_json("short_video_edit_plan")
-        scripts = [x for x in voiceover.get("scripts", []) if isinstance(x, dict)]
-        model = str(cfg.get("model_name") or self._text_model_name())
-        fallback = list(cfg.get("fallback_models") or [])
-        max_workers = max(1, int(cfg.get("max_workers", 2) or 2))
-        input_hash = stable_hash({
-            "voiceover_script": self._step_content_hash("voiceover_script"),
-            "short_video_edit_plan": self._step_content_hash("short_video_edit_plan"),
-            "model": model,
-            "fallback": fallback,
-            "cfg": cfg,
-        })
-        if self._can_reuse("voiceover_quality_check", input_hash):
-            print("澶嶇敤缂撳瓨: voiceover_quality_check")
-            return
-        version, vdir = self._version_dir("voiceover_quality_check", "agents/voiceover_quality_check")
-        ensure_dir(vdir)
-        plan_by_id = {
-            str(item.get("short_video_id") or ""): item
-            for item in edit_plan.get("scripts", [])
-            if isinstance(item, dict)
-        }
-
-        def check_one(index: int, script: dict[str, Any]) -> tuple[int, dict[str, Any]]:
-            short_video_id = str(script.get("short_video_id") or f"v_{index + 1:03d}")
-            input_text = self._build_voiceover_quality_check_text(script, plan_by_id.get(short_video_id, {}))
-            write_text(vdir / short_video_id / "input.txt", input_text)
-            try:
-                if self.llm_text is None:
-                    raise RuntimeError("missing text llm")
-                result = self.llm_text.call_json(
-                    model=model,
-                    fallback_models=fallback,
-                    prompt=prompts.VOICEOVER_QUALITY_CHECK_PROMPT,
-                    input_data=input_text,
-                    temperature=float(cfg.get("temperature", 0.0) or 0.0),
-                    max_tokens=int(cfg.get("max_tokens", 300) or 300),
-                    debug_dir=vdir / "_llm_debug" / short_video_id,
-                )
-                parsed = result.parsed if isinstance(result.parsed, dict) else {}
-                item = self._normalize_voiceover_quality_check(short_video_id, parsed)
-            except Exception as exc:
-                write_json(vdir / "_errors" / f"{short_video_id}.json", {"short_video_id": short_video_id, "error": str(exc), "created_at": now_iso()})
-                item = {"short_video_id": short_video_id, "ok": 1, "rewrite": 0, "missing": [], "warning": "quality_check_failed"}
-            return index, item
-
-        results: list[tuple[int, dict[str, Any]]] = []
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [executor.submit(check_one, index, script) for index, script in enumerate(scripts)]
-            for future in as_completed(futures):
-                results.append(future.result())
-        results.sort(key=lambda x: x[0])
-        checks = [item for _index, item in results]
-        output = {
-            "version": "voiceover_quality_check_v1",
-            "checks": checks,
-            "ok": 1 if all(int(item.get("ok", 1) or 0) == 1 for item in checks) else 0,
-            "rewrite": 1 if any(int(item.get("rewrite", 0) or 0) == 1 for item in checks) else 0,
-            "missing": [m for item in checks for m in (item.get("missing") or [])],
-        }
-        out = write_json(vdir / "voiceover_quality_check.json", output)
-        self._write_status(vdir, self._base_status("voiceover_quality_check", version, input_hash, [out]) | {"model": model})
-        self._record_step(
-            step="voiceover_quality_check",
-            version=version,
-            status="success",
-            output=relpath(out, self.task_dir),
-            input_hash=input_hash,
-            output_files=[out],
-            extra={"model": model, "summary": {"scripts": len(checks), "max_workers": max_workers}},
-        )
-        print("瀹屾垚: voiceover_quality_check")
+        self._mark_skipped("voiceover_quality_check", "已删除：配音文案质量改由代码规则和时长校验处理。")
 
     def step_risk_review(self) -> None:
         self._run_text_agent("risk_review", {
@@ -2267,6 +2053,379 @@ class PipelineRunner:
             "duration_strategy": self._duration_strategy_payload(),
             "run_options": self._run_options_payload(),
         })
+
+    def _overwrite_step_json(self, step: str, output: dict[str, Any], *, materialized: bool = False) -> None:
+        out_path = self.task_dir / self._step_output(step)
+        write_json(out_path, output)
+        version_dir = out_path.parent
+        write_json(version_dir / "final_output.json", output)
+        if materialized:
+            write_json(version_dir / "materialized_output.json", output)
+
+        output_files = [out_path]
+        new_hash = output_hash(output_files)
+        step_status = self.manifest.setdefault("steps", {}).setdefault(step, {})
+        step_status["output_hash"] = new_hash
+        if materialized:
+            step_status["materialized_output"] = True
+        self._save_manifest()
+
+        status_path = version_dir / "step_status.json"
+        status_doc = read_json(status_path, {})
+        if isinstance(status_doc, dict):
+            status_doc["output_hash"] = new_hash
+            if materialized:
+                status_doc["materialized_output"] = True
+            write_json(status_path, status_doc)
+
+    def _timeline_chunks_by_id(self) -> dict[str, dict[str, Any]]:
+        digest = self._load_current_timeline_digest()
+        chunks = digest.get("chunks", []) if isinstance(digest, dict) else []
+        out: dict[str, dict[str, Any]] = {}
+        for index, chunk in enumerate(chunks, start=1):
+            if not isinstance(chunk, dict):
+                continue
+            chunk_id = str(chunk.get("chunk_id") or chunk.get("global_chunk_id") or f"chunk_{index:04d}")
+            out[chunk_id] = chunk
+        return out
+
+    def _coerce_id_list(self, value: Any) -> list[str]:
+        if isinstance(value, str):
+            parts = re.split(r"[,，\s]+", value)
+            return [part.strip() for part in parts if part.strip()]
+        if isinstance(value, list):
+            out: list[str] = []
+            for item in value:
+                text = str(item).strip()
+                if text:
+                    out.append(text)
+            return out
+        return []
+
+    def _chunk_start_end(self, chunk: dict[str, Any]) -> tuple[float, float]:
+        start = float(chunk.get("start_seconds", chunk.get("start", 0)) or 0)
+        end = float(chunk.get("end_seconds", chunk.get("end", start)) or start)
+        if end <= start and chunk.get("duration_seconds"):
+            end = start + float(chunk.get("duration_seconds") or 0)
+        return start, end
+
+    def _materialize_video_understanding(self, result: Any) -> dict[str, Any]:
+        raw = result if isinstance(result, dict) else {}
+        understanding = str(
+            raw.get("understanding")
+            or raw.get("summary")
+            or raw.get("overall_understanding")
+            or ""
+        ).strip()
+        key_facts = raw.get("key_facts")
+        if not isinstance(key_facts, list):
+            key_facts = []
+        people = raw.get("people")
+        if not isinstance(people, list):
+            people = []
+        locations = raw.get("locations")
+        if not isinstance(locations, list):
+            locations = []
+        return {
+            "version": "video_understanding_materialized_v2",
+            "understanding": understanding,
+            "main_topic": str(raw.get("main_topic") or raw.get("topic") or "").strip(),
+            "video_type": str(raw.get("video_type") or ""),
+            "summary": str(raw.get("summary") or understanding).strip(),
+            "key_facts": key_facts,
+            "people": people,
+            "locations": locations,
+            "materialized_by_code": True,
+            "raw_model_plan": result,
+        }
+
+    def _materialize_vision_chunk_result(self, result: Any, *, chunk_id: str, time_range: str) -> dict[str, Any]:
+        raw = result if isinstance(result, dict) else {}
+        visual = str(raw.get("visual") or raw.get("visual_summary") or "").strip()
+        screen_text = raw.get("screen_text")
+        if not isinstance(screen_text, list):
+            screen_text = []
+        visible_people = raw.get("visible_people")
+        if not isinstance(visible_people, list):
+            visible_people = []
+        location_clues = raw.get("location_clues")
+        if not isinstance(location_clues, list):
+            location_clues = []
+        warnings = raw.get("warnings")
+        if not isinstance(warnings, list):
+            warnings = []
+        return {
+            "chunk_id": chunk_id,
+            "time_range": time_range,
+            "visual": visual,
+            "visual_summary": visual,
+            "scene_type": str(raw.get("scene_type") or ""),
+            "screen_text": screen_text,
+            "visible_people": visible_people,
+            "location_clues": location_clues,
+            "footage_type": str(raw.get("footage_type") or ""),
+            "asr_visual_consistency": str(raw.get("asr_visual_consistency") or ""),
+            "warnings": warnings,
+            "materialized_by_code": True,
+            "raw_model_plan": result,
+        }
+
+    def _materialize_candidate_clips_from_chunks(self, result: Any, *, source_step: str) -> dict[str, Any]:
+        if isinstance(result, list):
+            raw_clips = result
+            base_result: dict[str, Any] = {}
+        elif isinstance(result, dict):
+            raw_clips = result.get("candidate_clips", [])
+            base_result = dict(result)
+        else:
+            raw_clips = []
+            base_result = {}
+        chunk_by_id = self._timeline_chunks_by_id()
+        if isinstance(raw_clips, dict):
+            raw_clips = raw_clips.get("candidate_clips", [])
+        if not isinstance(raw_clips, list):
+            raw_clips = []
+
+        materialized: list[dict[str, Any]] = []
+        for index, raw in enumerate(raw_clips, start=1):
+            if not isinstance(raw, dict):
+                continue
+            chunk_ids = self._coerce_id_list(
+                raw.get("chunk_ids")
+                or raw.get("source_chunk_ids")
+                or raw.get("chunks")
+                or raw.get("chunk_id")
+            )
+            chunks = [chunk_by_id[cid] for cid in chunk_ids if cid in chunk_by_id]
+            if chunks:
+                starts_ends = [self._chunk_start_end(chunk) for chunk in chunks]
+                start = min(start for start, _end in starts_ends)
+                end = max(end for _start, end in starts_ends)
+                source_ids = [str(chunk.get("source_id") or "source_1") for chunk in chunks]
+                unique_source_ids = list(dict.fromkeys(source_ids))
+                source_id = unique_source_ids[0] if len(unique_source_ids) == 1 else ""
+                source_index = chunks[0].get("source_index", "")
+                speech = " ".join(
+                    compact_text(str(chunk.get("speech") or chunk.get("asr_digest") or ""), max_chars=260)
+                    for chunk in chunks
+                    if str(chunk.get("speech") or chunk.get("asr_digest") or "").strip()
+                ).strip()
+                visual = " ".join(
+                    compact_text(str(chunk.get("visual") or chunk.get("visual_summary") or ""), max_chars=180)
+                    for chunk in chunks
+                    if str(chunk.get("visual") or chunk.get("visual_summary") or "").strip()
+                ).strip()
+            else:
+                start = self._clip_time_seconds(raw, "start", "source_start")
+                end = self._clip_time_seconds(raw, "end", "source_end")
+                if end <= start and raw.get("duration_seconds"):
+                    end = start + float(raw.get("duration_seconds") or 0)
+                source_id = str(raw.get("source_id") or "source_1")
+                unique_source_ids = [source_id] if source_id else []
+                source_index = raw.get("source_index", "")
+                speech = str(raw.get("speech") or raw.get("asr_text") or "").strip()
+                visual = str(raw.get("visual") or raw.get("visual_summary") or "").strip()
+                if not chunk_ids and raw.get("source_chunk_ids"):
+                    chunk_ids = self._coerce_id_list(raw.get("source_chunk_ids"))
+            if end <= start:
+                continue
+            clip_id = str(raw.get("clip_id") or raw.get("id") or f"clip_{len(materialized) + 1:03d}")
+            summary = str(raw.get("summary") or raw.get("reason") or speech or visual).strip()
+            clip_type = str(raw.get("type") or raw.get("clip_type") or raw.get("candidate_type") or "").strip()
+            materialized.append({
+                "clip_id": clip_id,
+                "chunk_ids": chunk_ids,
+                "source_chunk_ids": chunk_ids,
+                "start": seconds_to_timecode(start, ms=True),
+                "end": seconds_to_timecode(end, ms=True),
+                "start_seconds": round(start, 3),
+                "end_seconds": round(end, 3),
+                "duration_seconds": round(end - start, 3),
+                "source_id": source_id,
+                "source_index": source_index,
+                "source_ids": unique_source_ids,
+                "speech": speech,
+                "visual": visual,
+                "summary": summary,
+                "type": clip_type,
+                "clip_type": clip_type,
+            })
+
+        normalized = base_result
+        normalized["candidate_clips"] = materialized
+        if source_step == "content_analysis":
+            candidate_summaries = [
+                str(item.get("summary") or "").strip()
+                for item in materialized
+                if str(item.get("summary") or "").strip()
+            ]
+            if not str(normalized.get("summary") or "").strip() and candidate_summaries:
+                normalized["summary"] = compact_text(" ".join(candidate_summaries[:6]), max_chars=800)
+            if not normalized.get("key_facts") and candidate_summaries:
+                normalized["key_facts"] = candidate_summaries[:8]
+        normalized.setdefault("version", f"{source_step}_materialized_v2")
+        normalized["materialized_by_code"] = True
+        return normalized
+
+    def _candidate_clips_by_id(self) -> dict[str, dict[str, Any]]:
+        clips = self._load_candidate_clips_for_current_mode()
+        return {self._clip_id(clip, index): clip for index, clip in enumerate(clips)}
+
+    def _stringify_fact_points(self, values: Any) -> list[str]:
+        if not isinstance(values, list):
+            return []
+        out: list[str] = []
+        for item in values:
+            if isinstance(item, str):
+                text = item.strip()
+            else:
+                text = json.dumps(item, ensure_ascii=False, separators=(",", ":"))
+            if text and text not in out:
+                out.append(text)
+        return out
+
+    def _materialize_short_video_edit_plan(self, result: Any) -> dict[str, Any]:
+        if isinstance(result, list):
+            raw_videos = result
+        elif isinstance(result, dict):
+            raw_videos = result.get("videos")
+            if not isinstance(raw_videos, list):
+                raw_videos = result.get("scripts") if isinstance(result.get("scripts"), list) else []
+        else:
+            raw_videos = []
+        content = self._load_optional_step_json("content_analysis", {})
+        clips_by_id = self._candidate_clips_by_id()
+        if not raw_videos and clips_by_id:
+            raw_videos = [{"clip_ids": list(clips_by_id)[:8], "讲述重点": content.get("main_topic", ""), "必须讲到": content.get("key_facts", [])}]
+
+        scripts: list[dict[str, Any]] = []
+        used_clip_ids: set[str] = set()
+        topic = str(content.get("main_topic") or content.get("topic") or "")
+        default_facts = self._stringify_fact_points(content.get("key_facts") or [])
+        for video_index, video in enumerate(raw_videos, start=1):
+            if not isinstance(video, dict):
+                continue
+            clip_ids = self._coerce_id_list(video.get("clip_ids") or video.get("source_clip_ids"))
+            selected = [clips_by_id[cid] for cid in clip_ids if cid in clips_by_id]
+            if not selected:
+                continue
+            short_video_id = f"v_{len(scripts) + 1:03d}"
+            source_clip_ids = [self._clip_id(clip, idx) for idx, clip in enumerate(selected)]
+            used_clip_ids.update(source_clip_ids)
+            must_keep = self._stringify_fact_points(video.get("必须讲到") or video.get("must_keep_fact_points") or [])
+            if not must_keep:
+                must_keep = default_facts
+            news_angle = str(video.get("讲述重点") or video.get("news_angle") or topic or "").strip()
+            editing_structure: list[dict[str, Any]] = []
+            for shot_index, clip in enumerate(selected, start=1):
+                start, end = self._clip_start_end(clip)
+                duration = max(0.0, end - start)
+                source_clip_id = self._clip_id(clip, shot_index - 1)
+                visual = str(clip.get("visual") or clip.get("visual_summary") or "").strip()
+                fact = str(clip.get("summary") or clip.get("speech") or clip.get("clip_type") or "").strip()
+                editing_structure.append({
+                    "order": shot_index,
+                    "shot_id": f"{short_video_id}_s{shot_index:02d}",
+                    "source_clip_id": source_clip_id,
+                    "source_id": clip.get("source_id", ""),
+                    "source_index": clip.get("source_index", ""),
+                    "source_start": seconds_to_timecode(start, ms=True),
+                    "source_end": seconds_to_timecode(end, ms=True),
+                    "duration_seconds": round(duration, 3),
+                    "visual": visual,
+                    "fact": fact,
+                    "news_fact_to_explain": fact,
+                    "purpose": "evidence_visual" if shot_index > 1 else "opening_hook",
+                    "must_say_facts": must_keep if shot_index == 1 else [],
+                })
+            visual_total = editing_structure_duration(editing_structure)
+            target_duration = round(visual_total or float(self.options.target_duration_seconds or self.duration_settings.default_target_seconds), 3)
+            max_allowed = max(target_duration, float(self.options.max_output_video_seconds or target_duration))
+            scripts.append({
+                "short_video_id": short_video_id,
+                "topic": topic,
+                "news_angle": news_angle,
+                "video_type": "解说型",
+                "target_duration_seconds": target_duration,
+                "max_allowed_seconds": round(max_allowed, 3),
+                "visual_total_seconds": target_duration,
+                "source_clip_ids": source_clip_ids,
+                "must_keep_fact_points": must_keep,
+                "voiceover_brief": news_angle,
+                "editing_structure": editing_structure,
+            })
+
+        discarded = [cid for cid in clips_by_id if cid not in used_clip_ids]
+        return {
+            "version": "short_video_edit_plan_materialized_v2",
+            "recommended_video_count": len(scripts),
+            "overall_reason": "模型输出 clip_ids，代码已补全 short_video_id、shot_id、时间码、时长和旧工程结构。",
+            "scripts": scripts,
+            "discarded_clip_ids": discarded,
+            "materialized_by_code": True,
+            "raw_model_plan": result,
+        }
+
+    def _materialize_highlight_reassembly_plan(self, result: Any) -> dict[str, Any]:
+        if isinstance(result, list):
+            raw_videos = result
+            base_result: dict[str, Any] = {}
+        elif isinstance(result, dict):
+            raw_videos = result.get("videos")
+            if not isinstance(raw_videos, list):
+                raw_videos = result.get("output_videos") if isinstance(result.get("output_videos"), list) else []
+            base_result = dict(result)
+        else:
+            raw_videos = []
+            base_result = {}
+        clips_by_id = self._candidate_clips_by_id()
+        if not raw_videos and clips_by_id:
+            raw_videos = [{"clip_ids": list(clips_by_id)[: self.options.reassembly_max_clip_count]}]
+
+        output_videos: list[dict[str, Any]] = []
+        used_clip_ids: set[str] = set()
+        for video in raw_videos:
+            if not isinstance(video, dict):
+                continue
+            clip_ids = self._coerce_id_list(video.get("clip_ids") or video.get("source_clip_ids"))
+            if not clip_ids and isinstance(video.get("selected_clips"), list):
+                clip_ids = self._coerce_id_list([
+                    item.get("source_clip_id") or item.get("clip_id")
+                    for item in video.get("selected_clips", [])
+                    if isinstance(item, dict)
+                ])
+            selected = [clips_by_id[cid] for cid in clip_ids if cid in clips_by_id]
+            if not selected:
+                continue
+            rid = f"hr_{len(output_videos) + 1:03d}"
+            selected_clips: list[dict[str, Any]] = []
+            for clip in selected:
+                start, end = self._clip_start_end(clip)
+                source_clip_id = self._clip_id(clip, len(selected_clips))
+                used_clip_ids.add(source_clip_id)
+                selected_clips.append({
+                    "source_clip_id": source_clip_id,
+                    "source_id": clip.get("source_id", ""),
+                    "source_start": seconds_to_timecode(start, ms=True),
+                    "source_end": seconds_to_timecode(end, ms=True),
+                    "duration_seconds": round(max(0.0, end - start), 3),
+                    "role": clip.get("type") or clip.get("clip_type") or "",
+                    "transition_after": "hard_cut",
+                })
+            output_videos.append({
+                "reassembly_id": rid,
+                "title": "",
+                "selected_clips": selected_clips,
+                "excluded_clip_ids": [cid for cid in clips_by_id if cid not in used_clip_ids],
+            })
+
+        return {
+            "version": "highlight_reassembly_materialized_v2",
+            "output_videos": output_videos,
+            "materialized_by_code": True,
+            "raw_model_plan": result,
+            **({"model_fields": {k: v for k, v in base_result.items() if k not in {"videos", "output_videos"}}} if base_result else {}),
+        }
 
     def _write_compat_agent_output(self, step: str, output: dict[str, Any], source_step: str) -> None:
         base, out_name, _prompt, prompt_version = AGENT_INFO[step]
@@ -2339,6 +2498,9 @@ class PipelineRunner:
                     "order": shot.get("order", idx + 1),
                     "shot_id": shot.get("shot_id", f"{script.get('short_video_id', 'sv')}_s{idx + 1:02d}"),
                     "target_timeline": shot.get("target_timeline", ""),
+                    "source_clip_id": shot.get("source_clip_id", ""),
+                    "source_id": shot.get("source_id", ""),
+                    "source_index": shot.get("source_index", ""),
                     "source_start": shot.get("source_start", ""),
                     "source_end": shot.get("source_end", ""),
                     "duration_seconds": shot.get("duration_seconds", 0),
@@ -2662,73 +2824,70 @@ class PipelineRunner:
         max_clips = int(llm_cfg.get("max_llm_candidate_clips", llm_cfg.get("max_candidate_clips_for_edit_plan", 14)) or 14)
         max_boundaries = int(llm_cfg.get("max_llm_source_boundaries", 20) or 20)
         video = self._load_optional_step_json("video_understanding", {})
-        refine = self._candidate_refine_by_clip_id()
         clips = self._load_candidate_clips_for_current_mode()[:max_clips]
         lines = [
-            "Task: original-audio highlight reassembly.",
+            "任务：请规划原声高光重组视频。",
             "",
-            "Options:",
-            f"- target={self.options.reassembly_target_seconds}s",
-            f"- max_clip_count={self.options.reassembly_max_clip_count}",
-            f"- output_mode={self.options.reassembly_output_mode}",
+            "运行参数：",
+            f"- target_seconds：{self.options.reassembly_target_seconds}",
+            f"- max_clip_count：{self.options.reassembly_max_clip_count}",
+            f"- output_mode：{self.options.reassembly_output_mode}",
             "",
-            "Video:",
-            f"topic: {video.get('main_topic') or video.get('topic') or ''}",
-            f"summary: {video.get('summary') or ''}",
+            "视频理解：",
+            f"主题：{video.get('main_topic') or video.get('topic') or ''}",
+            f"摘要：{video.get('summary') or video.get('understanding') or ''}",
             "",
-            "Candidate clips:",
+            "候选 clips：",
         ]
         for index, clip in enumerate(clips):
             cid = self._clip_id(clip, index)
-            r = refine.get(cid, {})
-            lines.append(f"[{cid}] t={self._format_clip_time(clip)} dur={clip.get('duration_seconds', '')} source={clip.get('source_id', 'source_1')} k={r.get('k', 1)} u={r.get('u', 'both')} i={r.get('i', 0)} c={r.get('c', 0)} g={r.get('g', 'g1')} r={r.get('r', index + 1)}")
-            lines.append(f"summary: {compact_text(str(clip.get('summary') or ''), max_chars=400)}")
-            lines.append(f"speech: {compact_text(str(clip.get('speech') or clip.get('asr_text') or clip.get('original_audio_transcript_summary') or ''), max_chars=400)}")
-            lines.append(f"visual: {compact_text(str(clip.get('visual') or clip.get('visual_summary') or clip.get('why_this_visual_matters') or ''), max_chars=400)}")
+            lines.append(f"[{cid}] 时间={self._format_clip_time(clip)} 时长={clip.get('duration_seconds', '')} source_id={clip.get('source_id', 'source_1')} 类型={clip.get('type') or clip.get('clip_type') or ''}")
+            lines.append(f"摘要：{compact_text(str(clip.get('summary') or ''), max_chars=400)}")
+            lines.append(f"声音：{compact_text(str(clip.get('speech') or clip.get('asr_text') or clip.get('original_audio_transcript_summary') or ''), max_chars=400)}")
+            lines.append(f"画面：{compact_text(str(clip.get('visual') or clip.get('visual_summary') or clip.get('why_this_visual_matters') or ''), max_chars=400)}")
             lines.append("")
-        lines.append("Source boundaries:")
+        lines.append("素材源边界：")
         for boundary in self._source_boundaries()[:max_boundaries]:
             lines.append(f"{boundary['source_id']}: {boundary['start']}-{boundary['end']}s")
         lines.append("")
-        lines.append("Return strict JSON following the prompt schema.")
+        lines.append("请严格按照提示词指定 JSON schema 输出。")
         return "\n".join(lines)
 
     def _build_short_video_edit_plan_text(self) -> str:
         llm_cfg = self.config.raw.get("llm_input", {})
         max_clips = int(llm_cfg.get("max_llm_candidate_clips", llm_cfg.get("max_candidate_clips_for_edit_plan", 14)) or 14)
         content = self._load_optional_step_json("content_analysis", {})
-        refine = self._candidate_refine_by_clip_id()
         clips = self._load_candidate_clips_for_current_mode()[:max_clips]
         lines = [
-            "Task: generate AI voiceover short-video edit plan.",
+            "任务：请生成 AI 配音短视频选片与讲述规划。",
             "",
-            "Run options:",
-            f"- target_duration_seconds={self.options.target_duration_seconds}",
-            f"- output_mode={self.options.output_mode}",
-            f"- max_output_videos={self.options.max_output_videos}",
+            "运行参数：",
+            f"- output_mode：{self.options.output_mode}",
+            f"- max_output_videos：{self.options.max_output_videos}",
+            f"- min_output_video_seconds：{self.options.min_output_video_seconds}",
+            f"- max_output_video_seconds：{self.options.max_output_video_seconds}",
             "",
-            "Video brief:",
-            f"topic: {content.get('main_topic') or content.get('topic') or ''}",
-            f"summary: {content.get('summary') or ''}",
-            "key facts:",
+            "新闻概览：",
+            f"主题：{content.get('main_topic') or content.get('topic') or ''}",
+            f"摘要：{content.get('summary') or ''}",
+            "关键事实：",
         ]
         for fact in (content.get("key_facts") or [])[: int(llm_cfg.get("max_llm_key_facts", 8) or 8)]:
             lines.append(f"- {fact if isinstance(fact, str) else json.dumps(fact, ensure_ascii=False)}")
         lines.append("")
-        lines.append("Candidate clips:")
+        lines.append("候选 clips：")
         context_index = self._build_timeline_context_index()
         for index, clip in enumerate(clips):
             cid = self._clip_id(clip, index)
-            r = refine.get(cid, {})
-            lines.append(f"[{cid}] t={self._format_clip_time(clip)} dur={clip.get('duration_seconds', '')} k={r.get('k', 1)} u={r.get('u', 'both')} i={r.get('i', 0)} c={r.get('c', 0)} g={r.get('g', 'g1')} r={r.get('r', index + 1)}")
-            lines.append(f"summary: {compact_text(str(clip.get('summary') or ''), max_chars=400)}")
-            lines.append(f"speech: {compact_text(str(clip.get('speech') or clip.get('asr_text') or clip.get('original_audio_transcript_summary') or ''), max_chars=400)}")
-            lines.append(f"visual: {compact_text(str(clip.get('visual') or clip.get('visual_summary') or clip.get('why_this_visual_matters') or ''), max_chars=400)}")
+            lines.append(f"[{cid}] 时间={self._format_clip_time(clip)} 时长={clip.get('duration_seconds', '')} source_id={clip.get('source_id', 'source_1')} 类型={clip.get('type') or clip.get('clip_type') or ''}")
+            lines.append(f"摘要：{compact_text(str(clip.get('summary') or ''), max_chars=400)}")
+            lines.append(f"声音：{compact_text(str(clip.get('speech') or clip.get('asr_text') or clip.get('original_audio_transcript_summary') or ''), max_chars=400)}")
+            lines.append(f"画面：{compact_text(str(clip.get('visual') or clip.get('visual_summary') or clip.get('why_this_visual_matters') or ''), max_chars=400)}")
             nearby = self._nearby_context_for_clip(clip, context_index, max_chunks=int(llm_cfg.get("max_llm_context_chunks", 3) or 3))
             if nearby:
-                lines.append("nearby context: " + json.dumps(nearby, ensure_ascii=False, separators=(",", ":")))
+                lines.append("相邻上下文：" + json.dumps(nearby, ensure_ascii=False, separators=(",", ":")))
             lines.append("")
-        lines.append("Return strict JSON following the prompt schema.")
+        lines.append("请严格按照提示词指定 JSON schema 输出。")
         return "\n".join(lines)
 
     def _build_merge_decision_text(self, edit_plan: dict[str, Any]) -> str:
@@ -2779,21 +2938,23 @@ class PipelineRunner:
 
     def _build_voiceover_script_text_input(self, script: dict[str, Any]) -> str:
         lines = [
-            "Task: write the final AI voiceover script for one short video.",
-            f"short_video_id: {script.get('short_video_id') or ''}",
-            f"topic: {script.get('topic') or ''}",
-            f"angle: {script.get('news_angle') or ''}",
-            f"title: {script.get('title') or ''}",
-            f"target_duration_seconds: {script.get('target_duration_seconds') or self.options.target_duration_seconds}",
-            "must_keep_fact_points:",
+            "任务：请为一条短视频写最终 AI 配音文案。",
+            "",
+            "视频信息：",
+            f"- short_video_id：{script.get('short_video_id') or ''}",
+            f"- 主题：{script.get('topic') or ''}",
+            f"- 讲述重点：{script.get('news_angle') or ''}",
+            f"- visual_total_seconds：{script.get('visual_total_seconds') or editing_structure_duration(script.get('editing_structure') or [])}",
+            "",
+            "必须保留事实：",
         ]
         for fact in script.get("must_keep_fact_points") or []:
             lines.append(f"- {fact}")
         lines.append("")
-        lines.append("editing_structure:")
+        lines.append("shots：")
         for shot in script.get("editing_structure") or []:
             if isinstance(shot, dict):
-                lines.append(f"- shot_id={shot.get('shot_id') or ''} t={shot.get('source_start') or ''}-{shot.get('source_end') or ''} dur={shot.get('duration_seconds') or ''} visual={shot.get('visual') or ''} fact={shot.get('fact') or shot.get('news_fact_to_explain') or shot.get('editing_note') or ''}")
+                lines.append(f"- shot_id={shot.get('shot_id') or ''} 时长={shot.get('duration_seconds') or ''} 画面={shot.get('visual') or ''} 事实={shot.get('fact') or shot.get('news_fact_to_explain') or shot.get('editing_note') or ''}")
         return "\n".join(lines)
 
     def _fallback_voiceover_script(self, script: dict[str, Any], short_video_id: str) -> dict[str, Any]:
@@ -2842,7 +3003,7 @@ class PipelineRunner:
                 f"LLM input size [{step}] exceeds max_text_agent_input_chars={limit}; 应改用 timeline_digest"
             )
 
-    def _run_text_agent(self, step: str, input_data: Any) -> dict[str, Any]:
+    def _run_text_agent(self, step: str, input_data: Any) -> Any:
         if self.llm_text is None:
             raise RuntimeError("缺少 text LLM 配置")
         base, out_name, prompt, default_prompt_version = AGENT_INFO[step]
@@ -3675,6 +3836,8 @@ class PipelineRunner:
                 clip_duration = end - start
                 audio_mode = seg.get("audio_mode") or ("mixed_evidence" if seg.get("original_audio_required") else "ai_voiceover")
                 raw_clip = {
+                    "source_id": seg.get("source_id", ""),
+                    "source_index": seg.get("source_index", ""),
                     "source_start": seconds_to_timecode(start, ms=True),
                     "source_end": seconds_to_timecode(end, ms=True),
                     "target_start": seconds_to_timecode(target, ms=True),

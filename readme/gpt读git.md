@@ -13,7 +13,7 @@ clean-highlight-reassembly
 run_web.py
 
 请先按路径读取这些文件：
-1. README.md
+1. README.md  代码改动太大，不要读这个，直接读代码
 2. run_web.py
 3. web_app.py
 4. config.toml
