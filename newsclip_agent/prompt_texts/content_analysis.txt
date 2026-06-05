@@ -30,12 +30,9 @@
 5. 不要输出 start、end、duration_seconds、clip_id、source_id、type。
 
 输出格式：
-{
-  "main_topic": "",
-  "candidate_clips": [
-    {
-      "chunk_ids": [],
-      "summary": ""
-    }
-  ]
-}
+[
+  {
+    "chunk_ids": [],
+    "summary": ""
+  }
+]

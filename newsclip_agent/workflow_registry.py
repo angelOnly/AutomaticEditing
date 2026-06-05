@@ -17,10 +17,13 @@ LEGACY_SINGLE_COMMON_REUSABLE_STEPS = [
     "timeline_digest",
 ]
 
-UNIFIED_SOURCE_COMMON_REUSABLE_STEPS = [
-    # source_prepare is marked by the multi-source wrapper; the remaining
-    # steps are produced by PipelineRunner common analysis and reused later.
+UNIFIED_SOURCE_COMMON_PROGRESS_STEPS = [
     "source_prepare",
+    "source_analysis",
+    "source_aggregate",
+]
+
+UNIFIED_SOURCE_COMMON_REUSABLE_STEPS = [
     "source_analysis",
     "source_aggregate",
 ]
@@ -63,7 +66,8 @@ WORKFLOWS: dict[tuple[str, bool], list[str]] = {
         "timeline",
         "timeline_digest",
         "video_understanding",
-        "highlight_detection",
+        "asr_event_candidate",
+        "candidate_filter",
         "highlight_reassembly_plan",
         "reassembly_cut_plan",
         "news_quality_gate",
@@ -90,7 +94,8 @@ WORKFLOWS: dict[tuple[str, bool], list[str]] = {
         "source_analysis",
         "source_aggregate",
         "video_understanding",
-        "highlight_detection",
+        "asr_event_candidate",
+        "candidate_filter",
         "highlight_reassembly_plan",
         "reassembly_cut_plan",
         "news_quality_gate",
@@ -128,8 +133,10 @@ DEPENDENCIES: dict[str, list[str]] = {
 
     "video_understanding": ["timeline_digest", "source_aggregate"],
     "highlight_detection": ["timeline_digest", "source_aggregate", "video_understanding"],
-    "highlight_reassembly_plan": ["highlight_detection", "video_understanding"],
-    "reassembly_cut_plan": ["highlight_reassembly_plan"],
+    "asr_event_candidate": ["timeline_digest", "source_aggregate", "video_understanding"],
+    "candidate_filter": ["asr_event_candidate"],
+    "highlight_reassembly_plan": ["candidate_filter", "video_understanding"],
+    "reassembly_cut_plan": ["highlight_reassembly_plan", "candidate_filter"],
     "render": ["cut_plan", "news_quality_gate", "news_quality_ai_review"],
     "reassembly_render": ["reassembly_cut_plan", "news_quality_gate", "news_quality_ai_review"],
 }
@@ -147,6 +154,14 @@ def step_order(production_mode: str, *, unified: bool) -> list[str]:
 def common_reusable_steps(*, unified: bool) -> list[str]:
     return list(
         UNIFIED_SOURCE_COMMON_REUSABLE_STEPS
+        if unified
+        else LEGACY_SINGLE_COMMON_REUSABLE_STEPS
+    )
+
+
+def common_progress_steps(*, unified: bool) -> list[str]:
+    return list(
+        UNIFIED_SOURCE_COMMON_PROGRESS_STEPS
         if unified
         else LEGACY_SINGLE_COMMON_REUSABLE_STEPS
     )

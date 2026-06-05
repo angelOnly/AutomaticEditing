@@ -30,7 +30,7 @@ from newsclip_agent.remote_ucms import (
     load_remote_ucms_config,
     public_config as remote_ucms_public_config,
 )
-from newsclip_agent.utils import ensure_dir, read_json, relpath, write_json
+from newsclip_agent.utils import ensure_dir, read_json, relpath, seconds_to_timecode, write_json
 from newsclip_agent.tts_omnivoice import generate_omnivoice_audio
 from newsclip_agent.job_store import JobStore
 
@@ -71,6 +71,7 @@ SAME_TASK_POLICY = str(WEB_CONCURRENCY.get("same_task_policy", "reject"))
 from newsclip_agent.workflow_registry import (
     step_order,
     common_reusable_steps,
+    common_progress_steps,
 )
 
 
@@ -86,6 +87,15 @@ def _common_reusable_steps_for_request(
 ) -> list[str]:
     unified = bool(use_unified_source_pipeline or source_count > 1)
     return common_reusable_steps(unified=unified)
+
+
+def _common_progress_steps_for_request(
+    *,
+    source_count: int,
+    use_unified_source_pipeline: bool,
+) -> list[str]:
+    unified = bool(use_unified_source_pipeline or source_count > 1)
+    return common_progress_steps(unified=unified)
 
 
 def _step_order_for_production_mode(
@@ -121,7 +131,7 @@ def _init_multisource_child_manifest(
     now = datetime.now().isoformat(timespec="seconds")
     source_count = len(raw_source_items)
     common_steps = set(
-        _common_reusable_steps_for_request(
+        _common_progress_steps_for_request(
             source_count=source_count,
             use_unified_source_pipeline=use_unified_source_pipeline,
         )
@@ -934,8 +944,7 @@ def list_source_videos(task_id: str) -> list[dict[str, Any]]:
                 "source_type": item.get("source_type", ""),
                 "source_id": item.get("source_id", ""),
                 "duration_seconds": item.get("duration_seconds"),
-                "virtual_start": item.get("virtual_start", ""),
-                "virtual_end": item.get("virtual_end", ""),
+                "local_time_range": f"00:00:00.000-{seconds_to_timecode(float(item.get('duration_seconds') or 0), ms=True)}",
             }
         )
     return sources
@@ -1528,8 +1537,7 @@ def _hydrate_common_progress_for_manifest(task_dir: Path, manifest: dict[str, An
     manifest.setdefault("steps", {})
     common_steps = common_manifest.get("steps", {}) or {}
 
-    from newsclip_agent.workflow_registry import UNIFIED_SOURCE_COMMON_REUSABLE_STEPS
-    for step in UNIFIED_SOURCE_COMMON_REUSABLE_STEPS:
+    for step in common_progress_steps(unified=True):
         item = common_steps.get(step)
         if not isinstance(item, dict):
             continue

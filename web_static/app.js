@@ -1439,7 +1439,7 @@ function renderSourceVideoList(sources) {
     .map(
       (source, index) => `<button class="draft-item source-item ${index === 0 ? "active" : ""}" data-index="${index}">
         <strong>${escapeHtml(source.label || source.file || `原始素材 ${index + 1}`)}</strong>
-        <span>${escapeHtml(source.virtual_start && source.virtual_end ? `${source.virtual_start} - ${source.virtual_end}` : source.file || "原片")}</span>
+        <span>${escapeHtml(source.local_time_range || source.file || "原片")}</span>
       </button>`,
     )
     .join("");

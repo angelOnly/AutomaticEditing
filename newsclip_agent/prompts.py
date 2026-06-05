@@ -23,6 +23,8 @@ VIDEO_UNDERSTANDING_PROMPT = _load_prompt("video_understanding.txt")
 CONTENT_ANALYSIS_PROMPT = _load_prompt("content_analysis.txt")
 # 原声高光候选片段：从时间轴中选择适合原声重组的 chunk 组合。
 HIGHLIGHT_DETECTION_PROMPT = _load_prompt("highlight_detection.txt")
+# 原声高光 ASR 事件候选：模型只输出 segment_id 保留/合并判断。
+ASR_EVENT_CANDIDATE_PROMPT = _load_prompt("asr_event_candidate.txt")
 # AI 配音选片规划：从候选 clips 中决定每条短视频使用哪些 clip。
 SHORT_VIDEO_EDIT_PLAN_TEXT_PROMPT = _load_prompt("short_video_edit_plan_text.txt")
 # AI 配音文案：根据短视频 shots 生成 narration_text 和分段文案。

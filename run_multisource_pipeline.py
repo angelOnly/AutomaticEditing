@@ -24,10 +24,11 @@ COMMON_OUTPUTS_DIR = OUTPUTS_DIR / "__common__"
 from newsclip_agent.workflow_registry import (
     UNIFIED_SOURCE_COMMON_REUSABLE_STEPS,
     LEGACY_SINGLE_COMMON_REUSABLE_STEPS,
+    common_progress_steps,
 )
 
 COMMON_REUSABLE_STEPS = UNIFIED_SOURCE_COMMON_REUSABLE_STEPS
-COMMON_PROGRESS_STEPS = list(dict.fromkeys(["source_prepare"] + COMMON_REUSABLE_STEPS))
+COMMON_PROGRESS_STEPS = common_progress_steps(unified=True)
 LEGACY_COMMON_REUSABLE_STEPS = LEGACY_SINGLE_COMMON_REUSABLE_STEPS
 COMMON_STEP_OUTPUT_FILES = {
     "source_analysis": "source_analysis.json",
@@ -439,6 +440,20 @@ def _repair_common_manifest_from_outputs(common_dir: Path) -> None:
 
         manifest["steps"][step] = existing
         manifest["current_versions"][step] = version
+
+    source_manifest = common_dir / "input" / "source_manifest.json"
+    if source_manifest.exists():
+        existing = manifest["steps"].get("source_prepare", {})
+        if existing.get("status") not in {"success", "partial_success", "skipped"}:
+            existing.update({
+                "step_name": "source_prepare",
+                "status": "success",
+                "updated_at": now,
+                "finished_at": existing.get("finished_at") or now,
+                "output": relpath(source_manifest, common_dir),
+                "can_rerun": True,
+            })
+            manifest["steps"]["source_prepare"] = existing
 
     write_json(manifest_path, manifest)
 

@@ -44,6 +44,14 @@ from .llm_digest import (
     compact_text,
     select_frames_for_vision,
 )
+from .asr_cleaning import clean_asr_text
+from .llm_materials import (
+    FORBIDDEN_LLM_FIELDS,
+    compact_chunks_for_llm,
+    compact_sources_for_llm,
+    local_time_range,
+    sanitize_llm_text,
+)
 from .text_policy import sanitize_reporter_bylines
 from .media_quality import build_source_quality_report
 from .tts_omnivoice import audio_metadata, generate_omnivoice_audio, release_omnivoice_models
@@ -76,12 +84,26 @@ ALL_STEP_ORDER = list(dict.fromkeys(
 AGENT_INFO = {
     "video_understanding": ("agents/video_understanding", "video_analysis.json", prompts.VIDEO_UNDERSTANDING_PROMPT, "video_understanding_v1"),
     "highlight_detection": ("agents/highlight_detection", "candidate_clips.json", prompts.HIGHLIGHT_DETECTION_PROMPT, "highlight_detection_v1"),
+    "asr_event_candidate": ("agents/asr_event_candidate", "asr_event_candidate.json", prompts.ASR_EVENT_CANDIDATE_PROMPT, "asr_event_candidate_v1"),
+    "candidate_filter": ("agents/candidate_filter", "candidate_filter.json", prompts.CANDIDATE_FILTER_PROMPT, "candidate_filter_v1"),
     "short_video_planning": ("agents/short_video_planning", "short_video_plan.json", prompts.SHORT_VIDEO_EDIT_PLAN_TEXT_PROMPT, "short_video_planning_compat_v2"),
     "editing_script": ("agents/editing_script", "editing_script.json", prompts.SHORT_VIDEO_EDIT_PLAN_TEXT_PROMPT, "editing_script_compat_v2"),
     "content_analysis": ("agents/content_analysis", "content_analysis.json", prompts.CONTENT_ANALYSIS_PROMPT, "content_analysis_v1"),
     "short_video_edit_plan": ("agents/short_video_edit_plan", "short_video_edit_plan.json", prompts.SHORT_VIDEO_EDIT_PLAN_TEXT_PROMPT, "short_video_edit_plan_text_v1"),
     "voiceover_script": ("agents/voiceover_script", "voiceover_script.json", prompts.VOICEOVER_SCRIPT_TEXT_PROMPT, "voiceover_script_text_v1"),
     "highlight_reassembly_plan": ("agents/highlight_reassembly", "highlight_reassembly_plan.json", prompts.HIGHLIGHT_REASSEMBLY_TEXT_PROMPT, "highlight_reassembly_text_v1"),
+    "news_quality_ai_review": ("agents/news_quality_ai_review", "news_quality_ai_review.json", prompts.NEWS_QUALITY_AI_REVIEW_PROMPT, "news_quality_ai_review_v1"),
+}
+
+LEGACY_TIME_FIELDS = {
+    "virtual_start_seconds",
+    "virtual_end_seconds",
+    "virtual_start",
+    "virtual_end",
+    "global_start_seconds",
+    "global_end_seconds",
+    "global_start",
+    "global_end",
 }
 
 
@@ -196,7 +218,12 @@ class PipelineRunner:
                 if self.options.skip_render and step == "reassembly_render":
                     self._mark_skipped(step, "skip_render")
                     continue
-                handler = getattr(self, f"step_{step}")
+                handler_name = f"step_{step}"
+                handler = getattr(self, handler_name, None)
+                if handler is None:
+                    raise RuntimeError(
+                        f"workflow step {step} has no handler {handler_name}; check workflow_registry.py"
+                    )
                 started = time.perf_counter()
                 self._mark_running(step)
                 try:
@@ -234,7 +261,7 @@ class PipelineRunner:
                 self._save_manifest()
             return
         source_manifest = read_json(Path(self.options.source_manifest), {}) if self.options.source_manifest else {}
-        is_virtual = source_manifest.get("source_mode") == "multi_source_virtual"
+        is_virtual = source_manifest.get("source_mode") in {"multi_source_pool", "multi_source_virtual"}
         
         if not self.options.input and not is_virtual:
             raise ValueError("首次运行必须提供 --input，断点续跑可只提供 --task-id")
@@ -364,6 +391,9 @@ class PipelineRunner:
         
         if self.options.common_only:
             if self._is_virtual_source_manifest():
+                # In unified virtual-source common_only mode, source_prepare is
+                # handled by run_multisource_pipeline.py before PipelineRunner
+                # starts. PipelineRunner only produces reusable common outputs.
                 common_steps = [
                     "source_analysis",
                     "source_aggregate",
@@ -418,12 +448,15 @@ class PipelineRunner:
         return p if p.is_absolute() else self.task_dir / p
 
     def _is_virtual_multi_source(self) -> bool:
-        return self._is_virtual_source_manifest()
+        return self._is_multi_source_pool()
 
     def _is_virtual_source_manifest(self) -> bool:
+        return self._is_multi_source_pool()
+
+    def _is_multi_source_pool(self) -> bool:
         manifest = getattr(self, "manifest", {}) or {}
         source_videos = manifest.get("source_videos") or []
-        if manifest.get("source_mode") == "multi_source_virtual" and source_videos:
+        if manifest.get("source_mode") in {"multi_source_pool", "multi_source_virtual"} and source_videos:
             return True
         if not manifest.get("source_manifest"):
             return False
@@ -431,7 +464,7 @@ class PipelineRunner:
             source_manifest = read_json(self._source_manifest_path(), {})
         except Exception:
             return False
-        return source_manifest.get("timeline_mode") == "virtual" and bool(source_manifest.get("sources"))
+        return bool(source_manifest.get("sources"))
 
     def _source_manifest_path(self) -> Path:
         manifest_path = self.manifest.get("source_manifest")
@@ -472,7 +505,31 @@ class PipelineRunner:
         output = status.get("output")
         if output and not (self.task_dir / output).exists():
             return False
+        if output and str(output).endswith(".json"):
+            try:
+                self._assert_no_legacy_virtual_time(read_json(self.task_dir / output, {}))
+            except Exception:
+                return False
         return self.options.resume
+
+    def _assert_no_legacy_virtual_time(self, obj: Any, *, path: str = "") -> None:
+        if isinstance(obj, dict):
+            found = LEGACY_TIME_FIELDS.intersection(obj.keys())
+            if found:
+                raise UserFacingPipelineError(
+                    "legacy virtual time fields detected",
+                    user_message=(
+                        "检测到旧架构产物，包含虚拟/全局时间字段："
+                        + ", ".join(sorted(found))
+                        + "。本次架构升级后不兼容旧任务产物，请重新运行任务。"
+                    ),
+                    technical_detail={"path": path, "fields": sorted(found)},
+                )
+            for key, value in obj.items():
+                self._assert_no_legacy_virtual_time(value, path=f"{path}.{key}" if path else str(key))
+        elif isinstance(obj, list):
+            for index, value in enumerate(obj):
+                self._assert_no_legacy_virtual_time(value, path=f"{path}[{index}]")
 
     def _record_step(
         self,
@@ -653,8 +710,8 @@ class PipelineRunner:
         if chunks:
             windows = []
             for chunk in chunks:
-                start = float(chunk.get("start", 0))
-                end = float(chunk.get("end", start))
+                start = float(chunk.get("local_start_seconds", chunk.get("start", 0)) or 0)
+                end = float(chunk.get("local_end_seconds", chunk.get("end", start)) or start)
                 if end <= start:
                     continue
                 w = {
@@ -1191,8 +1248,6 @@ class PipelineRunner:
             "source_type": item.get("source_type", ""),
             "original_path": item.get("original_path", ""),
             "duration_seconds": item.get("duration_seconds"),
-            "virtual_start_seconds": item.get("virtual_start_seconds"),
-            "virtual_end_seconds": item.get("virtual_end_seconds"),
             "summary": summary_text,
             "key_facts": key_facts,
             "timeline_digest": digest,
@@ -1224,15 +1279,12 @@ class PipelineRunner:
             summary_doc = read_json(self.task_dir / summary_rel, {}) if summary_rel else {}
             source_id = str(summary_doc.get("source_id") or source_result.get("source_id") or "")
             source_item = source_items_by_id.get(source_id, {})
-            virtual_start = float(source_item.get("virtual_start_seconds") or summary_doc.get("virtual_start_seconds") or 0)
             source_summary = {
                 "source_id": source_id,
                 "source_index": source_item.get("source_index") or summary_doc.get("source_index"),
                 "display_name": summary_doc.get("display_name") or source_result.get("display_name") or "",
                 "source_type": summary_doc.get("source_type") or source_item.get("source_type") or "",
                 "duration_seconds": summary_doc.get("duration_seconds") or source_item.get("duration_seconds"),
-                "virtual_start_seconds": source_item.get("virtual_start_seconds", summary_doc.get("virtual_start_seconds")),
-                "virtual_end_seconds": source_item.get("virtual_end_seconds", summary_doc.get("virtual_end_seconds")),
                 "summary": summary_doc.get("summary", ""),
                 "key_facts": summary_doc.get("key_facts", []),
             }
@@ -1244,12 +1296,16 @@ class PipelineRunner:
                     continue
                 local_start = float(chunk.get("local_start_seconds", chunk.get("start_seconds", chunk.get("start", 0))) or 0)
                 local_end = float(chunk.get("local_end_seconds", chunk.get("end_seconds", chunk.get("end", local_start))) or local_start)
-                global_start = virtual_start + local_start
-                global_end = virtual_start + local_end
                 chunk_id = str(chunk.get("chunk_id") or f"chunk_{index:04d}")
-                global_chunk_id = f"{source_id}_{chunk_id}"
+                global_chunk_id = chunk_id if chunk_id.startswith(f"{source_id}_") else f"{source_id}_{chunk_id}"
+                clean_chunk = {
+                    key: value
+                    for key, value in chunk.items()
+                    if key not in FORBIDDEN_LLM_FIELDS
+                    and key not in {"global_chunk_id", "local_chunk_id"}
+                }
                 chunks.append({
-                    **chunk,
+                    **clean_chunk,
                     "chunk_id": global_chunk_id,
                     "global_chunk_id": global_chunk_id,
                     "local_chunk_id": chunk_id,
@@ -1257,25 +1313,27 @@ class PipelineRunner:
                     "source_index": source_summary.get("source_index"),
                     "local_start_seconds": round(local_start, 3),
                     "local_end_seconds": round(local_end, 3),
-                    "start_seconds": round(global_start, 3),
-                    "end_seconds": round(global_end, 3),
-                    "start": round(global_start, 3),
-                    "end": round(global_end, 3),
-                    "source_start": seconds_to_timecode(global_start, ms=True),
-                    "source_end": seconds_to_timecode(global_end, ms=True),
+                    "local_start": seconds_to_timecode(local_start, ms=True),
+                    "local_end": seconds_to_timecode(local_end, ms=True),
+                    "duration_seconds": round(max(0.0, local_end - local_start), 3),
                 })
 
-        chunks.sort(key=lambda item: (float(item.get("start_seconds") or 0), str(item.get("chunk_id") or "")))
-        total_duration = max((float(item.get("end_seconds") or 0) for item in chunks), default=0.0)
+        chunks.sort(key=lambda item: (
+            int(item.get("source_index") or 0),
+            float(item.get("local_start_seconds") or 0),
+            str(item.get("chunk_id") or ""),
+        ))
+        total_source_duration = sum(float(item.get("duration_seconds") or 0) for item in summaries)
         aggregate = {
-            "version": "source_aggregate_v1",
+            "version": "source_aggregate_local_time_v1",
             "source_count": len(self._iter_source_items()),
             "successful_source_count": len(summaries),
             "failed_sources": analysis.get("failed_sources", []),
             "sources": summaries,
             "timeline_digest": {
-                "version": "multi_source_timeline_digest_v1",
-                "video_duration_seconds": round(total_duration, 3),
+                "version": "multi_source_local_timeline_digest_v1",
+                "timeline_mode": "source_pool_local_time",
+                "total_source_duration_seconds": round(total_source_duration, 3),
                 "chunks": chunks,
             },
         }
@@ -1294,26 +1352,12 @@ class PipelineRunner:
     def _load_current_timeline_digest_for_llm(self, step: str) -> dict[str, Any]:
         digest = self._load_current_timeline_digest()
         chunks = digest.get("chunks", []) if isinstance(digest, dict) else []
-        compact_chunks: list[dict[str, Any]] = []
-        for chunk in chunks:
-            if not isinstance(chunk, dict):
-                continue
-            compact_chunks.append({
-                "chunk_id": chunk.get("chunk_id") or chunk.get("global_chunk_id") or "",
-                "source_id": chunk.get("source_id", ""),
-                "source_index": chunk.get("source_index", ""),
-                "start": chunk.get("start_seconds", chunk.get("start", 0)),
-                "end": chunk.get("end_seconds", chunk.get("end", 0)),
-                "speech": compact_text(str(chunk.get("speech") or ""), max_chars=70),
-                "visual": compact_text(str(chunk.get("visual") or ""), max_chars=50),
-                "visual_score": chunk.get("visual_score", 0),
-                "hook_score": chunk.get("hook_score", 0),
-                "flags": compact_list(chunk.get("flags") or [], max_items=2, max_chars_each=18),
-            })
+        compact_chunks = compact_chunks_for_llm([chunk for chunk in chunks if isinstance(chunk, dict)])
         return {
             "version": str(digest.get("version") or "timeline_digest_llm_compact_v1"),
             "source": "source_aggregate" if self._is_virtual_source_manifest() else "timeline_digest",
-            "video_duration_seconds": digest.get("video_duration_seconds", 0),
+            "timeline_mode": digest.get("timeline_mode", "source_pool_local_time" if self._is_virtual_source_manifest() else ""),
+            "total_source_duration_seconds": digest.get("total_source_duration_seconds", digest.get("video_duration_seconds", 0)),
             "chunk_count": len(compact_chunks),
             "chunks": compact_chunks,
         }
@@ -1322,20 +1366,10 @@ class PipelineRunner:
         if not self._is_virtual_source_manifest():
             return {}
         aggregate = self._load_optional_step_json("source_aggregate", {})
-        sources: list[dict[str, Any]] = []
-        for item in aggregate.get("sources") or []:
-            if not isinstance(item, dict):
-                continue
-            sources.append({
-                "source_id": item.get("source_id", ""),
-                "source_index": item.get("source_index", ""),
-                "display_name": item.get("display_name", ""),
-                "duration_seconds": item.get("duration_seconds", 0),
-                "virtual_start_seconds": item.get("virtual_start_seconds", 0),
-                "virtual_end_seconds": item.get("virtual_end_seconds", 0),
-                "summary": compact_text(str(item.get("summary") or ""), max_chars=160),
-                "key_facts": compact_list(item.get("key_facts") or [], max_items=2, max_chars_each=70),
-            })
+        sources = compact_sources_for_llm(
+            [item for item in aggregate.get("sources") or [] if isinstance(item, dict)],
+            max_sources=int(self.config.raw.get("llm_input", {}).get("max_llm_sources", 20) or 20),
+        )
         return {
             "version": "source_aggregate_llm_compact_v1",
             "source_count": aggregate.get("source_count", len(sources)),
@@ -1450,12 +1484,13 @@ class PipelineRunner:
                 meta = ffprobe_json(source)
                 metadata_list.append({
                     "source_id": item.get("source_id"),
+                    "source_index": item.get("source_index"),
+                    "duration_seconds": item.get("duration_seconds"),
                     "metadata": meta,
-                    "virtual_start_seconds": item.get("virtual_start_seconds"),
-                    "virtual_end_seconds": item.get("virtual_end_seconds"),
                 })
             metadata = {
-                "source_mode": "multi_source_virtual",
+                "source_mode": "multi_source_pool",
+                "timeline_mode": "source_pool_local_time",
                 "duration": sum(m.get("duration_seconds", 0) for m in sources),
                 "sources": metadata_list,
             }
@@ -1579,7 +1614,6 @@ class PipelineRunner:
                 run_cmd(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(source), "-vf", f"fps=1/{interval}", "-q:v", "3", pattern])
                 frames = sorted(source_dir.glob("*.jpg"))
                 
-                virtual_start = item.get("virtual_start_seconds", 0)
                 for i, p in enumerate(frames):
                     local_seconds = i * interval
                     all_frames.append({
@@ -1587,7 +1621,6 @@ class PipelineRunner:
                         "index": i + 1,
                         "time": seconds_to_timecode(local_seconds, ms=True),
                         "seconds": local_seconds,
-                        "virtual_seconds": virtual_start + local_seconds,
                         "file": relpath(p, self.task_dir)
                     })
                 output_files.extend(frames[:5])
@@ -1643,7 +1676,6 @@ class PipelineRunner:
             for s_idx, source in enumerate(metadata.get("sources", [])):
                 source_id = source.get("source_id")
                 duration = float(source.get("metadata", {}).get("duration") or 0)
-                virtual_start = float(source.get("virtual_start_seconds", 0))
                 source_frames = [f for f in frame_items if f.get("source_id") == source_id]
                 for idx in range(max(1, math.ceil(duration / chunk_seconds))):
                     local_start = idx * chunk_seconds
@@ -1655,13 +1687,9 @@ class PipelineRunner:
                         "chunk_id": chunk_id,
                         "local_start_seconds": local_start,
                         "local_end_seconds": local_end,
-                        "local_start": local_start, # compat
-                        "local_end": local_end, # compat
-                        "virtual_start_seconds": virtual_start + local_start,
-                        "virtual_end_seconds": virtual_start + local_end,
-                        "start": virtual_start + local_start,
-                        "end": virtual_start + local_end,
-                        "time_range": f"{seconds_to_timecode(virtual_start + local_start)}-{seconds_to_timecode(virtual_start + local_end)}",
+                        "local_start": seconds_to_timecode(local_start, ms=True),
+                        "local_end": seconds_to_timecode(local_end, ms=True),
+                        "time_range": f"{seconds_to_timecode(local_start, ms=True)}-{seconds_to_timecode(local_end, ms=True)}",
                         "frames": [f["file"] for f in chunk_frames],
                     })
             out = write_json(vdir / "chunks.json", {"chunks": chunks})
@@ -1713,6 +1741,7 @@ class PipelineRunner:
 
         all_segments: list[dict[str, Any]] = []
         full_text_parts: list[str] = []
+        raw_full_text_parts: list[str] = []
         raw_results: list[dict[str, Any]] = []
         err = ""
         out = vdir / "asr_segments.json"
@@ -1777,17 +1806,22 @@ class PipelineRunner:
                     if not result.get("success"):
                         raise RuntimeError(f"{wid} ASR failed: {result.get('error')}")
 
-                    full_text_parts.append(result.get("text", ""))
+                    raw_text = str(result.get("text", ""))
+                    raw_full_text_parts.append(raw_text)
+                    full_text_parts.append(clean_asr_text(raw_text)["clean_text"])
                     for seg in result.get("segments", []):
                         local_start = float(seg.get("start") or 0)
                         local_end = float(seg.get("end") or 0)
-                        text = str(seg.get("text") or "").strip()
+                        cleaned = clean_asr_text(str(seg.get("text") or ""))
+                        text = cleaned["clean_text"]
                         if not text:
                             continue
                         all_segments.append({
                             "start": start + local_start,
                             "end": start + local_end if local_end > 0 else end,
                             "text": text,
+                            "raw_text": cleaned["raw_text"],
+                            "removed_tokens": cleaned["removed_tokens"],
                             "asr_segment_id": wid,
                             "chunk_id": window.get("chunk_id", ""),
                         })
@@ -1804,6 +1838,7 @@ class PipelineRunner:
                 "language": "zh",
                 "segments": segments,
                 "full_text": full_text,
+                "raw_full_text": " ".join(str(x) for x in raw_full_text_parts if x).strip(),
                 "raw_result": {
                     "mode": "segmented_asr_v1",
                     "segment_count": len(windows),
@@ -2107,14 +2142,12 @@ class PipelineRunner:
         timeline = []
         for chunk in chunks.get("chunks", []):
             vr = self._apply_manual_override(vdir, visual_by_id.get(chunk["chunk_id"], {}), "vision", chunk["chunk_id"])
-            segs = self._segments_in_range(asr.get("segments", []), chunk["start"], chunk["end"])
+            chunk_start = float(chunk.get("local_start_seconds", chunk.get("start", 0)) or 0)
+            chunk_end = float(chunk.get("local_end_seconds", chunk.get("end", chunk_start)) or chunk_start)
+            segs = self._segments_in_range(asr.get("segments", []), chunk_start, chunk_end)
             t_entry = {
                 "chunk_id": chunk["chunk_id"],
-                "start": seconds_to_timecode(chunk["start"], ms=True),
-                "end": seconds_to_timecode(chunk["end"], ms=True),
-                "start_seconds": chunk["start"],
-                "end_seconds": chunk["end"],
-                "asr_text": " ".join(s.get("text", "") for s in segs).strip(),
+                "asr_text": clean_asr_text(" ".join(str(s.get("clean_text") or s.get("text") or "") for s in segs))["clean_text"],
                 "asr_digest": asr_digest_by_id.get(str(chunk["chunk_id"]), ""),
                 "asr_segments": segs,
                 "scene_type": vr.get("scene_type", ""),
@@ -2130,8 +2163,15 @@ class PipelineRunner:
             }
             if "source_id" in chunk:
                 t_entry["source_id"] = chunk["source_id"]
-                t_entry["local_start_seconds"] = chunk.get("local_start_seconds", chunk.get("local_start", 0))
-                t_entry["local_end_seconds"] = chunk.get("local_end_seconds", chunk.get("local_end", 0))
+                t_entry["local_start_seconds"] = chunk_start
+                t_entry["local_end_seconds"] = chunk_end
+                t_entry["local_start"] = seconds_to_timecode(chunk_start, ms=True)
+                t_entry["local_end"] = seconds_to_timecode(chunk_end, ms=True)
+            else:
+                t_entry["start"] = seconds_to_timecode(chunk_start, ms=True)
+                t_entry["end"] = seconds_to_timecode(chunk_end, ms=True)
+                t_entry["start_seconds"] = chunk_start
+                t_entry["end_seconds"] = chunk_end
             timeline.append(t_entry)
         out = write_json(vdir / "merged_timeline.json", {"timeline": timeline, "source_versions": {"asr": self._step_content_hash("asr"), "asr_digest": self._step_content_hash("asr_digest"), "vision": self._step_content_hash("vision")}})
         self._write_status(vdir, self._base_status("timeline", version, input_hash, [out]))
@@ -2214,12 +2254,11 @@ class PipelineRunner:
             chunk_id = c.get("chunk_id", "")
             source_id = c.get("source_id") or "source_1"
             source_index = c.get("source_index", "")
-            start = seconds_to_timecode(float(c.get("start_seconds", c.get("start", 0)) or 0), ms=True)
-            end = seconds_to_timecode(float(c.get("end_seconds", c.get("end", 0)) or 0), ms=True)
-            speech = str(c.get("speech") or "").strip() or "无"
+            time_range = c.get("time_range") or local_time_range(c)
+            speech = sanitize_llm_text(str(c.get("speech") or ""), max_chars=500) or "无"
             visual = str(c.get("visual") or "").strip() or "无"
             
-            lines.append(f"[{chunk_id}] source_id={source_id} source_index={source_index} time={start}-{end}")
+            lines.append(f"[{chunk_id}] source_id={source_id} source_index={source_index} time={time_range}")
             lines.append(speech)
             lines.append(visual)
             lines.append("")
@@ -2285,6 +2324,85 @@ class PipelineRunner:
         lines.append(self._format_timeline_chunks_text(digest))
         return "\n".join(lines).strip()
 
+    def _asr_event_segments(self) -> list[dict[str, Any]]:
+        digest = self._load_current_timeline_digest()
+        chunks = digest.get("chunks", []) if isinstance(digest, dict) else []
+        segments: list[dict[str, Any]] = []
+        for index, chunk in enumerate(chunks, start=1):
+            if not isinstance(chunk, dict):
+                continue
+            speech = clean_asr_text(str(chunk.get("speech") or chunk.get("asr_text") or chunk.get("asr_digest") or ""))["clean_text"]
+            if not speech:
+                continue
+            source_id = str(chunk.get("source_id") or "source_1")
+            local_start = float(chunk.get("local_start_seconds", chunk.get("start_seconds", chunk.get("start", 0))) or 0)
+            local_end = float(chunk.get("local_end_seconds", chunk.get("end_seconds", chunk.get("end", local_start))) or local_start)
+            if local_end <= local_start and chunk.get("duration_seconds"):
+                local_end = local_start + float(chunk.get("duration_seconds") or 0)
+            if local_end <= local_start:
+                continue
+            source_index = chunk.get("source_index", 1 if source_id == "source_1" else "")
+            segment_id = str(chunk.get("segment_id") or f"{source_id}_seg_{index:04d}")
+            segments.append({
+                "segment_id": segment_id,
+                "source_id": source_id,
+                "source_index": source_index,
+                "source_start_seconds": round(local_start, 3),
+                "source_end_seconds": round(local_end, 3),
+                "time_range_for_reference": f"{seconds_to_timecode(local_start, ms=True)}-{seconds_to_timecode(local_end, ms=True)}",
+                "speech": compact_text(speech, max_chars=500),
+                "nearby_context": "",
+                "visual_summary": compact_text(str(chunk.get("visual") or chunk.get("visual_summary") or ""), max_chars=240),
+                "source_chunk_ids": [str(chunk.get("chunk_id") or chunk.get("global_chunk_id") or f"chunk_{index:04d}")],
+            })
+        return segments
+
+    def _build_asr_event_candidate_text(self) -> str:
+        video = self._load_optional_step_json("video_understanding", {})
+        segments = self._asr_event_segments()
+        lines = [
+            "任务：请从 ASR segment 中选择适合原声高光重组的新闻事件候选。",
+            "",
+            "视频理解：",
+            f"主题：{video.get('main_topic') or video.get('topic') or ''}",
+            f"摘要：{video.get('summary') or video.get('understanding') or ''}",
+            "",
+            "ASR segments：",
+        ]
+        for segment in segments:
+            lines.append(json.dumps(segment, ensure_ascii=False, separators=(",", ":")))
+        lines.append("")
+        lines.append("只输出 {\"keep\":[],\"merge\":[]}，不要输出时间码。")
+        return "\n".join(lines)
+
+    def _build_candidate_filter_text(self) -> str:
+        video = self._load_optional_step_json("video_understanding", {})
+        pool = self._load_candidate_clip_pool(filtered=False)
+        llm_cfg = self.config.raw.get("llm_input", {})
+        max_clips = int(llm_cfg.get("max_llm_candidate_clips", llm_cfg.get("max_candidate_clips_for_edit_plan", 18)) or 18)
+        payload = {
+            "production_mode": self.options.production_mode,
+            "main_topic": video.get("main_topic") or video.get("topic") or "",
+            "summary": video.get("summary") or video.get("understanding") or "",
+            "candidate_clips": [
+                {
+                    "clip_id": clip.get("clip_id"),
+                    "source_id": clip.get("source_id"),
+                    "source_index": clip.get("source_index"),
+                    "duration_seconds": clip.get("duration_seconds"),
+                    "speech": compact_text(str(clip.get("speech") or clip.get("asr_text") or ""), max_chars=500),
+                    "visual": compact_text(str(clip.get("visual") or clip.get("visual_summary") or ""), max_chars=260),
+                    "summary": compact_text(str(clip.get("summary") or clip.get("event_summary") or ""), max_chars=320),
+                    "event_type": clip.get("event_type", ""),
+                    "visual_support": clip.get("visual_support", "unknown"),
+                    "independent": clip.get("independent", True),
+                    "needs_context": clip.get("needs_context", False),
+                }
+                for clip in pool[:max_clips]
+            ],
+        }
+        return json.dumps(payload, ensure_ascii=False, indent=2)
+
     def step_content_analysis(self) -> None:
         text_input = self._build_content_analysis_brief_text()
         result = self._run_text_agent("content_analysis", text_input)
@@ -2303,6 +2421,56 @@ class PipelineRunner:
         result = self._run_text_agent("highlight_detection", text_input)
         result = self._materialize_candidate_clips_from_chunks(result, source_step="highlight_detection")
         self._overwrite_step_json("highlight_detection", result, materialized=True)
+
+    def step_asr_event_candidate(self) -> None:
+        result = self._run_text_agent("asr_event_candidate", self._build_asr_event_candidate_text())
+        result = self._materialize_asr_event_candidate(result)
+        self._overwrite_step_json("asr_event_candidate", result, materialized=True)
+
+    def step_candidate_filter(self) -> None:
+        pool = self._load_candidate_clip_pool(filtered=False)
+        if not pool:
+            self._write_candidate_filter_outputs(
+                parsed={"keep_clip_ids": [], "merge_groups": []},
+                filtered_pool=[],
+                diagnostics=self._reassembly_error(
+                    "candidate_pool_empty",
+                    reason="ASR 事件候选生成没有找到可用原声片段",
+                    suggestion="降低候选事件阈值，或检查 ASR 文本质量",
+                    source_chunk_count=len(self._asr_event_segments()),
+                ),
+                status="failed",
+            )
+            raise UserFacingPipelineError(
+                "candidate_pool_empty",
+                user_message="候选池为空：ASR 事件候选生成没有找到可用原声片段。",
+                suggestions=["检查 ASR 文本质量。", "从 ASR 事件候选步骤重跑，并放宽候选规则。"],
+                technical_detail={"error_type": "candidate_pool_empty"},
+            )
+        result = self._run_text_agent("candidate_filter", self._build_candidate_filter_text())
+        llm_input_hash = self.manifest.get("steps", {}).get("candidate_filter", {}).get("input_hash")
+        normalized = self._normalize_candidate_filter_result(result, pool)
+        filtered_pool = self._build_filtered_candidate_pool(pool, normalized)
+        diagnostics = {}
+        status = "success"
+        if not filtered_pool:
+            diagnostics = self._reassembly_error(
+                "candidate_filter_empty",
+                reason="候选复核后没有保留任何 clip",
+                suggestion="放宽 candidate_filter，或允许保留 medium 质量片段",
+                candidate_pool_count=len(pool),
+                keep_clip_ids=normalized.get("keep_clip_ids", []),
+                main_drop_reasons=normalized.get("diagnostics", {}).get("main_drop_reasons", []),
+            )
+            status = "failed"
+        self._write_candidate_filter_outputs(normalized, filtered_pool, diagnostics=diagnostics, status=status, input_hash=llm_input_hash)
+        if status == "failed":
+            raise UserFacingPipelineError(
+                "candidate_filter_empty",
+                user_message="候选复核后为空：candidate_filter 没有保留任何原声片段。",
+                suggestions=["放宽 candidate_filter 规则后重跑。", "检查候选片段是否都是半句话、弱背景或空镜。"],
+                technical_detail=diagnostics,
+            )
 
     def step_candidate_refine(self) -> None:
         self._mark_skipped("candidate_refine", "已删除：候选筛选前移到 content_analysis/highlight_detection，并由代码 materialize。")
@@ -2413,6 +2581,9 @@ class PipelineRunner:
     def step_voiceover_quality_check(self) -> None:
         self._mark_skipped("voiceover_quality_check", "已删除：配音文案质量改由代码规则和时长校验处理。")
 
+    def step_voiceover_quality_gate(self) -> None:
+        self._mark_skipped("voiceover_quality_gate", "已删除：配音文案质量改由代码规则、TTS时长和成片时长校验处理。")
+
     def step_risk_review(self) -> None:
         self._run_text_agent("risk_review", {
             "editing_script": self._load_step_json("editing_script"),
@@ -2471,8 +2642,8 @@ class PipelineRunner:
         return []
 
     def _chunk_start_end(self, chunk: dict[str, Any]) -> tuple[float, float]:
-        start = float(chunk.get("start_seconds", chunk.get("start", 0)) or 0)
-        end = float(chunk.get("end_seconds", chunk.get("end", start)) or start)
+        start = float(chunk.get("local_start_seconds", chunk.get("start_seconds", chunk.get("start", 0))) or 0)
+        end = float(chunk.get("local_end_seconds", chunk.get("end_seconds", chunk.get("end", start))) or start)
         if end <= start and chunk.get("duration_seconds"):
             end = start + float(chunk.get("duration_seconds") or 0)
         return start, end
@@ -2604,6 +2775,10 @@ class PipelineRunner:
                 "clip_id": clip_id,
                 "chunk_ids": chunk_ids,
                 "source_chunk_ids": chunk_ids,
+                "local_start": seconds_to_timecode(start, ms=True),
+                "local_end": seconds_to_timecode(end, ms=True),
+                "local_start_seconds": round(start, 3),
+                "local_end_seconds": round(end, 3),
                 "start": seconds_to_timecode(start, ms=True),
                 "end": seconds_to_timecode(end, ms=True),
                 "start_seconds": round(start, 3),
@@ -2635,8 +2810,210 @@ class PipelineRunner:
         normalized["materialized_by_code"] = True
         return normalized
 
+    def _normalize_asr_event_result(self, result: Any) -> dict[str, Any]:
+        raw = result if isinstance(result, dict) else {}
+        keep = self._coerce_id_list(raw.get("keep") or raw.get("keep_segment_ids") or raw.get("segment_ids"))
+        merge_raw = raw.get("merge") or raw.get("merge_groups") or []
+        merge_groups: list[list[str]] = []
+        if isinstance(merge_raw, list):
+            for group in merge_raw:
+                ids = self._coerce_id_list(group)
+                if len(ids) >= 2:
+                    merge_groups.append(ids)
+                    for sid in ids:
+                        if sid not in keep:
+                            keep.append(sid)
+        return {"keep": keep, "merge": merge_groups, "raw_model_plan": result}
+
+    def _materialize_asr_event_candidate(self, result: Any) -> dict[str, Any]:
+        normalized = self._normalize_asr_event_result(result)
+        segments = self._asr_event_segments()
+        by_id = {str(seg.get("segment_id")): seg for seg in segments}
+        keep_ids = [sid for sid in normalized["keep"] if sid in by_id]
+        if not keep_ids:
+            keep_ids = [str(seg.get("segment_id")) for seg in segments]
+
+        used: set[str] = set()
+        groups: list[list[str]] = []
+        for group in normalized["merge"]:
+            valid = [sid for sid in group if sid in by_id and sid in keep_ids]
+            if len(valid) < 2:
+                continue
+            source_ids = {str(by_id[sid].get("source_id") or "") for sid in valid}
+            if len(source_ids) != 1:
+                continue
+            groups.append(valid)
+            used.update(valid)
+        for sid in keep_ids:
+            if sid not in used:
+                groups.append([sid])
+
+        per_source_count: dict[str, int] = {}
+        candidate_clips: list[dict[str, Any]] = []
+        for group in groups:
+            group_segments = [by_id[sid] for sid in group if sid in by_id]
+            if not group_segments:
+                continue
+            source_id = str(group_segments[0].get("source_id") or "source_1")
+            source_ids = {str(seg.get("source_id") or "source_1") for seg in group_segments}
+            if len(source_ids) != 1:
+                continue
+            start = min(float(seg.get("source_start_seconds") or 0) for seg in group_segments)
+            end = max(float(seg.get("source_end_seconds") or 0) for seg in group_segments)
+            if end <= start:
+                continue
+            per_source_count[source_id] = per_source_count.get(source_id, 0) + 1
+            source_digits = re.sub(r"\D+", "", source_id) or str(group_segments[0].get("source_index") or 1)
+            clip_id = f"src{int(source_digits):02d}_evt_{per_source_count[source_id]:03d}" if source_digits.isdigit() else f"{source_id}_evt_{per_source_count[source_id]:03d}"
+            speech = " ".join(str(seg.get("speech") or "").strip() for seg in group_segments if str(seg.get("speech") or "").strip())
+            visual = " ".join(str(seg.get("visual_summary") or "").strip() for seg in group_segments if str(seg.get("visual_summary") or "").strip())
+            chunk_ids: list[str] = []
+            for seg in group_segments:
+                for chunk_id in seg.get("source_chunk_ids") or []:
+                    if chunk_id not in chunk_ids:
+                        chunk_ids.append(str(chunk_id))
+            candidate_clips.append({
+                "clip_id": clip_id,
+                "source_id": source_id,
+                "source_index": group_segments[0].get("source_index", ""),
+                "source_start_seconds": round(start, 3),
+                "source_end_seconds": round(end, 3),
+                "source_start": seconds_to_timecode(start, ms=True),
+                "source_end": seconds_to_timecode(end, ms=True),
+                "start_seconds": round(start, 3),
+                "end_seconds": round(end, 3),
+                "start": seconds_to_timecode(start, ms=True),
+                "end": seconds_to_timecode(end, ms=True),
+                "duration_seconds": round(end - start, 3),
+                "segment_ids": group,
+                "asr_text": speech,
+                "speech": speech,
+                "event_summary": compact_text(speech, max_chars=220),
+                "summary": compact_text(speech, max_chars=220),
+                "event_type": "",
+                "news_value": "medium",
+                "independent": True,
+                "needs_context": False,
+                "context_reason": "",
+                "source_chunk_ids": chunk_ids,
+                "chunk_ids": chunk_ids,
+                "visual_summary": compact_text(visual, max_chars=240),
+                "visual": compact_text(visual, max_chars=240),
+                "visual_support": "unknown",
+            })
+
+        return {
+            "version": "asr_event_candidate_materialized_v1",
+            "keep_segment_ids": keep_ids,
+            "merge_groups": groups,
+            "segments": segments,
+            "candidate_clips": candidate_clips,
+            "candidate_clip_pool": candidate_clips,
+            "materialized_by_code": True,
+            "raw_model_plan": result,
+        }
+
+    def _load_candidate_clip_pool(self, *, filtered: bool) -> list[dict[str, Any]]:
+        if filtered:
+            doc = self._load_optional_step_json("candidate_filter", {})
+            clips = doc.get("candidate_clip_pool_filtered") or doc.get("filtered_candidate_clips") or []
+            return [clip for clip in clips if isinstance(clip, dict)]
+        if self.options.production_mode == "highlight_reassembly":
+            doc = self._load_optional_step_json("asr_event_candidate", {})
+            clips = doc.get("candidate_clip_pool") or doc.get("candidate_clips") or []
+            if clips:
+                return [clip for clip in clips if isinstance(clip, dict)]
+            doc = self._load_optional_step_json("highlight_detection", {})
+            clips = doc.get("candidate_clips", [])
+            if isinstance(clips, dict):
+                clips = clips.get("candidate_clips", [])
+            return [clip for clip in clips if isinstance(clip, dict)]
+        return self._load_candidate_clips_for_current_mode()
+
+    def _normalize_candidate_filter_result(self, result: Any, pool: list[dict[str, Any]]) -> dict[str, Any]:
+        raw = result if isinstance(result, dict) else {}
+        pool_ids = [str(clip.get("clip_id") or "") for clip in pool if clip.get("clip_id")]
+        keep = self._coerce_id_list(raw.get("keep_clip_ids") or raw.get("keep") or raw.get("clip_ids"))
+        keep = [cid for cid in keep if cid in pool_ids]
+        if not keep:
+            keep = pool_ids
+        merge_groups: list[list[str]] = []
+        for group in raw.get("merge_groups") or raw.get("merge") or []:
+            ids = self._coerce_id_list(group.get("clip_ids") if isinstance(group, dict) else group)
+            ids = [cid for cid in ids if cid in pool_ids]
+            if len(ids) >= 2:
+                merge_groups.append(ids)
+        ranked = [cid for cid in self._coerce_id_list(raw.get("ranked_clip_ids")) if cid in keep]
+        diagnostics = raw.get("diagnostics") if isinstance(raw.get("diagnostics"), dict) else {}
+        return {
+            "version": "candidate_filter_materialized_v1",
+            "keep_clip_ids": keep,
+            "drop_clip_ids": [cid for cid in pool_ids if cid not in keep],
+            "merge_groups": merge_groups,
+            "ranked_clip_ids": ranked,
+            "diagnostics": diagnostics,
+            "materialized_by_code": True,
+            "raw_model_plan": result,
+        }
+
+    def _build_filtered_candidate_pool(self, pool: list[dict[str, Any]], filter_doc: dict[str, Any]) -> list[dict[str, Any]]:
+        by_id = {str(clip.get("clip_id")): clip for clip in pool if clip.get("clip_id")}
+        keep_ids = filter_doc.get("ranked_clip_ids") or filter_doc.get("keep_clip_ids") or []
+        group_by_clip: dict[str, str] = {}
+        for group_index, group in enumerate(filter_doc.get("merge_groups") or [], start=1):
+            gid = f"story_{group_index:03d}"
+            for cid in group:
+                group_by_clip[str(cid)] = gid
+        filtered: list[dict[str, Any]] = []
+        for cid in keep_ids:
+            if cid not in by_id:
+                continue
+            clip = dict(by_id[cid])
+            if cid in group_by_clip:
+                clip["story_group_id"] = group_by_clip[cid]
+                clip["merge_group_id"] = group_by_clip[cid]
+            filtered.append(clip)
+        return filtered
+
+    def _write_candidate_filter_outputs(
+        self,
+        parsed: dict[str, Any],
+        filtered_pool: list[dict[str, Any]],
+        *,
+        diagnostics: dict[str, Any] | None = None,
+        status: str = "success",
+        input_hash: str | None = None,
+    ) -> None:
+        effective_input_hash = input_hash or stable_hash({
+            "candidate_filter": self._step_content_hash("asr_event_candidate"),
+            "video_understanding": self._step_content_hash("video_understanding"),
+            "parsed": parsed,
+        })
+        version, vdir = self._version_dir("candidate_filter", "agents/candidate_filter")
+        ensure_dir(vdir)
+        output = dict(parsed)
+        output["candidate_clip_pool_filtered"] = filtered_pool
+        output["filtered_candidate_clips"] = filtered_pool
+        output["diagnostic_error"] = diagnostics or {}
+        out = write_json(vdir / "candidate_filter.json", output)
+        write_json(vdir / "candidate_clip_pool_filtered.json", {"candidate_clips": filtered_pool})
+        status_doc = self._base_status("candidate_filter", version, effective_input_hash, [out])
+        status_doc["status"] = status
+        if diagnostics:
+            status_doc["technical_error"] = diagnostics
+        self._write_status(vdir, status_doc)
+        self._record_step(
+            step="candidate_filter",
+            version=version,
+            status=status,
+            output=relpath(out, self.task_dir),
+            input_hash=effective_input_hash,
+            output_files=[out],
+            extra={"summary": {"filtered_clips": len(filtered_pool)}, "technical_error": diagnostics or {}},
+        )
+
     def _candidate_clips_by_id(self) -> dict[str, dict[str, Any]]:
-        clips = self._load_candidate_clips_for_current_mode()
+        clips = self._load_candidate_clip_pool(filtered=True) if self.options.production_mode == "highlight_reassembly" else self._load_candidate_clips_for_current_mode()
         return {self._clip_id(clip, index): clip for index, clip in enumerate(clips)}
 
     def _stringify_fact_points(self, values: Any) -> list[str]:
@@ -2689,16 +3066,25 @@ class PipelineRunner:
                 start, end = self._clip_start_end(clip)
                 duration = max(0.0, end - start)
                 source_clip_id = self._clip_id(clip, shot_index - 1)
+                local_start = seconds_to_timecode(start, ms=True)
+                local_end = seconds_to_timecode(end, ms=True)
                 visual = str(clip.get("visual") or clip.get("visual_summary") or "").strip()
                 fact = str(clip.get("summary") or clip.get("speech") or clip.get("clip_type") or "").strip()
                 editing_structure.append({
                     "order": shot_index,
                     "shot_id": f"{short_video_id}_s{shot_index:02d}",
                     "source_clip_id": source_clip_id,
+                    "clip_id": source_clip_id,
                     "source_id": clip.get("source_id", ""),
                     "source_index": clip.get("source_index", ""),
-                    "source_start": seconds_to_timecode(start, ms=True),
-                    "source_end": seconds_to_timecode(end, ms=True),
+                    "local_start": local_start,
+                    "local_end": local_end,
+                    "local_start_seconds": round(start, 3),
+                    "local_end_seconds": round(end, 3),
+                    "source_start": local_start,
+                    "source_end": local_end,
+                    "source_start_seconds": round(start, 3),
+                    "source_end_seconds": round(end, 3),
                     "duration_seconds": round(duration, 3),
                     "visual": visual,
                     "fact": fact,
@@ -2770,12 +3156,21 @@ class PipelineRunner:
             for clip in selected:
                 start, end = self._clip_start_end(clip)
                 source_clip_id = self._clip_id(clip, len(selected_clips))
+                local_start = seconds_to_timecode(start, ms=True)
+                local_end = seconds_to_timecode(end, ms=True)
                 used_clip_ids.add(source_clip_id)
                 selected_clips.append({
+                    "clip_id": source_clip_id,
                     "source_clip_id": source_clip_id,
                     "source_id": clip.get("source_id", ""),
-                    "source_start": seconds_to_timecode(start, ms=True),
-                    "source_end": seconds_to_timecode(end, ms=True),
+                    "local_start": local_start,
+                    "local_end": local_end,
+                    "local_start_seconds": round(start, 3),
+                    "local_end_seconds": round(end, 3),
+                    "source_start": local_start,
+                    "source_end": local_end,
+                    "source_start_seconds": round(start, 3),
+                    "source_end_seconds": round(end, 3),
                     "duration_seconds": round(max(0.0, end - start), 3),
                     "role": clip.get("type") or clip.get("clip_type") or "",
                     "transition_after": "hard_cut",
@@ -3060,18 +3455,18 @@ class PipelineRunner:
     def _format_chunk_ts(self, chunk: dict[str, Any]) -> str:
         if chunk.get("time_range"):
             return str(chunk.get("time_range"))
-        return f"{seconds_to_timecode(float(chunk.get('start') or 0), ms=True)}-{seconds_to_timecode(float(chunk.get('end') or 0), ms=True)}"
+        return local_time_range(chunk)
 
     def _clip_id(self, clip: dict[str, Any], index: int = 0) -> str:
         return str(clip.get("clip_id") or clip.get("id") or clip.get("source_clip_id") or f"clip_{index + 1:03d}")
 
     def _clip_start_end(self, clip: dict[str, Any]) -> tuple[float, float]:
-        start = clip.get("start_seconds")
-        end = clip.get("end_seconds")
+        start = clip.get("local_start_seconds", clip.get("source_start_seconds", clip.get("start_seconds")))
+        end = clip.get("local_end_seconds", clip.get("source_end_seconds", clip.get("end_seconds")))
         if start is None:
-            start = self._clip_time_seconds(clip, "start", "source_start")
+            start = self._clip_time_seconds(clip, "start", "local_start", "source_start")
         if end is None:
-            end = self._clip_time_seconds(clip, "end", "source_end")
+            end = self._clip_time_seconds(clip, "end", "local_end", "source_end")
         start_f = float(start or 0)
         end_f = float(end or 0)
         if end_f <= start_f and clip.get("duration_seconds"):
@@ -3079,10 +3474,9 @@ class PipelineRunner:
         return start_f, end_f
 
     def _format_clip_time(self, clip: dict[str, Any]) -> str:
-        start, end = self._clip_start_end(clip)
-        if clip.get("start") and clip.get("end"):
-            return f"{clip.get('start')}-{clip.get('end')}"
-        return f"{seconds_to_timecode(start, ms=True)}-{seconds_to_timecode(end, ms=True)}"
+        if clip.get("local_start") and clip.get("local_end"):
+            return f"{clip.get('local_start')}-{clip.get('local_end')}"
+        return local_time_range(clip)
 
     def _compact_clip_score(self, clip: dict[str, Any]) -> dict[str, Any]:
         keys = ["news_value_score", "timeliness_score", "information_density_score", "visual_score", "visual_evidence_score", "independence_score", "hook_score"]
@@ -3090,10 +3484,17 @@ class PipelineRunner:
 
     def _candidate_source_hash(self) -> str:
         if self.options.production_mode == "highlight_reassembly":
-            return self._step_content_hash("highlight_detection")
+            return self._step_content_hash("candidate_filter") or self._step_content_hash("asr_event_candidate")
         return self._step_content_hash("content_analysis")
 
     def _load_candidate_clips_for_current_mode(self) -> list[dict[str, Any]]:
+        if self.options.production_mode == "highlight_reassembly":
+            filtered = self._load_candidate_clip_pool(filtered=True)
+            if filtered:
+                return filtered
+            pool = self._load_candidate_clip_pool(filtered=False)
+            if pool:
+                return pool
         source_step = "highlight_detection" if self.options.production_mode == "highlight_reassembly" else "content_analysis"
         doc = self._load_optional_step_json(source_step, {})
         clips = doc.get("candidate_clips", [])
@@ -3125,9 +3526,10 @@ class PipelineRunner:
                 continue
             out.append({
                 "chunk_id": item.get("chunk_id", ""),
-                "start": float(item.get("start_seconds") or 0),
-                "end": float(item.get("end_seconds") or 0),
-                "speech": item.get("speech", ""),
+                "source_id": item.get("source_id", ""),
+                "local_start_seconds": float(item.get("local_start_seconds", item.get("start_seconds", 0)) or 0),
+                "local_end_seconds": float(item.get("local_end_seconds", item.get("end_seconds", 0)) or 0),
+                "speech": sanitize_llm_text(str(item.get("speech", "")), max_chars=500),
                 "visual": item.get("visual", ""),
             })
         return out
@@ -3137,8 +3539,10 @@ class PipelineRunner:
         center = (start + end) / 2
         scored: list[tuple[float, dict[str, Any]]] = []
         for item in context_index:
-            item_start = float(item.get("start") or 0)
-            item_end = float(item.get("end") or item_start)
+            if clip.get("source_id") and item.get("source_id") and clip.get("source_id") != item.get("source_id"):
+                continue
+            item_start = float(item.get("local_start_seconds") or 0)
+            item_end = float(item.get("local_end_seconds") or item_start)
             overlap = max(0.0, min(end, item_end) - max(start, item_start))
             distance = 0.0 if overlap > 0 else min(abs(center - item_start), abs(center - item_end))
             scored.append((distance, item))
@@ -3146,7 +3550,7 @@ class PipelineRunner:
         return [
             {
                 "id": item.get("chunk_id", ""),
-                "t": f"{seconds_to_timecode(item.get('start', 0), ms=True)}-{seconds_to_timecode(item.get('end', 0), ms=True)}",
+                "t": local_time_range(item),
                 "speech": compact_text(str(item.get("speech") or ""), max_chars=240),
                 "visual": compact_text(str(item.get("visual") or ""), max_chars=160),
             }
@@ -3176,10 +3580,11 @@ class PipelineRunner:
         boundaries: list[dict[str, Any]] = []
         for item in self.manifest.get("source_videos", []) or []:
             if isinstance(item, dict):
+                duration = float(item.get("duration_seconds") or item.get("original_duration_seconds") or 0)
                 boundaries.append({
                     "source_id": item.get("source_id", ""),
-                    "start": float(item.get("virtual_start_seconds") or 0),
-                    "end": float(item.get("virtual_end_seconds") or item.get("duration_seconds") or 0),
+                    "local_start": 0.0,
+                    "local_end": duration,
                 })
         if boundaries:
             return boundaries
@@ -3190,11 +3595,11 @@ class PipelineRunner:
     def _build_highlight_reassembly_plan_text(self) -> str:
         llm_cfg = self.config.raw.get("llm_input", {})
         max_clips = int(llm_cfg.get("max_llm_candidate_clips", llm_cfg.get("max_candidate_clips_for_edit_plan", 14)) or 14)
-        max_boundaries = int(llm_cfg.get("max_llm_source_boundaries", 20) or 20)
         video = self._load_optional_step_json("video_understanding", {})
         clips = self._load_candidate_clips_for_current_mode()[:max_clips]
         lines = [
             "任务：请规划原声高光重组视频。",
+            "规则：不同 source 是独立素材池，不代表连续时间线；只选择并排序 clip_id，不要输出任何时间戳。",
             "",
             "运行参数：",
             f"- target_seconds：{self.options.reassembly_target_seconds}",
@@ -3209,16 +3614,13 @@ class PipelineRunner:
         ]
         for index, clip in enumerate(clips):
             cid = self._clip_id(clip, index)
-            lines.append(f"[{cid}] 时间={self._format_clip_time(clip)} 时长={clip.get('duration_seconds', '')} source_id={clip.get('source_id', 'source_1')} 类型={clip.get('type') or clip.get('clip_type') or ''}")
+            lines.append(f"[{cid}] time={self._format_clip_time(clip)} duration={clip.get('duration_seconds', '')} source_id={clip.get('source_id', 'source_1')} type={clip.get('type') or clip.get('clip_type') or ''}")
             lines.append(f"摘要：{compact_text(str(clip.get('summary') or ''), max_chars=400)}")
-            lines.append(f"声音：{compact_text(str(clip.get('speech') or clip.get('asr_text') or clip.get('original_audio_transcript_summary') or ''), max_chars=400)}")
+            lines.append(f"声音：{sanitize_llm_text(str(clip.get('speech') or clip.get('asr_text') or clip.get('original_audio_transcript_summary') or ''), max_chars=400)}")
             lines.append(f"画面：{compact_text(str(clip.get('visual') or clip.get('visual_summary') or clip.get('why_this_visual_matters') or ''), max_chars=400)}")
             lines.append("")
-        lines.append("素材源边界：")
-        for boundary in self._source_boundaries()[:max_boundaries]:
-            lines.append(f"{boundary['source_id']}: {boundary['start']}-{boundary['end']}s")
         lines.append("")
-        lines.append("请严格按照提示词指定 JSON schema 输出。")
+        lines.append('输出 JSON 只允许包含 clip_id，例如 {"output_videos":[{"reassembly_id":"hr_001","title":"","clip_ids":["source_001_clip_0001"]}]}')
         return "\n".join(lines)
 
     def _build_short_video_edit_plan_text(self) -> str:
@@ -3247,15 +3649,15 @@ class PipelineRunner:
         context_index = self._build_timeline_context_index()
         for index, clip in enumerate(clips):
             cid = self._clip_id(clip, index)
-            lines.append(f"[{cid}] 时间={self._format_clip_time(clip)} 时长={clip.get('duration_seconds', '')} source_id={clip.get('source_id', 'source_1')} 类型={clip.get('type') or clip.get('clip_type') or ''}")
+            lines.append(f"[{cid}] time={self._format_clip_time(clip)} duration={clip.get('duration_seconds', '')} source_id={clip.get('source_id', 'source_1')} type={clip.get('type') or clip.get('clip_type') or ''}")
             lines.append(f"摘要：{compact_text(str(clip.get('summary') or ''), max_chars=400)}")
-            lines.append(f"声音：{compact_text(str(clip.get('speech') or clip.get('asr_text') or clip.get('original_audio_transcript_summary') or ''), max_chars=400)}")
+            lines.append(f"声音：{sanitize_llm_text(str(clip.get('speech') or clip.get('asr_text') or clip.get('original_audio_transcript_summary') or ''), max_chars=400)}")
             lines.append(f"画面：{compact_text(str(clip.get('visual') or clip.get('visual_summary') or clip.get('why_this_visual_matters') or ''), max_chars=400)}")
             nearby = self._nearby_context_for_clip(clip, context_index, max_chunks=int(llm_cfg.get("max_llm_context_chunks", 3) or 3))
             if nearby:
                 lines.append("相邻上下文：" + json.dumps(nearby, ensure_ascii=False, separators=(",", ":")))
             lines.append("")
-        lines.append("请严格按照提示词指定 JSON schema 输出。")
+        lines.append('输出 JSON：{"videos":[{"short_video_id":"v_001","title":"","clip_ids":["source_001_clip_0001"]}]}。不要输出时间戳。')
         return "\n".join(lines)
 
     def _build_merge_decision_text(self, edit_plan: dict[str, Any]) -> str:
@@ -4470,8 +4872,10 @@ class PipelineRunner:
 
     def step_reassembly_cut_plan(self) -> None:
         plan = self._load_step_json("highlight_reassembly_plan")
+        pool = self._load_candidate_clip_pool(filtered=True)
         input_hash = stable_hash({
             "reassembly_cut_plan": self._step_content_hash("highlight_reassembly_plan"),
+            "candidate_filter": self._step_content_hash("candidate_filter"),
             "aspect": self.options.aspect_ratio,
             "reassembly_options": self._reassembly_options_payload(),
         })
@@ -4480,6 +4884,10 @@ class PipelineRunner:
             return
         version, vdir = self._version_dir("reassembly_cut_plan", "edit/reassembly_cut_plan")
         ensure_dir(vdir)
+        if not pool:
+            pool = self._legacy_candidate_pool_from_reassembly_plan(plan)
+        pool_by_id = {str(clip.get("clip_id")): clip for clip in pool if clip.get("clip_id")}
+        diagnostics: list[dict[str, Any]] = []
         output_videos = []
         for item in plan.get("output_videos", []):
             if not isinstance(item, dict):
@@ -4493,78 +4901,91 @@ class PipelineRunner:
             warnings: list[str] = []
             blocked_reasons: list[str] = []
             target = 0.0
-            selected_clips = (
-                item.get("selected_clips")
-                or item.get("clips")
-                or item.get("clip_sequence")
-                or item.get("segments")
-                or []
-            )
-            for idx, clip in enumerate(selected_clips, start=1):
-                if not isinstance(clip, dict):
+            planned_clip_ids = self._planned_reassembly_clip_ids(item)
+            if not planned_clip_ids:
+                blocked_reasons.append("plan_empty")
+                diagnostics.append(self._reassembly_error(
+                    "plan_empty",
+                    reason="高光重组规划没有选择任何 clip_id",
+                    suggestion="重跑 highlight_reassembly_plan，或检查规划 prompt 是否过于严格",
+                    candidate_pool_count=len(self._load_candidate_clip_pool(filtered=False)),
+                    filtered_pool_count=len(pool),
+                ))
+            missing_clip_ids = [cid for cid in planned_clip_ids if cid not in pool_by_id]
+            if missing_clip_ids:
+                blocked_reasons.append("clip_id_not_found")
+                diagnostics.append(self._reassembly_error(
+                    "clip_id_not_found",
+                    reason="模型选择了不存在的 clip_id",
+                    suggestion="重跑高光重组规划，或检查 candidate_filter 输出和候选池映射",
+                    candidate_pool_count=len(self._load_candidate_clip_pool(filtered=False)),
+                    filtered_pool_count=len(pool),
+                    planned_clip_ids=planned_clip_ids,
+                    matched_clip_ids=[cid for cid in planned_clip_ids if cid in pool_by_id],
+                    missing_clip_ids=missing_clip_ids,
+                ))
+            for idx, source_clip_id in enumerate(planned_clip_ids, start=1):
+                candidate = pool_by_id.get(source_clip_id)
+                if not candidate:
                     continue
-                start = self._clip_time_seconds(clip, "adjusted_start", "source_start", "start", "start_time")
-                end = self._clip_time_seconds(clip, "adjusted_end", "source_end", "end", "end_time")
+                start = float(candidate.get("local_start_seconds", candidate.get("source_start_seconds", candidate.get("start_seconds", 0))) or 0)
+                end = float(candidate.get("local_end_seconds", candidate.get("source_end_seconds", candidate.get("end_seconds", 0))) or 0)
                 if end <= start:
-                    warnings.append(f"{clip.get('source_clip_id') or clip.get('clip_id') or idx}: invalid time range")
+                    warnings.append(f"{source_clip_id}: invalid source time range")
+                    diagnostics.append(self._reassembly_error(
+                        "clip_time_invalid",
+                        reason="候选池里的 clip 时间无效",
+                        suggestion="回查 ASR 事件候选构造和 candidate_clip_pool_build",
+                        invalid_clips=[{"clip_id": source_clip_id, "reason": "source_end <= source_start"}],
+                    ))
                     continue
-                
-                normalized_parts = self._normalize_reassembly_clip_to_source_boundaries(clip, start, end)
-                if not normalized_parts:
-                    warnings.append(
-                        f"{clip.get('source_clip_id') or clip.get('clip_id') or idx}: "
-                        f"outside source boundaries {start:.3f}-{end:.3f}"
-                    )
+                duration = end - start
+                if duration < self.options.reassembly_min_clip_seconds:
+                    warnings.append(f"{source_clip_id}: shorter than min clip seconds")
                     continue
-
-                for part in normalized_parts:
-                    part_start = float(part["_normalized_start"])
-                    part_end = float(part["_normalized_end"])
-                    duration = part_end - part_start
-
-                    if duration < self.options.reassembly_min_clip_seconds:
-                        warnings.append(
-                            f"{part.get('source_clip_id') or part.get('clip_id') or idx}: "
-                            "shorter than min clip seconds after boundary normalization"
-                        )
-                        continue
-
-                    if duration > self.options.reassembly_max_clip_seconds:
-                        part_end = part_start + self.options.reassembly_max_clip_seconds
-                        duration = self.options.reassembly_max_clip_seconds
-                        warnings.append(
-                            f"{part.get('source_clip_id') or part.get('clip_id') or idx}: "
-                            "truncated to max clip seconds"
-                        )
-
-                    clips.append({
-                        "clip_id": f"{rid}_{len(clips) + 1:03d}",
-                        "source_clip_id": part.get("source_clip_id") or part.get("clip_id") or part.get("id") or "",
-                        "source_id": part.get("source_id", ""),
-                        "source_index": part.get("source_index"),
-                        "source_start": seconds_to_timecode(part_start, ms=True),
-                        "source_end": seconds_to_timecode(part_end, ms=True),
-                        "target_start": seconds_to_timecode(target, ms=True),
-                        "duration_seconds": round(duration, 3),
-                        "original_audio_volume": 1.0,
-                        "keep_original_audio": True,
-                        "role": part.get("role", ""),
-                        "selection_reason": part.get("selection_reason", ""),
-                        "boundary_reason": part.get("boundary_reason", ""),
-                        "risk_level": part.get("risk_level", ""),
-                        "risk_notes": part.get("risk_notes", ""),
-                        "transition_after": part.get("transition_after", "hard_cut"),
-                        "crop_mode": "fit_blur" if self.options.aspect_ratio == "9:16" else "original",
-                    })
-
-                    target += duration
-
-                    if len(clips) >= self.options.reassembly_max_clip_count:
-                        break
+                if duration > self.options.reassembly_max_clip_seconds:
+                    end = start + self.options.reassembly_max_clip_seconds
+                    duration = self.options.reassembly_max_clip_seconds
+                    warnings.append(f"{source_clip_id}: truncated to max clip seconds")
+                clips.append({
+                    "clip_id": f"{rid}_{len(clips) + 1:03d}",
+                    "source_clip_id": source_clip_id,
+                    "source_id": candidate.get("source_id", ""),
+                    "source_index": candidate.get("source_index"),
+                    "local_start": seconds_to_timecode(start, ms=True),
+                    "local_end": seconds_to_timecode(end, ms=True),
+                    "local_start_seconds": round(start, 3),
+                    "local_end_seconds": round(end, 3),
+                    "source_start": seconds_to_timecode(start, ms=True),
+                    "source_end": seconds_to_timecode(end, ms=True),
+                    "source_start_seconds": round(start, 3),
+                    "source_end_seconds": round(end, 3),
+                    "target_start": seconds_to_timecode(target, ms=True),
+                    "target_start_seconds": round(target, 3),
+                    "duration_seconds": round(duration, 3),
+                    "original_audio_volume": 1.0,
+                    "keep_original_audio": True,
+                    "role": candidate.get("event_type") or candidate.get("type") or candidate.get("clip_type") or "",
+                    "selection_reason": candidate.get("summary") or candidate.get("event_summary") or "",
+                    "boundary_reason": "",
+                    "risk_level": candidate.get("risk_level", ""),
+                    "risk_notes": candidate.get("risk_notes", ""),
+                    "transition_after": "hard_cut",
+                    "crop_mode": "fit_blur" if self.options.aspect_ratio == "9:16" else "original",
+                })
+                target += duration
                 if len(clips) >= self.options.reassembly_max_clip_count:
                     break
             if not clips:
-                blocked_reasons.append("no valid clips for reassembly")
+                if not blocked_reasons:
+                    blocked_reasons.append("all_clips_filtered")
+                    diagnostics.append(self._reassembly_error(
+                        "all_clips_filtered",
+                        reason="所有片段低于最短时长或源文件不可用",
+                        suggestion="检查最短时长规则、源文件路径、候选池时间字段",
+                        candidate_pool_count=len(pool),
+                        planned_clip_ids=planned_clip_ids,
+                    ))
             output_videos.append({
                 "reassembly_id": rid,
                 "output_file": f"highlight_reassembly_{rid}_draft.mp4",
@@ -4583,6 +5004,13 @@ class PipelineRunner:
                 "blocked_reasons": blocked_reasons,
             })
         if not output_videos:
+            diagnostics.append(self._reassembly_error(
+                "plan_empty",
+                reason="高光重组规划没有 output_videos",
+                suggestion="重跑 highlight_reassembly_plan",
+                candidate_pool_count=len(self._load_candidate_clip_pool(filtered=False)),
+                filtered_pool_count=len(pool),
+            ))
             output_videos.append({
                 "reassembly_id": "hr_001",
                 "output_file": "highlight_reassembly_hr_001_draft.mp4",
@@ -4613,19 +5041,21 @@ class PipelineRunner:
         status_doc["status"] = status
         
         if status == "failed":
-            plan_output_videos = plan.get("output_videos", [])
+            primary_error = diagnostics[0] if diagnostics else self._reassembly_error(
+                "all_clips_filtered",
+                reason="没有找到可用于剪辑的片段",
+                suggestion="从候选生成、候选复核、重组规划依次检查",
+            )
             status_doc["user_error"] = {
                 "title": "生成重组剪辑计划失败",
-                "message": "没有找到可用于剪辑的片段。",
+                "message": primary_error.get("reason", "没有找到可用于剪辑的片段。"),
                 "suggestions": [
-                    "从“规划高光重组”重新运行。",
-                    "降低最短片段时长后重试。",
-                    "检查高光规划结果是否包含可用 clips。",
+                    primary_error.get("suggestion", "从“规划高光重组”重新运行。"),
                 ],
             }
             status_doc["technical_error"] = {
-                "message": "reassembly_cut_plan has no available clips",
-                "plan_output_videos": len(plan_output_videos),
+                **primary_error,
+                "diagnostics": diagnostics,
                 "renderable_count": renderable_count,
                 "blocked_count": blocked_count,
                 "blocked_reasons": [
@@ -4646,16 +5076,195 @@ class PipelineRunner:
         
         if status == "failed":
             raise UserFacingPipelineError(
-                "reassembly_cut_plan has no available clips",
-                user_message="生成重组剪辑计划失败：没有找到可用于剪辑的片段。",
+                status_doc["technical_error"].get("error_type", "reassembly_cut_plan_failed"),
+                user_message=f"生成重组剪辑计划失败：{status_doc['technical_error'].get('reason', '没有找到可用于剪辑的片段。')}",
                 suggestions=[
-                    "从“规划高光重组”重新运行，让系统重新选择高光片段。",
-                    "降低“最短片段时长”后，从“生成重组剪辑计划”重新运行。",
-                    "检查高光重组规划结果中是否包含 clips 或 selected_clips。",
-                    "如果是多段素材，请确认素材没有混乱或时间轴异常。",
+                    status_doc["technical_error"].get("suggestion", "从候选生成、候选复核、重组规划依次检查。"),
                 ],
                 technical_detail=status_doc["technical_error"],
             )
+
+    def _planned_reassembly_clip_ids(self, item: dict[str, Any]) -> list[str]:
+        clip_ids = self._coerce_id_list(item.get("clip_ids") or item.get("source_clip_ids"))
+        if clip_ids:
+            return clip_ids
+        selected = (
+            item.get("selected_clips")
+            or item.get("clips")
+            or item.get("clip_sequence")
+            or item.get("segments")
+            or []
+        )
+        out: list[str] = []
+        if isinstance(selected, list):
+            for clip in selected:
+                if isinstance(clip, dict):
+                    cid = str(clip.get("source_clip_id") or clip.get("clip_id") or clip.get("id") or "").strip()
+                else:
+                    cid = str(clip).strip()
+                if cid and cid not in out:
+                    out.append(cid)
+        return out
+
+    def _legacy_candidate_pool_from_reassembly_plan(self, plan: dict[str, Any]) -> list[dict[str, Any]]:
+        pool: list[dict[str, Any]] = []
+        for video in plan.get("output_videos", []) or []:
+            if not isinstance(video, dict):
+                continue
+            selected = (
+                video.get("selected_clips")
+                or video.get("clips")
+                or video.get("clip_sequence")
+                or video.get("segments")
+                or []
+            )
+            if not isinstance(selected, list):
+                continue
+            for index, clip in enumerate(selected, start=1):
+                if not isinstance(clip, dict):
+                    continue
+                cid = str(clip.get("source_clip_id") or clip.get("clip_id") or clip.get("id") or f"legacy_clip_{len(pool) + 1:03d}")
+                start = self._clip_time_seconds(clip, "adjusted_start", "source_start", "start", "start_time")
+                end = self._clip_time_seconds(clip, "adjusted_end", "source_end", "end", "end_time")
+                if end <= start and clip.get("duration_seconds"):
+                    end = start + float(clip.get("duration_seconds") or 0)
+                pool.append({
+                    "clip_id": cid,
+                    "source_id": clip.get("source_id", "source_1"),
+                    "source_index": clip.get("source_index"),
+                    "source_start_seconds": round(start, 3),
+                    "source_end_seconds": round(end, 3),
+                    "source_start": seconds_to_timecode(start, ms=True),
+                    "source_end": seconds_to_timecode(end, ms=True),
+                    "duration_seconds": round(max(0.0, end - start), 3),
+                    "summary": clip.get("selection_reason") or clip.get("role") or "",
+                    "event_type": clip.get("role", ""),
+                })
+        return pool
+
+    def _reassembly_error(self, error_type: str, **fields: Any) -> dict[str, Any]:
+        defaults = {
+            "candidate_pool_empty": ("ASR 事件候选池为空", "降低候选事件阈值，或检查 ASR 文本质量"),
+            "candidate_filter_empty": ("候选复核后没有保留任何 clip", "放宽 candidate_filter，或允许保留 medium 质量片段"),
+            "plan_empty": ("高光重组规划没有选择任何 clip_id", "重跑 highlight_reassembly_plan，或检查规划 prompt 是否过于严格"),
+            "clip_id_not_found": ("模型选择了不存在的 clip_id", "重跑高光重组规划，或检查 candidate_filter 输出和候选池映射"),
+            "clip_time_invalid": ("候选池里的 clip 时间无效", "回查 ASR 事件候选构造和 candidate_clip_pool_build"),
+            "all_clips_filtered": ("所有 clip 被剪辑规则过滤", "检查最短时长规则、源文件路径、候选池时间字段"),
+            "quality_gate_failed": ("本地质量检查未通过", "回查 reassembly_cut_plan 或 candidate_clip_pool_filtered"),
+        }
+        reason, suggestion = defaults.get(error_type, ("重组链路失败", "请检查上游步骤输出"))
+        data = {"error_type": error_type, "reason": reason, "suggestion": suggestion}
+        data.update({k: v for k, v in fields.items() if v is not None})
+        return data
+
+    def step_news_quality_gate(self) -> None:
+        source_step = "reassembly_cut_plan" if self.options.production_mode == "highlight_reassembly" else "cut_plan"
+        plan = self._load_step_json(source_step)
+        input_hash = stable_hash({"source_step": source_step, "source_hash": self._step_content_hash(source_step)})
+        if self._can_reuse("news_quality_gate", input_hash):
+            print("reuse cache: news_quality_gate")
+            return
+        version, vdir = self._version_dir("news_quality_gate", "quality/news_quality_gate")
+        ensure_dir(vdir)
+        output_videos = [v for v in plan.get("output_videos", []) if isinstance(v, dict)]
+        issues: list[dict[str, Any]] = []
+        warnings: list[dict[str, Any]] = []
+        total_duration = 0.0
+        clip_count = 0
+        if not output_videos:
+            issues.append({"type": "missing_output_videos", "message": "没有 output_videos"})
+        seen_source_clip_ids: set[str] = set()
+        for video in output_videos:
+            clips = [c for c in video.get("clips", []) if isinstance(c, dict)]
+            if not clips:
+                issues.append({"type": "missing_clips", "video_id": video.get("reassembly_id") or video.get("short_video_id"), "message": "视频没有 clips"})
+            for clip in clips:
+                clip_count += 1
+                cid = str(clip.get("clip_id") or clip.get("source_clip_id") or "")
+                source_clip_id = str(clip.get("source_clip_id") or cid)
+                if source_clip_id in seen_source_clip_ids:
+                    warnings.append({"type": "duplicate_clip", "clip_id": cid, "message": "存在重复使用的 source clip"})
+                seen_source_clip_ids.add(source_clip_id)
+                for key in ("source_id", "source_start", "source_end"):
+                    if not clip.get(key):
+                        issues.append({"type": f"missing_{key}", "clip_id": cid, "message": f"clip 缺少 {key}"})
+                start = float(clip.get("source_start_seconds", timecode_to_seconds(clip.get("source_start"))) or 0)
+                end = float(clip.get("source_end_seconds", timecode_to_seconds(clip.get("source_end"))) or 0)
+                duration = float(clip.get("duration_seconds") or max(0.0, end - start))
+                total_duration += max(0.0, duration)
+                if end <= start:
+                    issues.append({"type": "invalid_source_time", "clip_id": cid, "message": "source_end <= source_start"})
+                if duration <= 0:
+                    issues.append({"type": "invalid_duration", "clip_id": cid, "message": "duration_seconds <= 0"})
+                if self.options.production_mode == "highlight_reassembly" and clip.get("keep_original_audio") is not True:
+                    issues.append({"type": "missing_original_audio", "clip_id": cid, "message": "原声重组 clip 未明确保留原声"})
+        if clip_count and total_duration < max(1.0, float(getattr(self.options, "reassembly_min_clip_seconds", 5.0))):
+            warnings.append({"type": "total_duration_short", "message": "总时长过短"})
+        ok = not issues
+        output = {
+            "ok": ok,
+            "block_render": not ok,
+            "issues": issues,
+            "warnings": warnings,
+            "stats": {
+                "output_video_count": len(output_videos),
+                "clip_count": clip_count,
+                "total_duration_seconds": round(total_duration, 3),
+            },
+            "source_step": source_step,
+        }
+        if not ok:
+            output["diagnostic_error"] = self._reassembly_error("quality_gate_failed", issues=issues)
+        out = write_json(vdir / "news_quality_gate.json", output)
+        status = "success" if ok else "failed"
+        status_doc = self._base_status("news_quality_gate", version, input_hash, [out])
+        status_doc["status"] = status
+        if not ok:
+            status_doc["technical_error"] = output["diagnostic_error"]
+        self._write_status(vdir, status_doc)
+        self._record_step(step="news_quality_gate", version=version, status=status, output=relpath(out, self.task_dir), input_hash=input_hash, output_files=[out])
+        print(f"completed: news_quality_gate ({status})")
+        if not ok:
+            raise UserFacingPipelineError(
+                "quality_gate_failed",
+                user_message="本地质量检查未通过：剪辑计划存在缺字段或无效时间。",
+                suggestions=["回查 reassembly_cut_plan 或 candidate_clip_pool_filtered。"],
+                technical_detail=output["diagnostic_error"],
+            )
+
+    def step_news_quality_ai_review(self) -> None:
+        gate = self._load_step_json("news_quality_gate")
+        source_step = "reassembly_cut_plan" if self.options.production_mode == "highlight_reassembly" else "cut_plan"
+        plan = self._load_step_json(source_step)
+        payload = {
+            "production_mode": self.options.production_mode,
+            "quality_gate": gate,
+            "plan_summary": {
+                "output_video_count": len(plan.get("output_videos", []) or []),
+                "output_videos": [
+                    {
+                        "id": video.get("reassembly_id") or video.get("short_video_id"),
+                        "title": video.get("title", ""),
+                        "clips": [
+                            {
+                                "source_clip_id": clip.get("source_clip_id"),
+                                "source_id": clip.get("source_id"),
+                                "duration_seconds": clip.get("duration_seconds"),
+                                "selection_reason": clip.get("selection_reason", ""),
+                            }
+                            for clip in (video.get("clips") or [])[:10]
+                            if isinstance(clip, dict)
+                        ],
+                    }
+                    for video in (plan.get("output_videos") or [])[:5]
+                    if isinstance(video, dict)
+                ],
+            },
+        }
+        result = self._run_text_agent("news_quality_ai_review", payload)
+        if isinstance(result, dict):
+            result.setdefault("quality_gate_ok", bool(gate.get("ok")))
+            self._overwrite_step_json("news_quality_ai_review", result, materialized=True)
 
     def step_reassembly_render(self) -> None:
         render_slots = int(self.config.raw.get("gpu_limits", {}).get("render_slots", 1))
@@ -4703,57 +5312,29 @@ class PipelineRunner:
         start: float,
         end: float,
     ) -> list[dict[str, Any]]:
-        """
-        将高光重组片段限制在多源虚拟时间轴的合法源边界内。
-        - 如果片段完全落在一个源内：返回 1 段
-        - 如果片段跨源：自动拆成多段
-        - 如果片段完全超出所有源：返回空数组
-        """
         if not self._is_virtual_source_manifest():
             return [dict(clip, _normalized_start=start, _normalized_end=end)]
 
-        normalized: list[dict[str, Any]] = []
-        requested_source_id = str(clip.get("source_id") or "").strip()
+        if not clip.get("source_id"):
+            return []
 
-        for item in self._iter_source_items():
-            item_source_id = str(item.get("source_id") or "").strip()
-            if requested_source_id and item_source_id != requested_source_id:
-                continue
-
-            virtual_start = float(item.get("virtual_start_seconds") or 0)
-            virtual_end = float(item.get("virtual_end_seconds") or 0)
-            if virtual_end <= virtual_start:
-                continue
-
-            seg_start = max(start, virtual_start)
-            seg_end = min(end, virtual_end)
-
-            if seg_end <= seg_start:
-                continue
-
-            new_clip = dict(clip)
-            new_clip["source_id"] = item_source_id
-            new_clip["source_index"] = item.get("source_index")
-            new_clip["_normalized_start"] = seg_start
-            new_clip["_normalized_end"] = seg_end
-            new_clip["source_start"] = seconds_to_timecode(seg_start, ms=True)
-            new_clip["source_end"] = seconds_to_timecode(seg_end, ms=True)
-            new_clip["duration_seconds"] = round(seg_end - seg_start, 3)
-
-            if seg_start != start or seg_end != end:
-                new_clip["boundary_adjusted"] = True
-                new_clip["boundary_reason"] = (
-                    str(new_clip.get("boundary_reason") or "")
-                    + "；自动按多源素材边界裁剪/拆分"
-                ).strip("；")
-
-            normalized.append(new_clip)
-
-        return normalized
+        local_start = float(clip.get("local_start_seconds", start) or start)
+        local_end = float(clip.get("local_end_seconds", end) or end)
+        new_clip = dict(clip)
+        new_clip["_normalized_start"] = local_start
+        new_clip["_normalized_end"] = local_end
+        new_clip["local_start_seconds"] = round(local_start, 3)
+        new_clip["local_end_seconds"] = round(local_end, 3)
+        new_clip["local_start"] = seconds_to_timecode(local_start, ms=True)
+        new_clip["local_end"] = seconds_to_timecode(local_end, ms=True)
+        new_clip.setdefault("source_start", new_clip["local_start"])
+        new_clip.setdefault("source_end", new_clip["local_end"])
+        new_clip["duration_seconds"] = round(max(0.0, local_end - local_start), 3)
+        return [new_clip]
 
     def _resolve_reassembly_clip_source(self, clip: dict[str, Any]) -> tuple[Path, float, float]:
-        start = timecode_to_seconds(clip.get("source_start"))
-        end = timecode_to_seconds(clip.get("source_end"))
+        start = float(clip.get("local_start_seconds") or timecode_to_seconds(clip.get("local_start")) or timecode_to_seconds(clip.get("source_start")) or 0)
+        end = float(clip.get("local_end_seconds") or timecode_to_seconds(clip.get("local_end")) or timecode_to_seconds(clip.get("source_end")) or 0)
         if end <= start:
             raise RuntimeError(f"invalid reassembly clip time range: {clip.get('clip_id') or ''}")
 
@@ -4762,17 +5343,15 @@ class PipelineRunner:
             for item in self._iter_source_items():
                 if source_id and item.get("source_id") != source_id:
                     continue
-                virtual_start = float(item.get("virtual_start_seconds") or 0)
-                virtual_end = float(item.get("virtual_end_seconds") or 0)
-                if virtual_start <= start and end <= virtual_end:
-                    source_path = self._resolve_source_item_path(item)
-                    return source_path, start - virtual_start, end - virtual_start
+                duration = float(item.get("duration_seconds") or item.get("original_duration_seconds") or 0)
+                if duration and end > duration + 0.05:
+                    break
+                source_path = self._resolve_source_item_path(item)
+                return source_path, start, end
             raise RuntimeError(
-                "视频重组渲染失败：片段时间不在任何源视频边界内。\n"
+                "视频重组渲染失败：片段无效，source_id 不存在，或 local_start/local_end 超出该源视频时长。\n"
                 f"片段：{clip.get('clip_id') or ''} {start:.3f}-{end:.3f}\n"
-                f"source_id：{clip.get('source_id') or ''}\n"
-                "可能原因：模型输出了超出虚拟总时间轴的时间码，或把单个源视频的局部时间误当成多源虚拟时间。\n"
-                "处理办法：请从 highlight_reassembly_plan 重跑；如果仍失败，需要启用 reassembly_cut_plan 的边界裁剪/拆分逻辑。"
+                f"source_id：{clip.get('source_id') or ''}"
             )
 
         manifest_value = str(self.manifest.get("source_manifest") or "").strip()
@@ -4783,21 +5362,8 @@ class PipelineRunner:
         if source_manifest.get("source_mode") != "multi_source_concat_proxy":
             return self._source_video(), start, end
 
-        for item in source_manifest.get("sources") or []:
-            virtual_start = float(item.get("virtual_start_seconds") or 0)
-            virtual_end = float(item.get("virtual_end_seconds") or 0)
-            if virtual_start <= start and end <= virtual_end:
-                normalized = str(item.get("normalized_file") or "")
-                if not normalized:
-                    break
-                source_path = Path(normalized)
-                if not source_path.is_absolute():
-                    source_path = self.task_dir / source_path
-                return source_path, start - virtual_start, end - virtual_start
-
         raise RuntimeError(
-            "视频重组渲染失败：选中的高光片段跨越了多个源视频，当前无法直接从占位拼接文件导出。\n"
-            "处理办法：请重试高光重组，或调整片段边界避免跨源；后续应自动拆分跨源片段后再合并。\n"
+            "视频重组渲染失败：legacy concat proxy 任务不再支持虚拟时间转换，请重新运行多源任务。\n"
             f"片段：{clip.get('clip_id') or ''} {clip.get('source_start')} - {clip.get('source_end')}"
         )
 
@@ -5394,10 +5960,10 @@ class PipelineRunner:
                 "start_time": seconds_to_timecode(start, ms=True),
                 "end_time": seconds_to_timecode(end, ms=True),
                 "speaker": seg.get("speaker", ""),
-                "text": re.sub(r"<\s*\|\s*.*?\s*\|>", "", seg.get("text", "")).strip(),
+                "text": clean_asr_text(str(seg.get("text", "")))["clean_text"],
             })
         if not out and full_text:
-            out.append({"id": 1, "start": 0, "end": 0, "start_time": "00:00:00.000", "end_time": "00:00:00.000", "speaker": "", "text": full_text})
+            out.append({"id": 1, "start": 0, "end": 0, "start_time": "00:00:00.000", "end_time": "00:00:00.000", "speaker": "", "text": clean_asr_text(full_text)["clean_text"]})
         return out
 
     def _segments_in_range(self, segments: list[dict[str, Any]], start: float, end: float) -> list[dict[str, Any]]:

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .utils import ensure_dir, ffprobe_json, relpath, run_cmd, seconds_to_timecode, write_json, write_text
+from .utils import ensure_dir, ffprobe_json, relpath, run_cmd, write_json, write_text
 
 
 VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".m4v", ".avi"}
@@ -135,10 +135,6 @@ def build_multi_source_video(
                 "normalized_file": relpath(normalized, task_dir),
                 "original_duration_seconds": round(duration, 3),
                 "duration_seconds": round(normalized_duration, 3),
-                "virtual_start_seconds": round(cursor, 3),
-                "virtual_end_seconds": round(cursor + normalized_duration, 3),
-                "virtual_start": seconds_to_timecode(cursor, ms=True),
-                "virtual_end": seconds_to_timecode(cursor + normalized_duration, ms=True),
                 "remote": item.remote or {},
             }
         )
@@ -168,6 +164,7 @@ def build_multi_source_video(
     manifest = {
         "input_hash": input_hash,
         "source_mode": "multi_source_concat_proxy",
+        "timeline_mode": "source_pool_local_time",
         "source_count": len(sources),
         "source_video": relpath(output_video, task_dir),
         "total_duration_seconds": round(float(output_meta.get("duration") or cursor), 3),
@@ -201,7 +198,7 @@ def prepare_multi_source_manifest(
     input_hash = stable_hash({
         "sources": [{"id": s.source_id, "path": str(s.path.resolve()), "mtime": s.path.stat().st_mtime if s.path.exists() else 0} for s in sources],
         "aspect_ratio": aspect_ratio,
-        "mode": "virtual",
+        "mode": "source_pool_local_time",
     })
 
     if manifest_file.exists():
@@ -214,7 +211,7 @@ def prepare_multi_source_manifest(
             }
 
     timeline_sources: list[dict[str, Any]] = []
-    cursor = 0.0
+    total_duration = 0.0
 
     for index, item in enumerate(sources, start=1):
         source_path = item.path.resolve()
@@ -237,22 +234,18 @@ def prepare_multi_source_manifest(
                 "original_path": str(source_path),
                 "original_duration_seconds": round(duration, 3),
                 "duration_seconds": round(duration, 3),
-                "virtual_start_seconds": round(cursor, 3),
-                "virtual_end_seconds": round(cursor + duration, 3),
-                "virtual_start": seconds_to_timecode(cursor, ms=True),
-                "virtual_end": seconds_to_timecode(cursor + duration, ms=True),
                 "remote": item.remote or {},
             }
         )
-        cursor += duration
+        total_duration += duration
 
     manifest = {
         "input_hash": input_hash,
-        "source_mode": "multi_source_virtual",
-        "timeline_mode": "virtual",
+        "source_mode": "multi_source_pool",
+        "timeline_mode": "source_pool_local_time",
         "source_count": len(sources),
         "source_video": "",
-        "total_duration_seconds": round(cursor, 3),
+        "total_source_duration_seconds": round(total_duration, 3),
         "aspect_ratio": aspect_ratio,
         "sources": timeline_sources,
     }
