@@ -79,13 +79,15 @@ use_unified_source_pipeline = true
 
 [multi_source_analysis]
 enabled = true
-source_max_workers = 3
+source_max_workers = 2
 per_source_vision_max_workers = 2
-vision_global_max_workers = 6
-text_global_max_workers = 6
+vision_global_max_workers = 4
+text_global_max_workers = 4
 fail_policy = "partial_success"
 max_candidates_per_source = 8
 max_global_candidate_clips = 40
+progress_enabled = true
+verbose_source_logs = true
 
 [llm_input]
 max_asr_chars_per_chunk = 320

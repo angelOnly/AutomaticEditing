@@ -365,6 +365,7 @@ class PipelineRunner:
             if self._is_virtual_source_manifest():
                 common_steps = [
                     "source_analysis",
+                    "source_quality_check",
                     "source_aggregate",
                 ]
             else:
@@ -683,6 +684,7 @@ class PipelineRunner:
         return windows
 
     def step_source_analysis(self) -> None:
+        step_started = time.perf_counter()
         sources = self._iter_source_items()
         if not sources:
             raise RuntimeError("source_analysis requires a virtual source manifest with at least 1 source")
@@ -710,56 +712,195 @@ class PipelineRunner:
         ensure_dir(base_dir)
         cfg = self.config.raw.get("multi_source_analysis", {})
         max_workers = max(1, int(cfg.get("source_max_workers", 3) or 3))
+        active_workers = min(max_workers, len(sources))
+        per_source_vision_workers = max(1, int(cfg.get("per_source_vision_max_workers", self.options.vision_max_workers) or self.options.vision_max_workers))
         fail_policy = str(cfg.get("fail_policy") or "partial_success")
+        progress_enabled = bool(cfg.get("progress_enabled", True))
+        verbose_source_logs = bool(cfg.get("verbose_source_logs", True))
         config_path = Path(self.options.config)
         if not config_path.is_absolute():
             config_path = self.root / config_path
 
+        total_sources = len(sources)
+        source_items_by_identity = {id(item): idx for idx, item in enumerate(sources, start=1)}
+
+        def source_id_for(item: dict[str, Any]) -> str:
+            idx = source_items_by_identity.get(id(item), 0)
+            return str(item.get("source_id") or f"source_{idx:03d}")
+
+        source_positions = {
+            source_id_for(item): idx
+            for idx, item in enumerate(sources, start=1)
+        }
+        source_progress: dict[str, dict[str, Any]] = {}
+        for idx, item in enumerate(sources, start=1):
+            source_id = source_id_for(item)
+            display_name = str(item.get("display_name") or Path(str(item.get("original_path") or "")).name or source_id)
+            source_progress[source_id] = {
+                "source_id": source_id,
+                "source_index": item.get("source_index") or idx,
+                "display_name": display_name,
+                "status": "pending",
+                "updated_at": now_iso(),
+            }
+
+        if verbose_source_logs:
+            print(
+                f"[source_analysis] queue total={total_sources} "
+                f"source_max_workers={active_workers} "
+                f"per_source_vision_max_workers={per_source_vision_workers}",
+                flush=True,
+            )
+
         def analyze_one(item: dict[str, Any]) -> dict[str, Any]:
-            source_id = str(item.get("source_id") or f"source_{len(sources) + 1:03d}")
+            source_id = source_id_for(item)
+            source_pos = source_positions.get(source_id, 0)
             source_dir = ensure_dir(base_dir / source_id)
             work_root = ensure_dir(source_dir / "_work")
             source_path = self._resolve_source_item_path(item)
-            child_options = RunOptions(
-                input=str(source_path),
-                task_id=source_id,
-                config=str(config_path),
-                outputs_dir=str(work_root),
-                resume=self.options.resume,
-                rerun_from="metadata" if self.options.rerun == "source_analysis" else None,
-                chunk_seconds=self.options.chunk_seconds,
-                frame_interval=self.options.frame_interval,
-                vision_max_workers=max(1, int(cfg.get("per_source_vision_max_workers", self.options.vision_max_workers) or self.options.vision_max_workers)),
-                vision_max_frames_per_chunk=self.options.vision_max_frames_per_chunk,
-                release_asr_after_task=self.options.release_asr_after_task,
-                aspect_ratio=self.options.aspect_ratio,
-                mode=self.options.mode,
-                common_only=True,
-                production_mode="ai_voiceover",
-            )
-            child_runner = PipelineRunner(child_options)
-            child_manifest = child_runner.run()
-            digest = child_runner._load_step_json("timeline_digest")
-            summary = self._build_source_summary(item, child_runner.task_dir, child_manifest, digest)
-            summary_path = write_json(source_dir / "source_summary.json", summary)
-            return {
-                "source_id": source_id,
-                "status": "success",
-                "display_name": item.get("display_name") or source_path.name,
-                "summary": relpath(summary_path, self.task_dir),
-                "work_task_dir": relpath(child_runner.task_dir, self.task_dir),
-                "chunk_count": len(digest.get("chunks") or []),
-            }
+            started_at = time.perf_counter()
+            summary_path = source_dir / "source_summary.json"
+            source_status_path = source_dir / "source_status.json"
+            source_status = read_json(source_status_path, {})
+
+            if (
+                self.options.resume
+                and not self.options.rerun
+                and summary_path.exists()
+                and source_status.get("status") == "success"
+            ):
+                summary_doc = read_json(summary_path, {})
+                digest = summary_doc.get("timeline_digest") or {}
+                chunk_count = len(digest.get("chunks") or [])
+                if verbose_source_logs:
+                    print(
+                        f"[source_analysis] reuse {source_id} {source_pos}/{total_sources} "
+                        f"chunks={chunk_count} video={source_path.name}",
+                        flush=True,
+                    )
+                return {
+                    "source_id": source_id,
+                    "status": "success",
+                    "display_name": item.get("display_name") or source_path.name,
+                    "summary": relpath(summary_path, self.task_dir),
+                    "work_task_dir": summary_doc.get("work_task_dir", ""),
+                    "chunk_count": chunk_count,
+                    "elapsed_seconds": 0,
+                    "reused": True,
+                }
+
+            if verbose_source_logs:
+                print(
+                    f"[source_analysis] start {source_id} {source_pos}/{total_sources} "
+                    f"video={source_path.name}",
+                    flush=True,
+                )
+
+            try:
+                child_options = RunOptions(
+                    input=str(source_path),
+                    task_id=source_id,
+                    config=str(config_path),
+                    outputs_dir=str(work_root),
+                    resume=self.options.resume,
+                    rerun_from="metadata" if self.options.rerun == "source_analysis" else None,
+                    chunk_seconds=self.options.chunk_seconds,
+                    frame_interval=self.options.frame_interval,
+                    vision_max_workers=per_source_vision_workers,
+                    vision_max_frames_per_chunk=self.options.vision_max_frames_per_chunk,
+                    release_asr_after_task=self.options.release_asr_after_task,
+                    aspect_ratio=self.options.aspect_ratio,
+                    mode=self.options.mode,
+                    common_only=True,
+                    production_mode="ai_voiceover",
+                )
+                child_runner = PipelineRunner(child_options)
+                child_manifest = child_runner.run()
+                digest = child_runner._load_step_json("timeline_digest")
+                summary = self._build_source_summary(item, child_runner.task_dir, child_manifest, digest)
+                summary_path = write_json(summary_path, summary)
+                elapsed = round(time.perf_counter() - started_at, 3)
+                chunk_count = len(digest.get("chunks") or [])
+                write_json(source_status_path, {
+                    "source_id": source_id,
+                    "status": "success",
+                    "summary": relpath(summary_path, self.task_dir),
+                    "updated_at": now_iso(),
+                    "elapsed_seconds": elapsed,
+                    "chunk_count": chunk_count,
+                })
+                if verbose_source_logs:
+                    print(
+                        f"[source_analysis] done {source_id} {source_pos}/{total_sources} "
+                        f"elapsed={elapsed}s chunks={chunk_count} video={source_path.name}",
+                        flush=True,
+                    )
+                return {
+                    "source_id": source_id,
+                    "status": "success",
+                    "display_name": item.get("display_name") or source_path.name,
+                    "summary": relpath(summary_path, self.task_dir),
+                    "work_task_dir": relpath(child_runner.task_dir, self.task_dir),
+                    "chunk_count": chunk_count,
+                    "elapsed_seconds": elapsed,
+                }
+            except Exception as exc:
+                elapsed = round(time.perf_counter() - started_at, 3)
+                write_json(source_status_path, {
+                    "source_id": source_id,
+                    "status": "failed",
+                    "error": str(exc),
+                    "updated_at": now_iso(),
+                    "elapsed_seconds": elapsed,
+                })
+                if verbose_source_logs:
+                    print(
+                        f"[source_analysis] failed {source_id} {source_pos}/{total_sources} "
+                        f"elapsed={elapsed}s video={source_path.name} error={exc}",
+                        flush=True,
+                    )
+                raise
 
         results: list[dict[str, Any]] = []
         failures: list[dict[str, Any]] = []
-        with ThreadPoolExecutor(max_workers=min(max_workers, len(sources))) as executor:
-            future_map = {executor.submit(analyze_one, item): item for item in sources}
+        if progress_enabled:
+            self._update_step_progress(
+                "source_analysis",
+                f"multi-source analysis started: 0/{total_sources} sources completed",
+                {
+                    "completed_sources": 0,
+                    "total_sources": total_sources,
+                    "success_count": 0,
+                    "failed_count": 0,
+                    "running_count": 0,
+                    "source_progress": list(source_progress.values()),
+                    "source_max_workers": active_workers,
+                    "per_source_vision_max_workers": per_source_vision_workers,
+                },
+            )
+
+        with ThreadPoolExecutor(max_workers=active_workers) as executor:
+            future_map = {}
+            for idx, item in enumerate(sources, start=1):
+                source_id = source_id_for(item)
+                source_progress[source_id].update({"status": "running", "updated_at": now_iso()})
+                future_map[executor.submit(analyze_one, item)] = item
+
+            completed = 0
             for future in as_completed(future_map):
                 item = future_map[future]
-                source_id = str(item.get("source_id") or "")
+                source_id = source_id_for(item)
                 try:
-                    results.append(future.result())
+                    result = future.result()
+                    results.append(result)
+                    source_progress.setdefault(source_id, {"source_id": source_id}).update({
+                        "status": "success",
+                        "elapsed_seconds": result.get("elapsed_seconds", 0),
+                        "chunk_count": result.get("chunk_count", 0),
+                        "summary": result.get("summary", ""),
+                        "reused": bool(result.get("reused")),
+                        "updated_at": now_iso(),
+                    })
                 except Exception as exc:
                     failure = {
                         "source_id": source_id,
@@ -768,15 +909,44 @@ class PipelineRunner:
                         "error": str(exc),
                     }
                     failures.append(failure)
+                    source_progress.setdefault(source_id, {"source_id": source_id}).update({
+                        "status": "failed",
+                        "error": str(exc),
+                        "updated_at": now_iso(),
+                    })
                     if fail_policy == "fail_fast":
                         raise
+                finally:
+                    completed += 1
+                    running_count = sum(1 for value in source_progress.values() if value.get("status") == "running")
+                    if progress_enabled:
+                        self._update_step_progress(
+                            "source_analysis",
+                            f"multi-source analysis running: {completed}/{total_sources} sources completed",
+                            {
+                                "completed_sources": completed,
+                                "total_sources": total_sources,
+                                "success_count": len(results),
+                                "failed_count": len(failures),
+                                "running_count": running_count,
+                                "source_progress": list(source_progress.values()),
+                                "source_max_workers": active_workers,
+                                "per_source_vision_max_workers": per_source_vision_workers,
+                            },
+                        )
+                    if verbose_source_logs:
+                        print(
+                            f"[source_analysis] progress {completed}/{total_sources} "
+                            f"success={len(results)} failed={len(failures)} running={running_count}",
+                            flush=True,
+                        )
 
         results.sort(key=lambda item: str(item.get("source_id") or ""))
         failures.sort(key=lambda item: str(item.get("source_id") or ""))
         if not results:
             raise RuntimeError("source_analysis failed for all sources")
 
-        out = write_json(base_dir / "source_analysis.json", {
+        output_doc = {
             "version": "source_analysis_v1",
             "source_count": len(sources),
             "success_count": len(results),
@@ -784,11 +954,31 @@ class PipelineRunner:
             "sources": results,
             "failed_sources": failures,
             "fail_policy": fail_policy,
-        })
+        }
+        if failures and results:
+            output_doc["partial_success_notice"] = (
+                f"{len(failures)} source video(s) failed; downstream output is based on "
+                f"{len(results)} successful source video(s)."
+            )
+        out = write_json(base_dir / "source_analysis.json", output_doc)
         status = "partial_success" if failures else "success"
         status_doc = self._base_status("source_analysis", version, input_hash, [out])
         status_doc["status"] = status
         self._write_status(base_dir, status_doc)
+        extra = {
+            "completed_sources": len(results) + len(failures),
+            "total_sources": len(sources),
+            "success_count": len(results),
+            "failed_count": len(failures),
+            "source_progress": list(source_progress.values()),
+            "elapsed_seconds_total": round(time.perf_counter() - step_started, 3),
+            "source_max_workers": active_workers,
+            "per_source_vision_max_workers": per_source_vision_workers,
+            "vision_global_max_workers": int(cfg.get("vision_global_max_workers", 0) or 0),
+            "text_global_max_workers": int(cfg.get("text_global_max_workers", 0) or 0),
+        }
+        if failures:
+            extra["failed_sources"] = failures
         self._record_step(
             step="source_analysis",
             version=version,
@@ -796,8 +986,14 @@ class PipelineRunner:
             output=relpath(out, self.task_dir),
             input_hash=input_hash,
             output_files=[out] + [self.task_dir / item["summary"] for item in results if item.get("summary")],
-            extra={"failed_sources": failures} if failures else None,
+            extra=extra,
         )
+        if verbose_source_logs:
+            print(
+                f"[source_analysis] final status={status} success={len(results)} "
+                f"failed={len(failures)} elapsed={extra['elapsed_seconds_total']}s",
+                flush=True,
+            )
         print(f"完成: source_analysis ({status})")
 
     def _build_source_summary(
@@ -980,16 +1176,47 @@ class PipelineRunner:
 
     def step_source_quality_check(self) -> None:
         if self._is_virtual_multi_source():
-            # For unified pipeline, metadata is inside source_manifest.json built by source_analysis
-            manifest = self._load_step_json("source_analysis")
-            if not manifest:
-                manifest = read_json(self.manifest_path, {})
-            sources_metadata = [s.get("metadata", {}) for s in manifest.get("sources", [])]
-            input_hash = self._step_content_hash("source_analysis")
+            sources_metadata: list[dict[str, Any]] = []
+            source_hash_items: list[dict[str, Any]] = []
+            for item in self._iter_source_items():
+                meta: dict[str, Any] = {}
+                try:
+                    source_path = self._resolve_source_item_path(item)
+                    if source_path.exists():
+                        meta = ffprobe_json(source_path)
+                except Exception as exc:
+                    meta = {"probe_error": str(exc)}
+
+                if item.get("duration_seconds") is not None:
+                    meta.setdefault("duration", item.get("duration_seconds"))
+                    meta.setdefault("duration_seconds", item.get("duration_seconds"))
+                meta.setdefault("source_id", item.get("source_id"))
+                meta.setdefault("source_index", item.get("source_index"))
+                meta.setdefault("display_name", item.get("display_name", ""))
+                meta.setdefault("original_path", item.get("original_path", ""))
+                sources_metadata.append(meta)
+                source_hash_items.append({
+                    "source_id": item.get("source_id"),
+                    "source_index": item.get("source_index"),
+                    "duration_seconds": item.get("duration_seconds"),
+                    "original_path": item.get("original_path"),
+                })
+            input_hash = stable_hash({
+                "source_analysis": self._step_content_hash("source_analysis"),
+                "sources": source_hash_items,
+            })
         else:
-            # For legacy pipeline, metadata is inside metadata.json
             metadata_info = self._load_step_json("metadata")
-            sources_metadata = [s.get("metadata", {}) for s in metadata_info.get("sources", [])] if metadata_info else []
+            if metadata_info and isinstance(metadata_info.get("sources"), list):
+                sources_metadata = [
+                    s.get("metadata", {})
+                    for s in metadata_info.get("sources", [])
+                    if isinstance(s, dict)
+                ]
+            elif metadata_info:
+                sources_metadata = [metadata_info]
+            else:
+                sources_metadata = []
             input_hash = self._step_content_hash("metadata")
 
         if self._can_reuse("source_quality_check", input_hash):
@@ -1002,13 +1229,36 @@ class PipelineRunner:
         report = build_source_quality_report(sources_metadata)
         
         result = {
-            "version": version,
+            "version": "source_quality_check_v1",
             "report": report,
+            "source_count": len(sources_metadata),
         }
-        self._overwrite_step_json("source_quality_check", result)
+        out = write_json(vdir / "source_quality_check.json", result)
         
-        if not report.get("is_pass"):
+        status = "success" if report.get("is_pass", True) else "failed"
+        status_doc = self._base_status("source_quality_check", version, input_hash, [out])
+        status_doc["status"] = status
+        self._write_status(vdir, status_doc)
+        self._record_step(
+            step="source_quality_check",
+            version=version,
+            status=status,
+            output=relpath(out, self.task_dir),
+            input_hash=input_hash,
+            output_files=[out],
+            extra={
+                "summary": {
+                    "is_pass": report.get("is_pass", True),
+                    "reason": report.get("reason", ""),
+                    "source_count": len(sources_metadata),
+                }
+            },
+        )
+
+        if not report.get("is_pass", True):
             raise RuntimeError(f"Source quality check failed: {report.get('reason')}")
+
+        print("瀹屾垚: source_quality_check")
 
     def step_metadata(self) -> None:
         if self._is_virtual_multi_source():

@@ -20,6 +20,7 @@ const AI_VOICEOVER_STEPS = [
 const UNIFIED_AI_VOICEOVER_STEPS = [
   "source_prepare",
   "source_analysis",
+  "source_quality_check",
   "source_aggregate",
   "content_analysis",
   "candidate_refine",
@@ -53,6 +54,7 @@ const HIGHLIGHT_REASSEMBLY_STEPS = [
 const UNIFIED_HIGHLIGHT_REASSEMBLY_STEPS = [
   "source_prepare",
   "source_analysis",
+  "source_quality_check",
   "source_aggregate",
   "video_understanding",
   "highlight_detection",
@@ -67,6 +69,7 @@ let STEPS = AI_VOICEOVER_STEPS;
 const STEP_LABELS = {
   source_prepare: "准备多源素材",
   source_analysis: "按源分析素材",
+  source_quality_check: "素材质量检查",
   source_aggregate: "汇总素材分析",
   metadata: "读取视频信息",
   audio_extract: "提取音频",

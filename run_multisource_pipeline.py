@@ -29,6 +29,11 @@ from newsclip_agent.workflow_registry import (
 COMMON_REUSABLE_STEPS = UNIFIED_SOURCE_COMMON_REUSABLE_STEPS
 COMMON_PROGRESS_STEPS = ["source_prepare"] + COMMON_REUSABLE_STEPS
 LEGACY_COMMON_REUSABLE_STEPS = LEGACY_SINGLE_COMMON_REUSABLE_STEPS
+COMMON_STEP_OUTPUT_FILES = {
+    "source_analysis": "source_analysis.json",
+    "source_quality_check": "source_quality_check.json",
+    "source_aggregate": "source_aggregate.json",
+}
 
 
 def _sync_common_progress_to_child(
@@ -304,8 +309,14 @@ def _ensure_common_analysis(*, common_dir: Path, request: dict[str, Any], args: 
             if not _common_analysis_ready(common_dir):
                 manifest = read_json(common_dir / "manifest.json", {})
                 steps = manifest.get("steps", {}) or {}
+                not_ready_steps = [
+                    step
+                    for step in COMMON_REUSABLE_STEPS
+                    if not _common_step_ready(common_dir, step)
+                ]
                 debug = {
                     step: {
+                        "ready": _common_step_ready(common_dir, step),
                         "status": (steps.get(step) or {}).get("status"),
                         "output": (steps.get(step) or {}).get("output"),
                         "output_exists": _common_step_output_exists(common_dir, step),
@@ -313,7 +324,8 @@ def _ensure_common_analysis(*, common_dir: Path, request: dict[str, Any], args: 
                     for step in COMMON_REUSABLE_STEPS
                 }
                 raise RuntimeError(
-                    "common analysis finished but source_aggregate is not ready; "
+                    "common analysis finished but reusable common steps are not ready; "
+                    f"not_ready_steps={not_ready_steps}; "
                     f"debug={json.dumps(debug, ensure_ascii=False)}"
                 )
             _append_common_log(common_dir, "common analysis ready")
@@ -343,11 +355,9 @@ def _common_step_output_exists(common_dir: Path, step: str) -> bool:
     if not vdir:
         return False
 
-    if step == "source_analysis":
-        return (vdir / "source_analysis.json").exists()
-
-    if step == "source_aggregate":
-        return (vdir / "source_aggregate.json").exists()
+    output_name = COMMON_STEP_OUTPUT_FILES.get(step)
+    if output_name:
+        return (vdir / output_name).exists()
 
     return (vdir / "step_status.json").exists()
 
@@ -387,13 +397,12 @@ def _repair_common_manifest_from_outputs(common_dir: Path) -> None:
         if not vdir:
             continue
 
-        output_file = None
-        if step == "source_analysis":
-            output_file = vdir / "source_analysis.json"
-        elif step == "source_aggregate":
-            output_file = vdir / "source_aggregate.json"
+        output_name = COMMON_STEP_OUTPUT_FILES.get(step)
+        if not output_name:
+            continue
 
-        if not output_file or not output_file.exists():
+        output_file = vdir / output_name
+        if not output_file.exists():
             continue
 
         status_doc = read_json(vdir / "step_status.json", {})

@@ -18,6 +18,8 @@ LEGACY_SINGLE_COMMON_REUSABLE_STEPS = [
 ]
 
 UNIFIED_SOURCE_COMMON_REUSABLE_STEPS = [
+    # source_prepare is marked by the multi-source wrapper; the remaining
+    # steps are produced by PipelineRunner common analysis and reused later.
     "source_prepare",
     "source_analysis",
     "source_quality_check",
