@@ -2523,6 +2523,7 @@ class PipelineRunner:
             print("澶嶇敤缂撳瓨: voiceover_script")
             final_output = self._load_step_json("voiceover_script")
             self._normalize_voiceover_scripts(final_output)
+            self._attach_voiceover_script_timings(final_output, edit_plan)
             self._validate_voiceover_script_duration_or_raise(final_output)
             self._enforce_long_video_confirmation_after_voiceover(final_output)
             return
@@ -2575,6 +2576,7 @@ class PipelineRunner:
             extra={"model": model, "summary": {"scripts": len(final_output["scripts"]), "max_workers": max_workers}},
         )
         self._normalize_voiceover_scripts(final_output)
+        self._attach_voiceover_script_timings(final_output, edit_plan)
         self._validate_voiceover_script_duration_or_raise(final_output)
         self._enforce_long_video_confirmation_after_voiceover(final_output)
 
@@ -3133,8 +3135,17 @@ class PipelineRunner:
             raw_videos = []
             base_result = {}
         clips_by_id = self._candidate_clips_by_id()
+        diagnostics = {
+            "model_output_empty": not bool(raw_videos),
+            "fallback_used": False,
+            "candidate_clip_count": len(clips_by_id),
+        }
         if not raw_videos and clips_by_id:
-            raw_videos = [{"clip_ids": list(clips_by_id)[: self.options.reassembly_max_clip_count]}]
+            raw_videos = [{
+                "clip_ids": list(clips_by_id)[: self.options.reassembly_max_clip_count],
+                "fallback_reason": "model returned empty plan; selected top filtered clips",
+            }]
+            diagnostics["fallback_used"] = True
 
         output_videos: list[dict[str, Any]] = []
         used_clip_ids: set[str] = set()
@@ -3180,11 +3191,13 @@ class PipelineRunner:
                 "title": "",
                 "selected_clips": selected_clips,
                 "excluded_clip_ids": [cid for cid in clips_by_id if cid not in used_clip_ids],
+                **({"fallback_reason": video.get("fallback_reason")} if video.get("fallback_reason") else {}),
             })
 
         return {
             "version": "highlight_reassembly_materialized_v2",
             "output_videos": output_videos,
+            "diagnostics": diagnostics,
             "materialized_by_code": True,
             "raw_model_plan": result,
             **({"model_fields": {k: v for k, v in base_result.items() if k not in {"videos", "output_videos"}}} if base_result else {}),
@@ -3737,6 +3750,82 @@ class PipelineRunner:
             segments.append({"shot_id": shot.get("shot_id") or f"{short_video_id}_s{index:02d}", "text": text})
         return {"short_video_id": short_video_id, "narration_text": narration, "narration_segments": segments}
 
+    def _attach_voiceover_script_timings(self, voiceover_output: dict[str, Any], edit_plan: dict[str, Any]) -> None:
+        scripts = voiceover_output.get("scripts", []) if isinstance(voiceover_output, dict) else []
+        edit_scripts = edit_plan.get("scripts", []) if isinstance(edit_plan, dict) else []
+        if not isinstance(scripts, list) or not isinstance(edit_scripts, list):
+            return
+        edit_by_id = {
+            script.get("short_video_id"): script
+            for script in edit_scripts
+            if isinstance(script, dict) and script.get("short_video_id")
+        }
+        changed = False
+        for index, voice_script in enumerate(scripts, start=1):
+            if not isinstance(voice_script, dict):
+                continue
+            sid = voice_script.get("short_video_id") or f"v_{index:03d}"
+            edit_script = edit_by_id.get(sid)
+            if not edit_script and index <= len(edit_scripts) and isinstance(edit_scripts[index - 1], dict):
+                edit_script = edit_scripts[index - 1]
+            if edit_script and self._attach_voiceover_segment_timing(voice_script, edit_script):
+                changed = True
+        if changed:
+            out = self.task_dir / self._step_output("voiceover_script")
+            write_json(out, voiceover_output)
+
+    def _attach_voiceover_segment_timing(self, voice_script: dict[str, Any], edit_script: dict[str, Any]) -> bool:
+        segments = voice_script.get("narration_segments")
+        editing_structure = edit_script.get("editing_structure")
+        if not isinstance(segments, list) or not isinstance(editing_structure, list):
+            return False
+        shot_time_map: dict[str, dict[str, Any]] = {}
+        ordered_times: list[dict[str, Any]] = []
+        cursor = 0.0
+        for index, shot in enumerate(editing_structure, start=1):
+            if not isinstance(shot, dict):
+                continue
+            duration = shot.get("duration_seconds")
+            if duration is None:
+                start = timecode_to_seconds(shot.get("source_start"))
+                end = timecode_to_seconds(shot.get("source_end"))
+                duration = max(0.0, end - start)
+            duration = max(0.0, float(duration or 0))
+            if duration <= 0:
+                continue
+            shot_id = str(shot.get("shot_id") or f"{voice_script.get('short_video_id', 'v')}_s{index:02d}")
+            timing = {
+                "shot_id": shot_id,
+                "target_start": seconds_to_timecode(cursor, ms=True),
+                "target_end": seconds_to_timecode(cursor + duration, ms=True),
+                "target_start_seconds": round(cursor, 3),
+                "target_end_seconds": round(cursor + duration, 3),
+                "target_duration_seconds": round(duration, 3),
+            }
+            shot_time_map[shot_id] = timing
+            ordered_times.append(timing)
+            cursor += duration
+        if not ordered_times:
+            return False
+        changed = False
+        for index, segment in enumerate(segments, start=1):
+            if not isinstance(segment, dict):
+                continue
+            shot_id = str(segment.get("shot_id") or "")
+            timing = shot_time_map.get(shot_id)
+            if not timing and index <= len(ordered_times):
+                timing = ordered_times[index - 1]
+                if not shot_id:
+                    segment["shot_id"] = timing["shot_id"]
+                    changed = True
+            if not timing:
+                continue
+            for key in ("target_start", "target_end", "target_start_seconds", "target_end_seconds", "target_duration_seconds"):
+                if segment.get(key) in (None, ""):
+                    segment[key] = timing[key]
+                    changed = True
+        return changed
+
     def _build_voiceover_quality_check_text(self, script: dict[str, Any], plan_item: dict[str, Any]) -> str:
         lines = [
             "Task: check voiceover script quality.",
@@ -3912,6 +4001,7 @@ class PipelineRunner:
         return base
 
     def _reassembly_options_payload(self) -> dict[str, Any]:
+        reassembly_cfg = self.config.raw.get("reassembly", {}) if hasattr(self, "config") else {}
         return {
             "output_mode": self.options.reassembly_output_mode,
             "requested_output_mode": self.options.output_mode,
@@ -3919,9 +4009,11 @@ class PipelineRunner:
             "sort_mode": self.options.reassembly_sort_mode,
             "target_seconds": self.options.reassembly_target_seconds,
             "min_clip_seconds": self.options.reassembly_min_clip_seconds,
+            "soft_min_clip_seconds": float(reassembly_cfg.get("soft_min_clip_seconds", 5.0)),
             "max_clip_seconds": self.options.reassembly_max_clip_seconds,
             "max_clip_count": self.options.reassembly_max_clip_count,
             "export_individual_clips": self.options.reassembly_export_individual_clips,
+            "recover_missing_clip_ids": bool(reassembly_cfg.get("recover_missing_clip_ids", True)),
             "keep_original_audio": True,
         }
 
@@ -4346,8 +4438,10 @@ class PipelineRunner:
         for index, segment in enumerate(raw_segments, start=1):
             if not isinstance(segment, dict):
                 continue
-            start = timecode_to_seconds(segment.get("target_start"))
-            end = timecode_to_seconds(segment.get("target_end"))
+            start_value = segment.get("target_start_seconds")
+            end_value = segment.get("target_end_seconds")
+            start = float(start_value) if start_value not in (None, "") else timecode_to_seconds(segment.get("target_start"))
+            end = float(end_value) if end_value not in (None, "") else timecode_to_seconds(segment.get("target_end"))
             duration = float(segment.get("target_duration_seconds") or 0)
             if end <= start and duration > 0:
                 end = start + duration
@@ -4572,6 +4666,10 @@ class PipelineRunner:
             "voice_id": self.options.voice_id,
             "audio_policy": self.options.audio_policy,
             "allow_original_audio_evidence": self.options.allow_original_audio_evidence,
+            "duration_mismatch_block_threshold_seconds": self.duration_settings.duration_mismatch_block_threshold_seconds,
+            "ai_voiceover_compact_to_tts": self.duration_settings.ai_voiceover_compact_to_tts,
+            "ai_voiceover_mismatch_policy": self.duration_settings.ai_voiceover_mismatch_policy,
+            "ai_voiceover_min_ratio": self.duration_settings.ai_voiceover_min_ratio,
         })
         if self._can_reuse("cut_plan", input_hash):
             print("复用缓存: cut_plan")
@@ -4606,6 +4704,7 @@ class PipelineRunner:
                 clip_duration = end - start
                 audio_mode = seg.get("audio_mode") or ("mixed_evidence" if seg.get("original_audio_required") else "ai_voiceover")
                 raw_clip = {
+                    "shot_id": seg.get("shot_id", ""),
                     "source_id": seg.get("source_id", ""),
                     "source_index": seg.get("source_index", ""),
                     "source_start": seconds_to_timecode(start, ms=True),
@@ -4643,8 +4742,14 @@ class PipelineRunner:
                     clips.append(clip)
                     target += normalized_duration
             video_duration = round(target, 3)
+            original_visual_duration = video_duration
             tts_segments = tts_item.get("segments", []) if isinstance(tts_item.get("segments"), list) else []
-            if tts_success and tts_item.get("timeline_mode") == "compact_segmented" and tts_segments:
+            if (
+                self.duration_settings.ai_voiceover_compact_to_tts
+                and tts_success
+                and tts_item.get("timeline_mode") == "compact_segmented"
+                and tts_segments
+            ):
                 clips = self._compact_clips_to_voiceover_segments(clips, tts_segments, source_duration)
                 if clips:
                     video_duration = round(
@@ -4655,6 +4760,11 @@ class PipelineRunner:
                         3,
                     )
                     target = video_duration
+                    if abs(original_visual_duration - video_duration) > 0.001:
+                        repair_reasons.append("auto_compacted_to_tts")
+                        warnings.append(
+                            f"auto_compacted_to_tts: visual {original_visual_duration:.1f}s -> {video_duration:.1f}s"
+                        )
             target_duration = float(validation["target_duration_seconds"] or 0)
             min_compact_duration = target_duration * self.duration_settings.compact_min_target_ratio
             if (
@@ -4722,10 +4832,19 @@ class PipelineRunner:
                 voiceover_duration=voiceover_duration,
                 audio_policy=self.options.audio_policy,
                 tts_success=tts_success,
+                threshold_seconds=self.duration_settings.duration_mismatch_block_threshold_seconds,
             )
             if mismatch_reason:
                 blocked_reasons.append(mismatch_reason)
-            duration_status = "blocked" if blocked_reasons else ("mismatch" if duration_delta > 1.0 else "ok")
+            duration_status = (
+                "blocked"
+                if blocked_reasons
+                else (
+                    "mismatch"
+                    if duration_delta > self.duration_settings.duration_mismatch_block_threshold_seconds
+                    else "ok"
+                )
+            )
             voiceover_enabled = self.options.audio_policy != "original" and tts_success
             voiceover = {
                 "enabled": voiceover_enabled,
@@ -4751,6 +4870,15 @@ class PipelineRunner:
                 "blocked_reasons": blocked_reasons,
                 "repair_reasons": repair_reasons,
                 "warnings": warnings,
+                "auto_compacted_to_tts": bool(
+                    self.duration_settings.ai_voiceover_compact_to_tts
+                    and tts_success
+                    and tts_item.get("timeline_mode") == "compact_segmented"
+                    and tts_segments
+                    and abs(original_visual_duration - video_duration) > 0.001
+                ),
+                "original_visual_duration_seconds": round(original_visual_duration, 3),
+                "compacted_visual_duration_seconds": video_duration,
                 "auto_extended_for_voiceover_seconds": auto_extended_seconds,
                 "evidence_audio_windows": evidence_windows,
                 "voiceover_timeline_required": voiceover_timeline_required,
@@ -4841,34 +4969,44 @@ class PipelineRunner:
         tts_segments: list[dict[str, Any]],
         source_duration: float = 0.0,
     ) -> list[dict[str, Any]]:
-        active_segments = [
-            segment for segment in tts_segments
-            if segment.get("status") == "success" and float(segment.get("actual_duration_seconds") or 0) > 0
-        ]
-        if not clips or not active_segments:
+        active_by_shot_id = {
+            str(segment.get("shot_id")): segment
+            for segment in tts_segments
+            if segment.get("shot_id")
+            and segment.get("status") == "success"
+            and float(segment.get("actual_duration_seconds") or 0) > 0
+        }
+        if not clips or not active_by_shot_id:
             return clips
         compacted: list[dict[str, Any]] = []
-        for index, (clip, segment) in enumerate(zip(clips, active_segments)):
-            start = float(segment.get("target_start_seconds") or 0)
-            end = float(segment.get("target_end_seconds") or 0)
-            if index + 1 < len(active_segments):
-                next_start = float(active_segments[index + 1].get("target_start_seconds") or end)
-                duration = max(1.0, next_start - start)
-            else:
-                duration = max(1.0, end - start)
+        cursor = 0.0
+        gap = max(0.0, float(self.duration_settings.inter_sentence_gap_seconds or 0))
+        for clip in clips:
+            shot_id = str(clip.get("shot_id") or clip.get("source_shot_id") or "")
+            segment = active_by_shot_id.get(shot_id)
+            if not segment:
+                continue
+            duration = float(segment.get("actual_duration_seconds") or segment.get("target_duration_seconds") or 0)
+            if duration <= 0:
+                continue
             source_start = timecode_to_seconds(clip.get("source_start"))
             source_end = source_start + duration
             if source_duration > 0:
                 source_end = min(source_end, source_duration)
                 duration = max(0.1, source_end - source_start)
             new_clip = dict(clip)
-            new_clip["target_start"] = seconds_to_timecode(start, ms=True)
-            new_clip["target_start_seconds"] = round(start, 3)
+            new_clip["target_start"] = seconds_to_timecode(cursor, ms=True)
+            new_clip["target_start_seconds"] = round(cursor, 3)
+            new_clip["target_end_seconds"] = round(cursor + duration, 3)
             new_clip["source_end"] = seconds_to_timecode(source_end, ms=True)
             new_clip["duration_seconds"] = round(duration, 3)
             new_clip["compact_voiceover_timed"] = True
+            new_clip["voiceover_segment_shot_id"] = shot_id
             compacted.append(new_clip)
-        return compacted
+            cursor += duration
+            if len(compacted) < len(active_by_shot_id):
+                cursor += gap
+        return compacted or clips
 
     def step_reassembly_cut_plan(self) -> None:
         plan = self._load_step_json("highlight_reassembly_plan")
@@ -4888,6 +5026,10 @@ class PipelineRunner:
             pool = self._legacy_candidate_pool_from_reassembly_plan(plan)
         pool_by_id = {str(clip.get("clip_id")): clip for clip in pool if clip.get("clip_id")}
         diagnostics: list[dict[str, Any]] = []
+        raw_pool: list[dict[str, Any]] | None = None
+        reassembly_cfg = self.config.raw.get("reassembly", {}) if hasattr(self, "config") else {}
+        recover_missing_clip_ids = bool(reassembly_cfg.get("recover_missing_clip_ids", True))
+        soft_min_clip_seconds = float(reassembly_cfg.get("soft_min_clip_seconds", 5.0))
         output_videos = []
         for item in plan.get("output_videos", []):
             if not isinstance(item, dict):
@@ -4912,6 +5054,22 @@ class PipelineRunner:
                     filtered_pool_count=len(pool),
                 ))
             missing_clip_ids = [cid for cid in planned_clip_ids if cid not in pool_by_id]
+            if missing_clip_ids and recover_missing_clip_ids:
+                raw_pool = raw_pool if raw_pool is not None else self._load_candidate_clip_pool(filtered=False)
+                raw_by_id = {
+                    self._clip_id(clip, index): clip
+                    for index, clip in enumerate(raw_pool)
+                    if isinstance(clip, dict)
+                }
+                recovered_clip_ids: list[str] = []
+                for cid in missing_clip_ids:
+                    candidate = raw_by_id.get(cid)
+                    if candidate:
+                        pool_by_id[cid] = candidate
+                        recovered_clip_ids.append(cid)
+                if recovered_clip_ids:
+                    warnings.append(f"recovered missing clips from raw candidate pool: {recovered_clip_ids}")
+                missing_clip_ids = [cid for cid in missing_clip_ids if cid not in pool_by_id]
             if missing_clip_ids:
                 blocked_reasons.append("clip_id_not_found")
                 diagnostics.append(self._reassembly_error(
@@ -4941,8 +5099,10 @@ class PipelineRunner:
                     continue
                 duration = end - start
                 if duration < self.options.reassembly_min_clip_seconds:
-                    warnings.append(f"{source_clip_id}: shorter than min clip seconds")
+                    warnings.append(f"{source_clip_id}: shorter than hard min clip seconds")
                     continue
+                if duration < soft_min_clip_seconds:
+                    warnings.append(f"{source_clip_id}: short_original_audio_kept_with_warning")
                 if duration > self.options.reassembly_max_clip_seconds:
                     end = start + self.options.reassembly_max_clip_seconds
                     duration = self.options.reassembly_max_clip_seconds
@@ -5033,6 +5193,7 @@ class PipelineRunner:
             "production_mode": "highlight_reassembly",
             "source_video": self.manifest["source_video"],
             "output_videos": output_videos,
+            "diagnostics": diagnostics,
         })
         renderable_count = sum(1 for video in output_videos if video.get("duration_status") != "blocked")
         blocked_count = len(output_videos) - renderable_count

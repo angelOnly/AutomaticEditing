@@ -174,3 +174,60 @@ def test_tts_segments_to_srt_uses_actual_segment_times() -> None:
     ])
 
     assert "00:00:06,600 --> 00:00:12,520" in srt
+
+
+def test_attach_voiceover_segment_timing_from_editing_structure(tmp_path) -> None:
+    runner = PipelineRunner.__new__(PipelineRunner)
+    runner.task_dir = tmp_path
+    runner._step_output = lambda step: "voiceover_script.json"
+    voiceover = {
+        "scripts": [
+            {
+                "short_video_id": "v_001",
+                "narration_segments": [
+                    {"shot_id": "v_001_s01", "text": "one"},
+                    {"shot_id": "v_001_s02", "text": "two"},
+                ],
+            }
+        ]
+    }
+    edit_plan = {
+        "scripts": [
+            {
+                "short_video_id": "v_001",
+                "editing_structure": [
+                    {"shot_id": "v_001_s01", "duration_seconds": 4},
+                    {"shot_id": "v_001_s02", "duration_seconds": 6},
+                ],
+            }
+        ]
+    }
+
+    runner._attach_voiceover_script_timings(voiceover, edit_plan)
+
+    segments = voiceover["scripts"][0]["narration_segments"]
+    assert segments[0]["target_start"] == "00:00:00.000"
+    assert segments[0]["target_end"] == "00:00:04.000"
+    assert segments[1]["target_start_seconds"] == 4.0
+    assert segments[1]["target_duration_seconds"] == 6.0
+
+
+def test_compact_clips_to_voiceover_segments_aligns_by_shot_id() -> None:
+    runner = PipelineRunner.__new__(PipelineRunner)
+    runner.duration_settings = DurationSettings(inter_sentence_gap_seconds=0.25)
+
+    clips = [
+        {"shot_id": "shot_002", "source_start": "00:00:20.000", "source_end": "00:00:30.000", "duration_seconds": 10},
+        {"shot_id": "shot_001", "source_start": "00:00:00.000", "source_end": "00:00:10.000", "duration_seconds": 10},
+    ]
+    segments = [
+        {"shot_id": "shot_001", "status": "success", "actual_duration_seconds": 3.0},
+        {"shot_id": "shot_002", "status": "success", "actual_duration_seconds": 4.0},
+    ]
+
+    compacted = runner._compact_clips_to_voiceover_segments(clips, segments)
+
+    assert [clip["shot_id"] for clip in compacted] == ["shot_002", "shot_001"]
+    assert compacted[0]["source_end"] == "00:00:24.000"
+    assert compacted[0]["target_start_seconds"] == 0.0
+    assert compacted[1]["target_start_seconds"] == 4.25

@@ -2044,7 +2044,7 @@ function updateStopJobButton() {
   const button = $("stopJob");
   if (!button) return;
   const active = Boolean(state.activeJob);
-  button.classList.remove("hidden");
+  button.classList.toggle("hidden", !active);
   button.disabled = !active;
   button.classList.toggle("disabled", !active);
 }

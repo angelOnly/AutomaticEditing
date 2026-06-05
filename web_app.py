@@ -8,6 +8,7 @@ import signal
 import subprocess
 import sys
 import uuid
+import stat
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -253,6 +254,12 @@ def get_config() -> dict[str, Any]:
         "voiceover": {
             "tts_required_by_default": bool(VOICEOVER_DEFAULTS.get("tts_required_by_default", True)),
             "allow_original_audio_evidence": bool(VOICEOVER_DEFAULTS.get("allow_original_audio_evidence", False)),
+            "ai_voiceover_min_ratio": float(VOICEOVER_DEFAULTS.get("ai_voiceover_min_ratio", 0.8)),
+            "duration_mismatch_block_threshold_seconds": float(
+                VOICEOVER_DEFAULTS.get("duration_mismatch_block_threshold_seconds", 1.0)
+            ),
+            "ai_voiceover_compact_to_tts": bool(VOICEOVER_DEFAULTS.get("ai_voiceover_compact_to_tts", True)),
+            "ai_voiceover_mismatch_policy": str(VOICEOVER_DEFAULTS.get("ai_voiceover_mismatch_policy", "block")),
             "default_voice_id": str(PROJECT_CONFIG.omnivoice.get("default_voice_id", "")),
         },
         "voices": _public_voice_catalog(),
@@ -764,11 +771,29 @@ def list_tasks() -> list[dict[str, Any]]:
 
 @app.delete("/api/tasks/{task_id}")
 def delete_task(task_id: str) -> dict[str, Any]:
-    for job in JOBS.values():
-        if job.get("task_id") == task_id and _refresh_job(job["job_id"]).get("status") in {"pending", "running"}:
-            raise HTTPException(409, "task is running")
     task_dir = _task_dir(task_id)
-    shutil.rmtree(task_dir)
+    with JOB_LOCK:
+        matching_job_ids = [
+            job_id
+            for job_id, job in list(JOBS.items())
+            if job.get("task_id") == task_id
+        ]
+        for job_id in matching_job_ids:
+            if _refresh_job(job_id).get("status") in {"pending", "running"}:
+                raise HTTPException(409, "task is running")
+        for job_id in matching_job_ids:
+            JOBS.pop(job_id, None)
+            try:
+                PENDING_JOB_IDS.remove(job_id)
+            except ValueError:
+                pass
+        JOB_STORE.delete_job(task_id)
+    try:
+        _rmtree_task_dir(task_dir)
+    except PermissionError as exc:
+        raise HTTPException(409, f"task files are in use, close previews or logs and retry: {exc}") from exc
+    except OSError as exc:
+        raise HTTPException(500, f"failed to delete task files: {exc}") from exc
     return {"ok": True, "deleted": task_id}
 
 
@@ -1229,6 +1254,51 @@ def _terminate_process_tree(pid: int) -> None:
             pass
 
 
+def _pid_exists(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            result = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+            return f'"{pid}"' in result.stdout or f",{pid}," in result.stdout
+        except Exception:
+            return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _mark_job_finished(
+    job: dict[str, Any],
+    *,
+    status: str,
+    returncode: int,
+    user_message: str,
+) -> dict[str, Any]:
+    job["status"] = status
+    job["returncode"] = returncode
+    job["finished_at"] = datetime.now().isoformat(timespec="seconds")
+    job["user_message"] = user_message
+    log_file = job.get("log_file")
+    if log_file:
+        try:
+            log_file.close()
+        except Exception:
+            pass
+    _persist_job(job)
+    return job
+
+
 def _start_job(job: dict[str, Any]) -> None:
     log_path = Path(job["log_path"])
     log_file = log_path.open("a", encoding="utf-8", errors="replace")
@@ -1444,6 +1514,16 @@ def cancel_job(job_id: str) -> dict[str, Any]:
             return _public_job(job)
 
         pid = int(job.get("pid") or 0)
+        if not job.get("process") and not _pid_exists(pid):
+            _mark_job_finished(
+                job,
+                status="cancelled",
+                returncode=-9,
+                user_message="任务进程已不存在，已清理残留运行状态。",
+            )
+            _schedule_jobs()
+            return _public_job(job)
+
         _terminate_process_tree(pid)
         process = job.get("process")
         if process:
@@ -1478,6 +1558,22 @@ def _refresh_job(job_id: str, schedule_next: bool = True) -> dict[str, Any]:
     job = JOBS[job_id]
     process = job.get("process")
     changed_to_finished = False
+    if not process and job.get("status") in {"pending", "running"}:
+        pid = int(job.get("pid") or 0)
+        if job.get("status") == "running" and _pid_exists(pid):
+            return _public_job(job)
+        if job.get("status") == "pending":
+            try:
+                PENDING_JOB_IDS.remove(job_id)
+            except ValueError:
+                pass
+        _mark_job_finished(
+            job,
+            status="failed",
+            returncode=-9,
+            user_message="任务进程已不存在，可能是 Web 服务被重启或手动结束，已标记为中断。",
+        )
+        changed_to_finished = True
     if process and job["status"] == "running":
         code = process.poll()
         if code is not None:
@@ -1490,7 +1586,7 @@ def _refresh_job(job_id: str, schedule_next: bool = True) -> dict[str, Any]:
             job["user_message"] = _extract_user_message_from_log(Path(job["log_path"]))
             _persist_job(job)
             changed_to_finished = True
-    elif Path(job.get("log_path", "")).exists():
+    elif not changed_to_finished and Path(job.get("log_path", "")).exists():
         job["user_message"] = _extract_user_message_from_log(Path(job["log_path"]))
     if changed_to_finished and schedule_next:
         _schedule_jobs()
@@ -1660,6 +1756,24 @@ def _task_dir(task_id: str) -> Path:
     if not task_dir.exists():
         raise HTTPException(404, "task not found")
     return task_dir
+
+
+def _rmtree_task_dir(task_dir: Path) -> None:
+    def onexc(function: Any, path: str, exc_info: Any) -> None:
+        try:
+            os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
+            function(path)
+        except Exception:
+            raise exc_info[1]
+
+    if not task_dir.exists():
+        return
+    kwargs: dict[str, Any] = {}
+    if sys.version_info >= (3, 12):
+        kwargs["onexc"] = onexc
+    else:
+        kwargs["onerror"] = lambda function, path, exc_info: onexc(function, path, exc_info)
+    shutil.rmtree(task_dir, **kwargs)
 
 
 def _safe_child(root: Path, child: str) -> Path:

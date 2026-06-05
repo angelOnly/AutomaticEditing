@@ -24,6 +24,7 @@ UNIFIED_SOURCE_COMMON_PROGRESS_STEPS = [
 ]
 
 UNIFIED_SOURCE_COMMON_REUSABLE_STEPS = [
+    "source_prepare",
     "source_analysis",
     "source_aggregate",
 ]

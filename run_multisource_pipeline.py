@@ -296,7 +296,11 @@ def _ensure_common_analysis(*, common_dir: Path, request: dict[str, Any], args: 
             pipeline_args.extend(["--input", str(built["input_video"])])
         
         if rerun and _is_common_rerun_step(rerun):
-            pipeline_args.extend(["--rerun", _map_common_rerun_step(rerun)])
+            mapped_rerun = _map_common_rerun_step(rerun)
+            if rerun == "source_prepare":
+                pipeline_args.extend(["--rerun-from", mapped_rerun])
+            else:
+                pipeline_args.extend(["--rerun", mapped_rerun])
         if rerun_from and _is_common_rerun_step(rerun_from):
             pipeline_args.extend(["--rerun-from", _map_common_rerun_step(rerun_from)])
         try:
@@ -362,6 +366,9 @@ def _latest_version_dir(step_dir: Path) -> Path | None:
 
 
 def _common_step_output_exists(common_dir: Path, step: str) -> bool:
+    if step == "source_prepare":
+        return (common_dir / "input" / "source_manifest.json").exists()
+
     vdir = _latest_version_dir(common_dir / step)
     if not vdir:
         return False
@@ -379,7 +386,12 @@ def _common_step_ready(common_dir: Path, step: str) -> bool:
     item = steps.get(step, {}) or {}
 
     if step == "source_prepare":
-        return item.get("status") in {"success", "partial_success", "skipped"}
+        if item.get("status") == "failed":
+            return False
+        return (
+            item.get("status") in {"success", "partial_success", "skipped"}
+            or _common_step_output_exists(common_dir, step)
+        )
 
     if item.get("status") in {"success", "partial_success", "skipped"}:
         output = str(item.get("output") or "").strip()
@@ -686,10 +698,10 @@ def _is_common_rerun_step(step: str | None) -> bool:
 
 
 def _map_common_rerun_step(step: str) -> str:
-    if step in COMMON_REUSABLE_STEPS:
-        return step
     if step == "source_prepare":
         return "source_analysis"
+    if step in COMMON_REUSABLE_STEPS:
+        return step
     return "source_analysis"
 
 

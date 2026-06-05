@@ -27,6 +27,9 @@ class DurationSettings:
     voiceover_volume: float = 1.0
     tts_required_by_default: bool = True
     ai_voiceover_min_ratio: float = 0.80
+    duration_mismatch_block_threshold_seconds: float = 1.0
+    ai_voiceover_compact_to_tts: bool = True
+    ai_voiceover_mismatch_policy: str = "block"
     ai_voiceover_original_audio_max_seconds: float = 6.0
     ai_voiceover_original_audio_max_ratio: float = 0.15
     ai_voiceover_original_audio_single_max_seconds: float = 4.0
@@ -79,6 +82,9 @@ def load_duration_settings(config: Any) -> DurationSettings:
         voiceover_volume=float(voiceover.get("voiceover_volume", 1.0)),
         tts_required_by_default=bool(voiceover.get("tts_required_by_default", True)),
         ai_voiceover_min_ratio=float(voiceover.get("ai_voiceover_min_ratio", 0.80)),
+        duration_mismatch_block_threshold_seconds=float(voiceover.get("duration_mismatch_block_threshold_seconds", 1.0)),
+        ai_voiceover_compact_to_tts=bool(voiceover.get("ai_voiceover_compact_to_tts", True)),
+        ai_voiceover_mismatch_policy=str(voiceover.get("ai_voiceover_mismatch_policy", "block")),
         ai_voiceover_original_audio_max_seconds=float(voiceover.get("ai_voiceover_original_audio_max_seconds", 6.0)),
         ai_voiceover_original_audio_max_ratio=float(voiceover.get("ai_voiceover_original_audio_max_ratio", 0.15)),
         ai_voiceover_original_audio_single_max_seconds=float(voiceover.get("ai_voiceover_original_audio_single_max_seconds", 4.0)),

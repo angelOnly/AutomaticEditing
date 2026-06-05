@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+from collections import deque
+from types import SimpleNamespace
 
 import web_app
 from web_app import (
@@ -173,3 +175,79 @@ def test_mode_switch_prefers_task_id_when_manifest_was_already_overwritten(tmp_p
 
     assert req.input_video == str(source.resolve())
     assert req.task_id == "example_视频重组_20260527_161530"
+
+
+def test_delete_task_removes_directory_and_job_records(tmp_path, monkeypatch) -> None:
+    task_dir = tmp_path / "task_done"
+    task_dir.mkdir()
+    (task_dir / "manifest.json").write_text("{}", encoding="utf-8")
+    deleted_jobs: list[str] = []
+    monkeypatch.setattr(web_app, "OUTPUTS_DIR", tmp_path)
+    monkeypatch.setattr(web_app, "JOBS", {
+        "job_001": {
+            "job_id": "job_001",
+            "task_id": "task_done",
+            "status": "failed",
+            "log_path": str(tmp_path / "missing.log"),
+        }
+    })
+    monkeypatch.setattr(web_app, "PENDING_JOB_IDS", deque(["job_001"]))
+    monkeypatch.setattr(web_app, "JOB_STORE", SimpleNamespace(delete_job=lambda task_id: deleted_jobs.append(task_id)))
+
+    result = web_app.delete_task("task_done")
+
+    assert result == {"ok": True, "deleted": "task_done"}
+    assert not task_dir.exists()
+    assert web_app.JOBS == {}
+    assert list(web_app.PENDING_JOB_IDS) == []
+    assert deleted_jobs == ["task_done"]
+
+
+def test_refresh_job_marks_orphaned_running_job_failed(tmp_path, monkeypatch) -> None:
+    task_dir = tmp_path / "task_orphan"
+    task_dir.mkdir()
+    saved_jobs: list[dict] = []
+    monkeypatch.setattr(web_app, "OUTPUTS_DIR", tmp_path)
+    monkeypatch.setattr(web_app, "JOB_STORE", SimpleNamespace(save_job=lambda _task_id, job: saved_jobs.append(dict(job))))
+    monkeypatch.setattr(web_app, "_pid_exists", lambda _pid: False)
+    monkeypatch.setattr(web_app, "JOBS", {
+        "job_orphan": {
+            "job_id": "job_orphan",
+            "task_id": "task_orphan",
+            "status": "running",
+            "pid": 999999,
+            "log_path": str(tmp_path / "missing.log"),
+        }
+    })
+
+    public = web_app._refresh_job("job_orphan")
+
+    assert public["status"] == "failed"
+    assert public["returncode"] == -9
+    assert "进程已不存在" in public["user_message"]
+    assert saved_jobs[-1]["status"] == "failed"
+
+
+def test_cancel_job_clears_orphaned_running_job(tmp_path, monkeypatch) -> None:
+    task_dir = tmp_path / "task_orphan"
+    task_dir.mkdir()
+    saved_jobs: list[dict] = []
+    monkeypatch.setattr(web_app, "OUTPUTS_DIR", tmp_path)
+    monkeypatch.setattr(web_app, "JOB_STORE", SimpleNamespace(save_job=lambda _task_id, job: saved_jobs.append(dict(job))))
+    monkeypatch.setattr(web_app, "_pid_exists", lambda _pid: False)
+    monkeypatch.setattr(web_app, "JOBS", {
+        "job_orphan": {
+            "job_id": "job_orphan",
+            "task_id": "task_orphan",
+            "status": "running",
+            "pid": 999999,
+            "log_path": str(tmp_path / "missing.log"),
+        }
+    })
+
+    public = web_app.cancel_job("job_orphan")
+
+    assert public["status"] == "cancelled"
+    assert public["returncode"] == -9
+    assert "进程已不存在" in public["user_message"]
+    assert saved_jobs[-1]["status"] == "cancelled"
