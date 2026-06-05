@@ -207,6 +207,9 @@ class PipelineRunner:
                 self._save_manifest()
             if self.manifest.get("status") not in {"failed", "action_required"}:
                 self.manifest["status"] = "success"
+                if getattr(self.options, "common_only", False):
+                    self.manifest["common_only_completed"] = True
+                    self.manifest["common_only_completed_at"] = now_iso()
                 self._save_manifest()
         finally:
             if self.options.release_asr_after_task and self._asr_engine is not None:

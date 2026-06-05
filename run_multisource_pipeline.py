@@ -299,17 +299,147 @@ def _ensure_common_analysis(*, common_dir: Path, request: dict[str, Any], args: 
                 raise RuntimeError(f"common analysis failed with return code {result}")
 
             if not _common_analysis_ready(common_dir):
-                raise RuntimeError("common analysis finished but source_aggregate is not ready")
+                _repair_common_manifest_from_outputs(common_dir)
+
+            if not _common_analysis_ready(common_dir):
+                manifest = read_json(common_dir / "manifest.json", {})
+                steps = manifest.get("steps", {}) or {}
+                debug = {
+                    step: {
+                        "status": (steps.get(step) or {}).get("status"),
+                        "output": (steps.get(step) or {}).get("output"),
+                        "output_exists": _common_step_output_exists(common_dir, step),
+                    }
+                    for step in COMMON_REUSABLE_STEPS
+                }
+                raise RuntimeError(
+                    "common analysis finished but source_aggregate is not ready; "
+                    f"debug={json.dumps(debug, ensure_ascii=False)}"
+                )
             _append_common_log(common_dir, "common analysis ready")
         except Exception as exc:
             _append_common_log(common_dir, f"common analysis failed: {exc}")
+            _mark_common_failed(common_dir, str(exc))
             raise
 
 
-def _common_analysis_ready(common_dir: Path) -> bool:
+def _latest_version_dir(step_dir: Path) -> Path | None:
+    if not step_dir.exists() or not step_dir.is_dir():
+        return None
+    versions = []
+    for item in step_dir.iterdir():
+        if item.is_dir() and item.name.startswith("v"):
+            try:
+                versions.append((int(item.name[1:]), item))
+            except ValueError:
+                continue
+    if not versions:
+        return None
+    return sorted(versions, key=lambda x: x[0])[-1][1]
+
+
+def _common_step_output_exists(common_dir: Path, step: str) -> bool:
+    vdir = _latest_version_dir(common_dir / step)
+    if not vdir:
+        return False
+
+    if step == "source_analysis":
+        return (vdir / "source_analysis.json").exists()
+
+    if step == "source_aggregate":
+        return (vdir / "source_aggregate.json").exists()
+
+    return (vdir / "step_status.json").exists()
+
+
+def _common_step_ready(common_dir: Path, step: str) -> bool:
     manifest = read_json(common_dir / "manifest.json", {})
-    steps = manifest.get("steps", {})
-    return all(steps.get(step, {}).get("status") in {"success", "partial_success", "skipped"} for step in COMMON_REUSABLE_STEPS)
+    steps = manifest.get("steps", {}) or {}
+    item = steps.get(step, {}) or {}
+
+    if item.get("status") in {"success", "partial_success", "skipped"}:
+        output = str(item.get("output") or "").strip()
+        if not output:
+            return _common_step_output_exists(common_dir, step)
+        return (common_dir / output).exists()
+
+    # 兜底：manifest 没及时更新，但版本目录和核心输出已经存在
+    return _common_step_output_exists(common_dir, step)
+
+
+def _common_analysis_ready(common_dir: Path) -> bool:
+    return all(_common_step_ready(common_dir, step) for step in COMMON_REUSABLE_STEPS)
+
+
+def _repair_common_manifest_from_outputs(common_dir: Path) -> None:
+    manifest_path = common_dir / "manifest.json"
+    manifest = read_json(manifest_path, {})
+    now = datetime.now().isoformat(timespec="seconds")
+
+    manifest.setdefault("task_id", common_dir.name)
+    manifest.setdefault("created_at", now)
+    manifest["updated_at"] = now
+    manifest.setdefault("steps", {})
+    manifest.setdefault("current_versions", {})
+
+    for step in COMMON_REUSABLE_STEPS:
+        vdir = _latest_version_dir(common_dir / step)
+        if not vdir:
+            continue
+
+        output_file = None
+        if step == "source_analysis":
+            output_file = vdir / "source_analysis.json"
+        elif step == "source_aggregate":
+            output_file = vdir / "source_aggregate.json"
+
+        if not output_file or not output_file.exists():
+            continue
+
+        status_doc = read_json(vdir / "step_status.json", {})
+        version = vdir.name
+
+        existing = manifest["steps"].get(step, {})
+        existing.update({
+            "step_name": step,
+            "version": version,
+            "status": status_doc.get("status") or existing.get("status") or "success",
+            "updated_at": now,
+            "finished_at": existing.get("finished_at") or now,
+            "output": relpath(output_file, common_dir),
+            "can_rerun": True,
+        })
+
+        if status_doc.get("input_hash"):
+            existing["input_hash"] = status_doc["input_hash"]
+        if status_doc.get("output_hash"):
+            existing["output_hash"] = status_doc["output_hash"]
+
+        manifest["steps"][step] = existing
+        manifest["current_versions"][step] = version
+
+    write_json(manifest_path, manifest)
+
+
+def _mark_common_failed(common_dir: Path, message: str) -> None:
+    manifest_path = common_dir / "manifest.json"
+    manifest = read_json(manifest_path, {})
+    now = datetime.now().isoformat(timespec="seconds")
+    manifest.setdefault("task_id", common_dir.name)
+    manifest.setdefault("created_at", now)
+    manifest["updated_at"] = now
+    manifest["status"] = "failed"
+    manifest["user_message"] = message
+    manifest.setdefault("steps", {})
+
+    # 不覆盖已成功步骤，只补一个 wrapper 错误信息
+    manifest["common_wrapper_error"] = {
+        "status": "failed",
+        "message": message,
+        "updated_at": now,
+    }
+
+    write_json(manifest_path, manifest)
 
 
 def _copy_common_outputs_to_task(*, common_dir: Path, task_dir: Path, request: dict[str, Any]) -> None:

@@ -683,6 +683,7 @@ def list_tasks() -> list[dict[str, Any]]:
         reverse=True,
     ):
         manifest = read_json(task_dir / "manifest.json", {})
+        manifest = _hydrate_common_progress_for_manifest(task_dir, manifest)
         steps = manifest.get("steps", {})
         source_request_exists = (task_dir / "input" / "source_request.json").exists()
         if not manifest and not source_request_exists:
@@ -811,6 +812,7 @@ def get_manifest(task_id: str) -> dict[str, Any]:
             },
         }
     _hydrate_manifest_options(task_dir, manifest)
+    manifest = _hydrate_common_progress_for_manifest(task_dir, manifest)
     
     job_status = _active_job_status_for_task(task_id)
     if manifest.get("status") == "running" and job_status != "running":
@@ -1507,6 +1509,49 @@ def _extract_user_message_from_log(path: Path) -> str:
         lines = [line.strip() for line in tail.splitlines() if line.strip()]
         return "\n".join(lines[-4:])
     return ""
+
+
+def _hydrate_common_progress_for_manifest(task_dir: Path, manifest: dict[str, Any]) -> dict[str, Any]:
+    common_task_id = str(manifest.get("common_task_id") or "").strip()
+    if not common_task_id:
+        source_request = read_json(task_dir / "input" / "source_request.json", {})
+        common_task_id = str(source_request.get("common_task_id") or "").strip()
+
+    if not common_task_id:
+        return manifest
+
+    common_dir = COMMON_OUTPUTS_DIR / common_task_id
+    common_manifest = read_json(common_dir / "manifest.json", {})
+    if not common_manifest:
+        return manifest
+
+    manifest.setdefault("steps", {})
+    common_steps = common_manifest.get("steps", {}) or {}
+
+    from newsclip_agent.workflow_registry import UNIFIED_SOURCE_COMMON_REUSABLE_STEPS
+    for step in UNIFIED_SOURCE_COMMON_REUSABLE_STEPS:
+        item = common_steps.get(step)
+        if not isinstance(item, dict):
+            continue
+        copied = dict(item)
+        copied["common_progress"] = True
+        copied["common_task_id"] = common_task_id
+        copied["reused_from"] = relpath(common_dir, ROOT)
+        manifest["steps"][step] = copied
+
+    for key in ("source_video", "source_mode", "source_manifest", "source_videos", "current_versions"):
+        if common_manifest.get(key):
+            if key == "current_versions":
+                manifest.setdefault("current_versions", {}).update(common_manifest.get("current_versions") or {})
+            else:
+                manifest[key] = common_manifest[key]
+
+    if common_manifest.get("status") == "failed":
+        manifest["status"] = "failed"
+        manifest["user_message"] = common_manifest.get("user_message") or manifest.get("user_message", "")
+
+    manifest["common_task_id"] = common_task_id
+    return manifest
 
 
 def _hydrate_manifest_options(task_dir: Path, manifest: dict[str, Any]) -> None:
