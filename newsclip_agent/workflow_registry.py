@@ -22,7 +22,6 @@ UNIFIED_SOURCE_COMMON_REUSABLE_STEPS = [
     # steps are produced by PipelineRunner common analysis and reused later.
     "source_prepare",
     "source_analysis",
-    "source_quality_check",
     "source_aggregate",
 ]
 
@@ -74,7 +73,6 @@ WORKFLOWS: dict[tuple[str, bool], list[str]] = {
     ("ai_voiceover", True): [
         "source_prepare",
         "source_analysis",
-        "source_quality_check",
         "source_aggregate",
         "content_analysis",
         "short_video_edit_plan",
@@ -90,7 +88,6 @@ WORKFLOWS: dict[tuple[str, bool], list[str]] = {
     ("highlight_reassembly", True): [
         "source_prepare",
         "source_analysis",
-        "source_quality_check",
         "source_aggregate",
         "video_understanding",
         "highlight_detection",
@@ -107,7 +104,7 @@ DEPENDENCIES: dict[str, list[str]] = {
     "source_prepare": [],
     "source_analysis": [],
     "source_quality_check": ["source_analysis", "metadata"],
-    "source_aggregate": ["source_quality_check"],
+    "source_aggregate": ["source_analysis"],
 
     "metadata": [],
     "audio_extract": ["source_quality_check"],

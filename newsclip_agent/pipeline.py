@@ -6,6 +6,7 @@ import math
 import os
 import re
 import shutil
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -365,7 +366,6 @@ class PipelineRunner:
             if self._is_virtual_source_manifest():
                 common_steps = [
                     "source_analysis",
-                    "source_quality_check",
                     "source_aggregate",
                 ]
             else:
@@ -683,6 +683,70 @@ class PipelineRunner:
             t = max(end - overlap, end)
         return windows
 
+    def _quality_check_source_item(
+        self,
+        item: dict[str, Any],
+        source_path: Path,
+    ) -> dict[str, Any]:
+        try:
+            metadata = ffprobe_json(source_path)
+        except Exception as exc:
+            metadata = {"probe_error": str(exc)}
+
+        if item.get("duration_seconds") is not None:
+            metadata.setdefault("duration", item.get("duration_seconds"))
+            metadata.setdefault("duration_seconds", item.get("duration_seconds"))
+
+        metadata.setdefault("source_id", item.get("source_id", ""))
+        metadata.setdefault("source_index", item.get("source_index"))
+        metadata.setdefault("display_name", item.get("display_name", ""))
+        metadata.setdefault("original_path", item.get("original_path", ""))
+
+        report = build_source_quality_report([metadata])
+
+        return {
+            "version": "source_quality_check_internal_v1",
+            "source_id": item.get("source_id", ""),
+            "source_index": item.get("source_index"),
+            "display_name": item.get("display_name", ""),
+            "original_path": item.get("original_path", ""),
+            "metadata": metadata,
+            "report": report,
+            "is_pass": bool(report.get("is_pass", False)),
+            "reason": report.get("reason", ""),
+            "checked_at": now_iso(),
+        }
+
+    def _source_stage_message(self, step: str, summary: dict[str, Any]) -> str:
+        if step == "vision":
+            total = int(summary.get("total_chunks") or 0)
+            processed = int(summary.get("processed_chunks") or 0)
+            failed = int(summary.get("failed_chunks") or 0)
+            if total:
+                return f"画面识别 {processed}/{total}" + (f"，失败 {failed}" if failed else "")
+
+        if step == "asr":
+            total = int(summary.get("total_chunks") or summary.get("total_segments") or 0)
+            processed = int(summary.get("processed_chunks") or summary.get("processed_segments") or 0)
+            if total:
+                return f"语音转文字 {processed}/{total}"
+
+        return step
+
+    def _step_label(self, step: str) -> str:
+        return {
+            "source_quality_check": "素材质量检查",
+            "metadata": "读取视频信息",
+            "audio_extract": "提取音频",
+            "frame_extract": "抽取关键帧",
+            "chunk_build": "切分分析片段",
+            "asr": "语音转文字",
+            "asr_digest": "压缩语音摘要",
+            "vision": "画面识别",
+            "timeline": "合并时间线",
+            "timeline_digest": "压缩分析时间线",
+        }.get(step, step)
+
     def step_source_analysis(self) -> None:
         step_started = time.perf_counter()
         sources = self._iter_source_items()
@@ -752,6 +816,21 @@ class PipelineRunner:
                 flush=True,
             )
 
+        def source_progress_extra() -> dict[str, Any]:
+            return {
+                "completed_sources": sum(
+                    1 for value in source_progress.values()
+                    if value.get("status") in {"success", "failed"}
+                ),
+                "total_sources": total_sources,
+                "success_count": sum(1 for value in source_progress.values() if value.get("status") == "success"),
+                "failed_count": sum(1 for value in source_progress.values() if value.get("status") == "failed"),
+                "running_count": sum(1 for value in source_progress.values() if value.get("status") == "running"),
+                "source_progress": list(source_progress.values()),
+                "source_max_workers": active_workers,
+                "per_source_vision_max_workers": per_source_vision_workers,
+            }
+
         def analyze_one(item: dict[str, Any]) -> dict[str, Any]:
             source_id = source_id_for(item)
             source_pos = source_positions.get(source_id, 0)
@@ -762,6 +841,20 @@ class PipelineRunner:
             summary_path = source_dir / "source_summary.json"
             source_status_path = source_dir / "source_status.json"
             source_status = read_json(source_status_path, {})
+
+            source_progress[source_id].update({
+                "status": "running",
+                "current_stage": "source_quality_check",
+                "current_stage_label": "素材质量检查",
+                "message": "素材质量检查中",
+                "updated_at": now_iso(),
+            })
+            if progress_enabled:
+                self._update_step_progress(
+                    "source_analysis",
+                    f"source {source_pos}/{total_sources}: source_quality_check",
+                    source_progress_extra(),
+                )
 
             if (
                 self.options.resume
@@ -789,6 +882,39 @@ class PipelineRunner:
                     "reused": True,
                 }
 
+            quality_doc = self._quality_check_source_item(item, source_path)
+            quality_path = write_json(source_dir / "source_quality_check.json", quality_doc)
+
+            if not quality_doc.get("is_pass"):
+                elapsed = round(time.perf_counter() - started_at, 3)
+                reason = quality_doc.get("reason") or "source quality check failed"
+
+                write_json(source_status_path, {
+                    "source_id": source_id,
+                    "status": "failed",
+                    "failed_stage": "source_quality_check",
+                    "error": reason,
+                    "quality_check": relpath(quality_path, self.task_dir),
+                    "updated_at": now_iso(),
+                    "elapsed_seconds": elapsed,
+                })
+
+                source_progress[source_id].update({
+                    "status": "failed",
+                    "current_stage": "source_quality_check",
+                    "error": reason,
+                    "quality_check": relpath(quality_path, self.task_dir),
+                    "updated_at": now_iso(),
+                })
+                if progress_enabled:
+                    self._update_step_progress(
+                        "source_analysis",
+                        f"source {source_pos}/{total_sources}: source_quality_check failed",
+                        source_progress_extra(),
+                    )
+
+                raise RuntimeError(f"source quality check failed for {source_id}: {reason}")
+
             if verbose_source_logs:
                 print(
                     f"[source_analysis] start {source_id} {source_pos}/{total_sources} "
@@ -815,7 +941,53 @@ class PipelineRunner:
                     production_mode="ai_voiceover",
                 )
                 child_runner = PipelineRunner(child_options)
-                child_manifest = child_runner.run()
+                stop_child_sync = threading.Event()
+
+                def sync_child_progress() -> None:
+                    while not stop_child_sync.is_set():
+                        try:
+                            child_manifest_data = read_json(child_runner.manifest_path, {})
+                            child_steps = child_manifest_data.get("steps", {}) or {}
+
+                            running_step = ""
+                            running_item: dict[str, Any] = {}
+                            for name, value in child_steps.items():
+                                if isinstance(value, dict) and value.get("status") == "running":
+                                    running_step = name
+                                    running_item = value
+                                    break
+
+                            if running_step:
+                                summary = running_item.get("summary") or {}
+                                message = self._source_stage_message(running_step, summary)
+                                if message == running_step:
+                                    message = str(running_item.get("message") or running_step)
+                                source_progress[source_id].update({
+                                    "status": "running",
+                                    "current_stage": running_step,
+                                    "current_stage_label": self._step_label(running_step),
+                                    "stage_summary": summary,
+                                    "message": message,
+                                    "updated_at": now_iso(),
+                                })
+
+                                self._update_step_progress(
+                                    "source_analysis",
+                                    f"source {source_pos}/{total_sources}: {running_step}",
+                                    source_progress_extra(),
+                                )
+                        except Exception:
+                            pass
+
+                        stop_child_sync.wait(2.0)
+
+                sync_thread = threading.Thread(target=sync_child_progress, daemon=True)
+                sync_thread.start()
+                try:
+                    child_manifest = child_runner.run()
+                finally:
+                    stop_child_sync.set()
+                    sync_thread.join(timeout=1.0)
                 digest = child_runner._load_step_json("timeline_digest")
                 summary = self._build_source_summary(item, child_runner.task_dir, child_manifest, digest)
                 summary_path = write_json(summary_path, summary)
@@ -825,6 +997,7 @@ class PipelineRunner:
                     "source_id": source_id,
                     "status": "success",
                     "summary": relpath(summary_path, self.task_dir),
+                    "quality_check": relpath(quality_path, self.task_dir),
                     "updated_at": now_iso(),
                     "elapsed_seconds": elapsed,
                     "chunk_count": chunk_count,
@@ -840,6 +1013,7 @@ class PipelineRunner:
                     "status": "success",
                     "display_name": item.get("display_name") or source_path.name,
                     "summary": relpath(summary_path, self.task_dir),
+                    "quality_check": relpath(quality_path, self.task_dir),
                     "work_task_dir": relpath(child_runner.task_dir, self.task_dir),
                     "chunk_count": chunk_count,
                     "elapsed_seconds": elapsed,
@@ -849,6 +1023,7 @@ class PipelineRunner:
                 write_json(source_status_path, {
                     "source_id": source_id,
                     "status": "failed",
+                    "failed_stage": source_progress.get(source_id, {}).get("current_stage", ""),
                     "error": str(exc),
                     "updated_at": now_iso(),
                     "elapsed_seconds": elapsed,
@@ -883,7 +1058,7 @@ class PipelineRunner:
             future_map = {}
             for idx, item in enumerate(sources, start=1):
                 source_id = source_id_for(item)
-                source_progress[source_id].update({"status": "running", "updated_at": now_iso()})
+                source_progress[source_id].update({"status": "pending", "updated_at": now_iso()})
                 future_map[executor.submit(analyze_one, item)] = item
 
             completed = 0

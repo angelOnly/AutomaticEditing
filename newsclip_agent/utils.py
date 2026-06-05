@@ -150,9 +150,17 @@ def ffprobe_json(video_path: str | Path) -> dict[str, Any]:
         str(video_path),
     ])
     data = json.loads(proc.stdout)
-    v_stream = next((s for s in data.get("streams", []) if s.get("codec_type") == "video"), {})
-    a_stream = next((s for s in data.get("streams", []) if s.get("codec_type") == "audio"), {})
-    duration = float(data.get("format", {}).get("duration") or v_stream.get("duration") or 0)
+    streams = data.get("streams", []) or []
+    v_stream = next((s for s in streams if s.get("codec_type") == "video"), {})
+    a_stream = next((s for s in streams if s.get("codec_type") == "audio"), {})
+    has_video = bool(v_stream)
+    has_audio = bool(a_stream)
+    duration = float(
+        data.get("format", {}).get("duration")
+        or v_stream.get("duration")
+        or a_stream.get("duration")
+        or 0
+    )
     fps = 0.0
     fps_text = v_stream.get("avg_frame_rate") or v_stream.get("r_frame_rate") or "0/1"
     if "/" in fps_text:
@@ -160,14 +168,17 @@ def ffprobe_json(video_path: str | Path) -> dict[str, Any]:
         fps = float(num) / max(1.0, float(den))
     return {
         "duration": duration,
+        "duration_seconds": duration,
         "duration_timecode": seconds_to_timecode(duration, ms=True),
+        "has_video": has_video,
+        "has_audio": has_audio,
         "width": int(v_stream.get("width") or 0),
         "height": int(v_stream.get("height") or 0),
         "fps": round(fps, 3),
         "video_codec": v_stream.get("codec_name", ""),
         "audio_codec": a_stream.get("codec_name", ""),
         "format": data.get("format", {}),
-        "streams": data.get("streams", []),
+        "streams": streams,
     }
 
 

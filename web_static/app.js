@@ -20,7 +20,6 @@ const AI_VOICEOVER_STEPS = [
 const UNIFIED_AI_VOICEOVER_STEPS = [
   "source_prepare",
   "source_analysis",
-  "source_quality_check",
   "source_aggregate",
   "content_analysis",
   "candidate_refine",
@@ -54,7 +53,6 @@ const HIGHLIGHT_REASSEMBLY_STEPS = [
 const UNIFIED_HIGHLIGHT_REASSEMBLY_STEPS = [
   "source_prepare",
   "source_analysis",
-  "source_quality_check",
   "source_aggregate",
   "video_understanding",
   "highlight_detection",
@@ -1644,6 +1642,29 @@ function jobStatusLabel(status) {
 function stepNote(step, item = {}) {
   if (!item) return "";
 
+  if (step === "source_analysis") {
+    const completed = Number(item.completed_sources || 0);
+    const total = Number(item.total_sources || 0);
+    const success = Number(item.success_count || 0);
+    const failed = Number(item.failed_count || 0);
+    const running = Number(item.running_count || 0);
+
+    if (total) {
+      const activeSources = (item.source_progress || [])
+        .filter((source) => source.status === "running")
+        .slice(0, 2)
+        .map((source) => {
+          const name = source.display_name || source.source_id || "素材";
+          const stage = source.current_stage ? `：${stepLabel(source.current_stage)}` : "";
+          const message = source.message ? ` ${source.message}` : "";
+          return `${name}${stage}${message}`;
+        });
+
+      const activeText = activeSources.length ? `；${activeSources.join("；")}` : "";
+      return `按源分析 ${completed}/${total}，成功 ${success}，失败 ${failed}，运行 ${running}${activeText}`;
+    }
+  }
+
   if (step === "vision" && item.summary) {
     const s = item.summary || {};
     const total = Number(s.total_chunks || 0);
@@ -2121,6 +2142,8 @@ function renderJobError(manifest, visibleEntries) {
   if (!box || !msgBox) return;
 
   const failedEntry = visibleEntries.find(([, item]) => item.status === "failed");
+  const wrapperError = manifest.common_wrapper_error || null;
+  const wrapperFailedStep = wrapperError?.failed_step || "source_analysis";
   if (failedEntry) {
     const [stepName, item] = failedEntry;
     const rawError = item.error || item.reason || manifest.user_message || "";
@@ -2140,6 +2163,30 @@ function renderJobError(manifest, visibleEntries) {
     `;
     box.querySelector(".rerun-btn")?.addEventListener("click", () => {
       rerunFromSuggestedStep(explained.rerunStep);
+    });
+    box.classList.remove("hidden");
+    msgBox.classList.add("hidden");
+  } else if (wrapperError || manifest.status === "failed") {
+    const stepName = wrapperFailedStep;
+    const rawError = wrapperError?.message || manifest.user_message || "任务失败，但没有记录到具体失败步骤。";
+    const explained = explainStepError(stepName, rawError);
+
+    box.innerHTML = `
+      <strong>${escapeHtml(explained.title)}</strong>
+      <p>${escapeHtml(explained.message)}</p>
+      <p>${escapeHtml(explained.suggestion)}</p>
+      <div class="error-actions">
+        <button class="button primary rerun-btn" type="button">
+          从 ${escapeHtml(stepLabel(stepName))} 重新运行
+        </button>
+      </div>
+      <details>
+        <summary>查看技术详情</summary>
+        <pre>${escapeHtml(rawError)}</pre>
+      </details>
+    `;
+    box.querySelector(".rerun-btn")?.addEventListener("click", () => {
+      rerunFromSuggestedStep(stepName);
     });
     box.classList.remove("hidden");
     msgBox.classList.add("hidden");

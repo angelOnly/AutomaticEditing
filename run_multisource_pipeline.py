@@ -27,11 +27,10 @@ from newsclip_agent.workflow_registry import (
 )
 
 COMMON_REUSABLE_STEPS = UNIFIED_SOURCE_COMMON_REUSABLE_STEPS
-COMMON_PROGRESS_STEPS = ["source_prepare"] + COMMON_REUSABLE_STEPS
+COMMON_PROGRESS_STEPS = list(dict.fromkeys(["source_prepare"] + COMMON_REUSABLE_STEPS))
 LEGACY_COMMON_REUSABLE_STEPS = LEGACY_SINGLE_COMMON_REUSABLE_STEPS
 COMMON_STEP_OUTPUT_FILES = {
     "source_analysis": "source_analysis.json",
-    "source_quality_check": "source_quality_check.json",
     "source_aggregate": "source_aggregate.json",
 }
 
@@ -87,6 +86,9 @@ def _sync_common_progress_to_child(
 
     if "current_versions" in common_manifest:
         child_manifest.setdefault("current_versions", {}).update(common_manifest["current_versions"])
+
+    if common_manifest.get("common_wrapper_error"):
+        child_manifest["common_wrapper_error"] = common_manifest["common_wrapper_error"]
 
     if common_manifest.get("status") == "failed":
         child_manifest["status"] = "failed"
@@ -301,7 +303,9 @@ def _ensure_common_analysis(*, common_dir: Path, request: dict[str, Any], args: 
             result = pipeline_main(pipeline_args)
             _append_common_log(common_dir, f"common pipeline finished with return code {result}")
             if result != 0:
-                raise RuntimeError(f"common analysis failed with return code {result}")
+                failed_step, detail = _find_failed_common_step(common_dir)
+                _mark_common_failed(common_dir, detail, failed_step=failed_step)
+                raise RuntimeError(f"common analysis failed at {failed_step}: {detail}")
 
             if not _common_analysis_ready(common_dir):
                 _repair_common_manifest_from_outputs(common_dir)
@@ -323,15 +327,21 @@ def _ensure_common_analysis(*, common_dir: Path, request: dict[str, Any], args: 
                     }
                     for step in COMMON_REUSABLE_STEPS
                 }
-                raise RuntimeError(
+                failed_step = not_ready_steps[0] if not_ready_steps else "source_analysis"
+                message = (
                     "common analysis finished but reusable common steps are not ready; "
                     f"not_ready_steps={not_ready_steps}; "
                     f"debug={json.dumps(debug, ensure_ascii=False)}"
                 )
+                _mark_common_failed(common_dir, message, failed_step=failed_step)
+                raise RuntimeError(message)
             _append_common_log(common_dir, "common analysis ready")
         except Exception as exc:
             _append_common_log(common_dir, f"common analysis failed: {exc}")
-            _mark_common_failed(common_dir, str(exc))
+            wrapper_error = read_json(common_dir / "manifest.json", {}).get("common_wrapper_error") or {}
+            if not wrapper_error:
+                failed_step, detail = _find_failed_common_step(common_dir)
+                _mark_common_failed(common_dir, detail or str(exc), failed_step=failed_step)
             raise
 
 
@@ -366,6 +376,9 @@ def _common_step_ready(common_dir: Path, step: str) -> bool:
     manifest = read_json(common_dir / "manifest.json", {})
     steps = manifest.get("steps", {}) or {}
     item = steps.get(step, {}) or {}
+
+    if step == "source_prepare":
+        return item.get("status") in {"success", "partial_success", "skipped"}
 
     if item.get("status") in {"success", "partial_success", "skipped"}:
         output = str(item.get("output") or "").strip()
@@ -430,10 +443,55 @@ def _repair_common_manifest_from_outputs(common_dir: Path) -> None:
     write_json(manifest_path, manifest)
 
 
-def _mark_common_failed(common_dir: Path, message: str) -> None:
+def _find_failed_common_step(common_dir: Path) -> tuple[str, str]:
+    manifest = read_json(common_dir / "manifest.json", {})
+    steps = manifest.get("steps", {}) or {}
+
+    for step in COMMON_REUSABLE_STEPS:
+        item = steps.get(step) or {}
+        if item.get("status") == "failed":
+            return step, str(
+                item.get("error")
+                or item.get("reason")
+                or manifest.get("user_message")
+                or f"{step} failed"
+            )
+
+    source_analysis = steps.get("source_analysis") or {}
+    output = source_analysis.get("output")
+    if output:
+        analysis = read_json(common_dir / output, {})
+        for failure in analysis.get("failed_sources") or []:
+            if isinstance(failure, dict):
+                msg = failure.get("error") or failure.get("reason") or "source analysis failed"
+                return "source_analysis", str(msg)
+
+    source_analysis_dir = _latest_version_dir(common_dir / "source_analysis")
+    if source_analysis_dir:
+        for status_path in sorted(source_analysis_dir.glob("source_*/source_status.json")):
+            source_status = read_json(status_path, {})
+            if source_status.get("status") == "failed":
+                msg = (
+                    source_status.get("error")
+                    or source_status.get("reason")
+                    or "source analysis failed"
+                )
+                return "source_analysis", str(msg)
+
+    for step in COMMON_REUSABLE_STEPS:
+        item = steps.get(step) or {}
+        if item.get("status") == "running":
+            return step, str(manifest.get("user_message") or f"{step} interrupted or failed")
+
+    return "source_analysis", str(manifest.get("user_message") or "common analysis failed")
+
+
+def _mark_common_failed(common_dir: Path, message: str, failed_step: str | None = None) -> None:
     manifest_path = common_dir / "manifest.json"
     manifest = read_json(manifest_path, {})
     now = datetime.now().isoformat(timespec="seconds")
+    failed_step = failed_step or (manifest.get("common_wrapper_error") or {}).get("failed_step") or "source_analysis"
+
     manifest.setdefault("task_id", common_dir.name)
     manifest.setdefault("created_at", now)
     manifest["updated_at"] = now
@@ -441,10 +499,23 @@ def _mark_common_failed(common_dir: Path, message: str) -> None:
     manifest["user_message"] = message
     manifest.setdefault("steps", {})
 
-    # 不覆盖已成功步骤，只补一个 wrapper 错误信息
+    step_item = dict(manifest["steps"].get(failed_step) or {})
+    if step_item.get("status") not in {"success", "partial_success", "skipped"}:
+        step_item.update({
+            "step_name": failed_step,
+            "status": "failed",
+            "error": message,
+            "updated_at": now,
+            "can_rerun": True,
+            "common_progress": True,
+            "common_task_id": common_dir.name,
+        })
+        manifest["steps"][failed_step] = step_item
+
     manifest["common_wrapper_error"] = {
         "status": "failed",
         "message": message,
+        "failed_step": failed_step,
         "updated_at": now,
     }
 
@@ -483,6 +554,9 @@ def _copy_common_outputs_to_task(*, common_dir: Path, task_dir: Path, request: d
 
     if "current_versions" in common_manifest:
         manifest.setdefault("current_versions", {}).update(common_manifest["current_versions"])
+
+    if common_manifest.get("common_wrapper_error"):
+        manifest["common_wrapper_error"] = common_manifest["common_wrapper_error"]
 
     manifest["reused_common_steps"] = COMMON_REUSABLE_STEPS
     manifest.setdefault("steps", {})
