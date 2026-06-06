@@ -228,6 +228,28 @@ def test_refresh_job_marks_orphaned_running_job_failed(tmp_path, monkeypatch) ->
     assert saved_jobs[-1]["status"] == "failed"
 
 
+def test_refresh_job_keeps_queued_pending_job_pending(tmp_path, monkeypatch) -> None:
+    task_dir = tmp_path / "task_pending"
+    task_dir.mkdir()
+    monkeypatch.setattr(web_app, "OUTPUTS_DIR", tmp_path)
+    monkeypatch.setattr(web_app, "PENDING_JOB_IDS", deque(["job_pending"]))
+    monkeypatch.setattr(web_app, "_pid_exists", lambda _pid: False)
+    monkeypatch.setattr(web_app, "JOBS", {
+        "job_pending": {
+            "job_id": "job_pending",
+            "task_id": "task_pending",
+            "status": "pending",
+            "pid": None,
+            "log_path": str(tmp_path / "missing.log"),
+        }
+    })
+
+    public = web_app._refresh_job("job_pending")
+
+    assert public["status"] == "pending"
+    assert web_app.JOBS["job_pending"]["status"] == "pending"
+
+
 def test_cancel_job_clears_orphaned_running_job(tmp_path, monkeypatch) -> None:
     task_dir = tmp_path / "task_orphan"
     task_dir.mkdir()

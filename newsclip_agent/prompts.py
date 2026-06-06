@@ -29,6 +29,8 @@ ASR_EVENT_CANDIDATE_PROMPT = _load_prompt("asr_event_candidate.txt")
 SHORT_VIDEO_EDIT_PLAN_TEXT_PROMPT = _load_prompt("short_video_edit_plan_text.txt")
 # AI 配音文案：根据短视频 shots 生成 narration_text 和分段文案。
 VOICEOVER_SCRIPT_TEXT_PROMPT = _load_prompt("voiceover_script_text.txt")
+# AI 配音局部修复：只修复 TTS 时长过长或过短的 narration_segments。
+VOICEOVER_REPAIR_TEXT_PROMPT = _load_prompt("voiceover_repair_text.txt")
 # 原声高光重组：从候选 clips 中决定每条原声视频的 clip 顺序。
 HIGHLIGHT_REASSEMBLY_TEXT_PROMPT = _load_prompt("highlight_reassembly_text.txt")
 # 候选片段轻量复核：只判断保留 clip_id 和建议合并组。

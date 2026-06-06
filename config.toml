@@ -141,6 +141,12 @@ max_long_video_seconds = 90
 
 [voiceover]
 chars_per_second = 4.2
+default_target_duration_seconds = 60
+voiceover_chars_per_second = 4.8
+voiceover_min_chars_per_second = 3.8
+voiceover_max_chars_per_second = 5.8
+shot_min_text_chars = 10
+shot_max_text_chars = 90
 default_original_audio_volume = 0.0
 evidence_original_audio_volume = 1.0
 background_original_audio_volume = 0.08
@@ -175,6 +181,13 @@ tts_actual_chars_per_second = 5.2
 compact_min_target_ratio = 0.58
 compact_duration_tolerance_seconds = 10.0
 compact_severe_short_ratio = 0.58
+enable_tts_duration_repair = true
+max_tts_repair_rounds = 2
+tts_segment_ok_min_ratio = 0.75
+tts_segment_ok_max_ratio = 1.25
+tts_segment_hard_min_ratio = 0.55
+tts_segment_hard_max_ratio = 1.60
+max_audio_speedup = 1.08
 long_source_threshold_seconds = 600
 long_source_min_total_output_seconds = 90
 long_source_preferred_total_output_seconds = 150

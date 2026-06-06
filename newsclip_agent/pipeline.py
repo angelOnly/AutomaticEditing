@@ -2524,6 +2524,7 @@ class PipelineRunner:
             final_output = self._load_step_json("voiceover_script")
             self._normalize_voiceover_scripts(final_output)
             self._attach_voiceover_script_timings(final_output, edit_plan)
+            self._validate_voiceover_script_against_editing_structure(final_output, edit_plan)
             self._validate_voiceover_script_duration_or_raise(final_output)
             self._enforce_long_video_confirmation_after_voiceover(final_output)
             return
@@ -2577,6 +2578,7 @@ class PipelineRunner:
         )
         self._normalize_voiceover_scripts(final_output)
         self._attach_voiceover_script_timings(final_output, edit_plan)
+        self._validate_voiceover_script_against_editing_structure(final_output, edit_plan)
         self._validate_voiceover_script_duration_or_raise(final_output)
         self._enforce_long_video_confirmation_after_voiceover(final_output)
 
@@ -3052,7 +3054,19 @@ class PipelineRunner:
         for video_index, video in enumerate(raw_videos, start=1):
             if not isinstance(video, dict):
                 continue
-            clip_ids = self._coerce_id_list(video.get("clip_ids") or video.get("source_clip_ids"))
+            selected_clip_meta: dict[str, dict[str, Any]] = {}
+            selected_clips_raw = video.get("selected_clips")
+            if isinstance(selected_clips_raw, list) and selected_clips_raw:
+                clip_ids = []
+                for item in selected_clips_raw:
+                    if not isinstance(item, dict):
+                        continue
+                    clip_id = str(item.get("clip_id") or item.get("source_clip_id") or "").strip()
+                    if clip_id:
+                        clip_ids.append(clip_id)
+                        selected_clip_meta[clip_id] = item
+            else:
+                clip_ids = self._coerce_id_list(video.get("clip_ids") or video.get("source_clip_ids"))
             selected = [clips_by_id[cid] for cid in clip_ids if cid in clips_by_id]
             if not selected:
                 continue
@@ -3072,6 +3086,15 @@ class PipelineRunner:
                 local_end = seconds_to_timecode(end, ms=True)
                 visual = str(clip.get("visual") or clip.get("visual_summary") or "").strip()
                 fact = str(clip.get("summary") or clip.get("speech") or clip.get("clip_type") or "").strip()
+                clip_meta = selected_clip_meta.get(source_clip_id, {})
+                section = str(clip_meta.get("section") or clip.get("section") or ("hook" if shot_index == 1 else "evidence")).strip()
+                narration_intent = str(
+                    clip_meta.get("narration_intent")
+                    or clip.get("narration_intent")
+                    or clip.get("role")
+                    or fact
+                    or visual
+                ).strip()
                 editing_structure.append({
                     "order": shot_index,
                     "shot_id": f"{short_video_id}_s{shot_index:02d}",
@@ -3088,14 +3111,19 @@ class PipelineRunner:
                     "source_start_seconds": round(start, 3),
                     "source_end_seconds": round(end, 3),
                     "duration_seconds": round(duration, 3),
+                    "section": section,
                     "visual": visual,
+                    "visual_summary": visual,
                     "fact": fact,
                     "news_fact_to_explain": fact,
+                    "narration_intent": narration_intent,
                     "purpose": "evidence_visual" if shot_index > 1 else "opening_hook",
                     "must_say_facts": must_keep if shot_index == 1 else [],
                 })
             visual_total = editing_structure_duration(editing_structure)
-            target_duration = round(visual_total or float(self.options.target_duration_seconds or self.duration_settings.default_target_seconds), 3)
+            target_duration = round(self._resolve_voiceover_target_duration(visual_total, video), 3)
+            editing_structure = self._assign_shot_duration_budget(editing_structure, target_duration)
+            editing_structure = self._attach_voiceover_char_budget(editing_structure)
             max_allowed = max(target_duration, float(self.options.max_output_video_seconds or target_duration))
             scripts.append({
                 "short_video_id": short_video_id,
@@ -3104,7 +3132,7 @@ class PipelineRunner:
                 "video_type": "解说型",
                 "target_duration_seconds": target_duration,
                 "max_allowed_seconds": round(max_allowed, 3),
-                "visual_total_seconds": target_duration,
+                "visual_total_seconds": round(editing_structure_duration(editing_structure), 3),
                 "source_clip_ids": source_clip_ids,
                 "must_keep_fact_points": must_keep,
                 "voiceover_brief": news_angle,
@@ -3121,6 +3149,123 @@ class PipelineRunner:
             "materialized_by_code": True,
             "raw_model_plan": result,
         }
+
+    def _first_number(self, *values: Any) -> float | None:
+        for value in values:
+            if value in (None, ""):
+                continue
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(number):
+                return number
+        return None
+
+    def _timecode_field_seconds(self, seg: dict[str, Any], *keys: str) -> float | None:
+        for key in keys:
+            value = seg.get(key)
+            if value in (None, ""):
+                continue
+            try:
+                seconds = timecode_to_seconds(value)
+            except Exception:
+                continue
+            if seconds > 0 or str(value).strip() in {"0", "0.0", "00:00:00", "00:00:00.000"}:
+                return float(seconds)
+        return None
+
+    def _segment_start_end_seconds(self, seg: dict[str, Any]) -> tuple[float | None, float | None]:
+        start = self._first_number(
+            seg.get("source_start_seconds"),
+            seg.get("local_start_seconds"),
+            seg.get("start_seconds"),
+        )
+        end = self._first_number(
+            seg.get("source_end_seconds"),
+            seg.get("local_end_seconds"),
+            seg.get("end_seconds"),
+        )
+        if start is None:
+            start = self._timecode_field_seconds(seg, "source_start", "local_start", "start")
+        if end is None:
+            end = self._timecode_field_seconds(seg, "source_end", "local_end", "end")
+        duration = self._first_number(seg.get("duration_seconds"))
+        if start is not None and (end is None or end <= start) and duration and duration > 0:
+            end = start + duration
+        return start, end
+
+    def _resolve_voiceover_target_duration(self, visual_total: float, plan: dict[str, Any] | None = None) -> float:
+        plan = plan or {}
+        for value in (
+            self._first_number(getattr(self.options, "target_duration_seconds", None)),
+            self._first_number(getattr(self.options, "max_output_video_seconds", None)),
+            self._first_number(plan.get("target_duration_seconds")),
+        ):
+            if value and value > 0:
+                return value
+        voice_cfg = self.config.raw.get("voiceover", {}) if hasattr(self, "config") else {}
+        default_target = self._first_number(voice_cfg.get("default_target_duration_seconds"))
+        if not default_target or default_target <= 0:
+            default_target = float(getattr(self.duration_settings, "default_target_seconds", 60.0) or 60.0)
+        if visual_total <= 0:
+            return default_target
+        return min(float(visual_total), float(default_target))
+
+    def _assign_shot_duration_budget(self, editing_structure: list[dict[str, Any]], target_duration: float) -> list[dict[str, Any]]:
+        if not editing_structure:
+            return []
+        items: list[dict[str, Any]] = []
+        total_available = 0.0
+        for seg in editing_structure:
+            item = dict(seg)
+            start, end = self._segment_start_end_seconds(item)
+            available = max(0.0, float(end - start)) if start is not None and end is not None else 0.0
+            if start is not None:
+                item["source_start_seconds"] = round(float(start), 3)
+                item.setdefault("source_start", seconds_to_timecode(float(start), ms=True))
+            if end is not None:
+                item["source_end_seconds"] = round(float(end), 3)
+                item.setdefault("source_end", seconds_to_timecode(float(end), ms=True))
+            item["available_duration_seconds"] = round(available, 3)
+            items.append(item)
+            total_available += available
+        if total_available <= 0:
+            return items
+        target_duration = max(0.0, float(target_duration or 0.0)) or total_available
+        for item in items:
+            available = float(item.get("available_duration_seconds") or 0.0)
+            if available <= 0:
+                continue
+            shot_target = min(available, max(3.0, target_duration * (available / total_available)))
+            min_d = min(available, max(1.0, shot_target * 0.65))
+            max_d = min(available, max(min_d, shot_target * 1.35))
+            item["target_duration_seconds"] = round(shot_target, 3)
+            item["min_duration_seconds"] = round(min_d, 3)
+            item["max_duration_seconds"] = round(max_d, 3)
+            item.setdefault("allow_trim", True)
+            item.setdefault("allow_extend", True)
+        return items
+
+    def _attach_voiceover_char_budget(self, editing_structure: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        voice_cfg = self.config.raw.get("voiceover", {}) if hasattr(self, "config") else {}
+        cps = float(voice_cfg.get("voiceover_chars_per_second") or voice_cfg.get("chars_per_second") or 4.8)
+        min_cps = float(voice_cfg.get("voiceover_min_chars_per_second") or 3.8)
+        max_cps = float(voice_cfg.get("voiceover_max_chars_per_second") or 5.8)
+        global_min = int(voice_cfg.get("shot_min_text_chars") or 10)
+        global_max = int(voice_cfg.get("shot_max_text_chars") or 90)
+        result: list[dict[str, Any]] = []
+        for seg in editing_structure:
+            item = dict(seg)
+            target = float(item.get("target_duration_seconds") or item.get("duration_seconds") or 5.0)
+            min_chars = max(global_min, int(target * min_cps))
+            target_chars = max(global_min, int(target * cps))
+            max_chars = min(global_max, max(min_chars + 4, int(target * max_cps)))
+            item["narration_min_chars"] = min_chars
+            item["narration_target_chars"] = target_chars
+            item["narration_max_chars"] = max_chars
+            result.append(item)
+        return result
 
     def _materialize_highlight_reassembly_plan(self, result: Any) -> dict[str, Any]:
         if isinstance(result, list):
@@ -3737,7 +3882,15 @@ class PipelineRunner:
         lines.append("shots：")
         for shot in script.get("editing_structure") or []:
             if isinstance(shot, dict):
-                lines.append(f"- shot_id={shot.get('shot_id') or ''} 时长={shot.get('duration_seconds') or ''} 画面={shot.get('visual') or ''} 事实={shot.get('fact') or shot.get('news_fact_to_explain') or shot.get('editing_note') or ''}")
+                lines.append(
+                    f"- shot_id={shot.get('shot_id') or ''} "
+                    f"target={shot.get('target_duration_seconds') or shot.get('duration_seconds') or ''}s "
+                    f"chars={shot.get('narration_min_chars') or ''}/{shot.get('narration_target_chars') or ''}/{shot.get('narration_max_chars') or ''} "
+                    f"section={shot.get('section') or ''} "
+                    f"visual={shot.get('visual_summary') or shot.get('visual') or ''} "
+                    f"fact={shot.get('fact') or shot.get('news_fact_to_explain') or shot.get('editing_note') or ''} "
+                    f"narration_intent={shot.get('narration_intent') or ''}"
+                )
         return "\n".join(lines)
 
     def _fallback_voiceover_script(self, script: dict[str, Any], short_video_id: str) -> dict[str, Any]:
@@ -3825,6 +3978,75 @@ class PipelineRunner:
                     segment[key] = timing[key]
                     changed = True
         return changed
+
+    def _validate_voiceover_script_against_editing_structure(
+        self,
+        voiceover_output: dict[str, Any],
+        edit_plan: dict[str, Any],
+    ) -> dict[str, Any]:
+        voice_scripts = voiceover_output.get("scripts", []) if isinstance(voiceover_output, dict) else []
+        edit_scripts = edit_plan.get("scripts", []) if isinstance(edit_plan, dict) else []
+        edit_by_id = {
+            str(script.get("short_video_id")): script
+            for script in edit_scripts
+            if isinstance(script, dict) and script.get("short_video_id")
+        }
+        checks: list[dict[str, Any]] = []
+        hard_issues: list[str] = []
+        for index, voice_script in enumerate(voice_scripts):
+            if not isinstance(voice_script, dict):
+                continue
+            sid = str(voice_script.get("short_video_id") or f"v_{index + 1:03d}")
+            edit_script = edit_by_id.get(sid)
+            if edit_script is None and index < len(edit_scripts) and isinstance(edit_scripts[index], dict):
+                edit_script = edit_scripts[index]
+            shots = [shot for shot in (edit_script or {}).get("editing_structure", []) if isinstance(shot, dict)]
+            segments = [seg for seg in voice_script.get("narration_segments", []) if isinstance(seg, dict)]
+            shot_ids = [str(shot.get("shot_id") or "") for shot in shots if shot.get("shot_id")]
+            segment_ids = [str(seg.get("shot_id") or "") for seg in segments if seg.get("shot_id")]
+            missing = [shot_id for shot_id in shot_ids if shot_id not in segment_ids]
+            extra = [shot_id for shot_id in segment_ids if shot_id not in shot_ids]
+            empty_text = [str(seg.get("shot_id") or "") for seg in segments if not str(seg.get("text") or "").strip()]
+            char_issues: list[dict[str, Any]] = []
+            shot_by_id = {str(shot.get("shot_id")): shot for shot in shots if shot.get("shot_id")}
+            for seg in segments:
+                shot_id = str(seg.get("shot_id") or "")
+                shot = shot_by_id.get(shot_id)
+                if not shot:
+                    continue
+                text_chars = len(re.sub(r"\s+", "", str(seg.get("text") or "")))
+                min_chars = self._first_number(shot.get("narration_min_chars"))
+                max_chars = self._first_number(shot.get("narration_max_chars"))
+                if min_chars is not None and text_chars < min_chars:
+                    char_issues.append({"shot_id": shot_id, "chars": text_chars, "min_chars": int(min_chars), "type": "too_short"})
+                if max_chars is not None and text_chars > max_chars:
+                    char_issues.append({"shot_id": shot_id, "chars": text_chars, "max_chars": int(max_chars), "type": "too_long"})
+            ok = not missing and not extra and not empty_text and not char_issues and len(segments) == len(shots)
+            check = {
+                "short_video_id": sid,
+                "ok": ok,
+                "shot_count": len(shots),
+                "segment_count": len(segments),
+                "missing_shot_ids": missing,
+                "extra_shot_ids": extra,
+                "empty_text_shot_ids": empty_text,
+                "char_budget_issues": char_issues,
+            }
+            checks.append(check)
+            if not ok:
+                hard_issues.append(
+                    f"{sid}: shot/voiceover mismatch "
+                    f"(shots={len(shots)}, segments={len(segments)}, missing={missing}, extra={extra}, empty={empty_text}, char_issues={len(char_issues)})"
+                )
+        result = {"ok": not hard_issues, "checks": checks}
+        if hasattr(self, "task_dir"):
+            write_json(self.task_dir / "voiceover_alignment_check.json", result)
+        if hard_issues:
+            raise RuntimeError(
+                "AI voiceover script does not match editing_structure; blocked before TTS:\n"
+                + "\n".join(f"- {issue}" for issue in hard_issues)
+            )
+        return result
 
     def _build_voiceover_quality_check_text(self, script: dict[str, Any], plan_item: dict[str, Any]) -> str:
         lines = [
@@ -4413,6 +4635,7 @@ class PipelineRunner:
             "voice_id": voice_config.get("voice_id", ""),
             "voice_name": voice_config.get("voice_name", ""),
         })
+        self._build_tts_duration_reconcile(editing, voiceover, {"outputs": outputs})
         failed = sum(1 for item in outputs if item.get("status") == "failed")
         success = sum(1 for item in outputs if item.get("status") == "success")
         tts_is_hard_required = self.options.require_tts and self.options.audio_policy in {"ai_voiceover", "mixed"}
@@ -4429,6 +4652,76 @@ class PipelineRunner:
         print(f"完成: tts ({overall_status})")
         if overall_status == "failed":
             raise RuntimeError("TTS 失败且 require_tts=true，已阻断后续 cut_plan/render")
+
+    def _build_tts_duration_reconcile(
+        self,
+        editing: dict[str, Any],
+        voiceover: dict[str, Any],
+        tts: dict[str, Any],
+    ) -> dict[str, Any]:
+        edit_scripts = editing.get("scripts", []) if isinstance(editing, dict) else []
+        voice_scripts = voiceover.get("scripts", []) if isinstance(voiceover, dict) else []
+        tts_outputs = tts.get("outputs", []) if isinstance(tts, dict) else []
+        voice_by_id = {str(item.get("short_video_id")): item for item in voice_scripts if isinstance(item, dict) and item.get("short_video_id")}
+        tts_by_id = {str(item.get("short_video_id")): item for item in tts_outputs if isinstance(item, dict) and item.get("short_video_id")}
+        voice_cfg = self.config.raw.get("voiceover", {}) if hasattr(self, "config") else {}
+        ok_min = float(voice_cfg.get("tts_segment_ok_min_ratio") or 0.75)
+        ok_max = float(voice_cfg.get("tts_segment_ok_max_ratio") or 1.25)
+        hard_min = float(voice_cfg.get("tts_segment_hard_min_ratio") or 0.55)
+        hard_max = float(voice_cfg.get("tts_segment_hard_max_ratio") or 1.60)
+        videos: list[dict[str, Any]] = []
+        for index, edit_script in enumerate(edit_scripts):
+            if not isinstance(edit_script, dict):
+                continue
+            sid = str(edit_script.get("short_video_id") or f"v_{index + 1:03d}")
+            voice_script = voice_by_id.get(sid, {})
+            tts_item = tts_by_id.get(sid, {})
+            tts_segments = tts_item.get("segments", []) if isinstance(tts_item.get("segments"), list) else []
+            tts_by_shot = {str(seg.get("shot_id")): seg for seg in tts_segments if isinstance(seg, dict) and seg.get("shot_id")}
+            voice_segments = voice_script.get("narration_segments", []) if isinstance(voice_script.get("narration_segments"), list) else []
+            voice_by_shot = {str(seg.get("shot_id")): seg for seg in voice_segments if isinstance(seg, dict) and seg.get("shot_id")}
+            segment_checks: list[dict[str, Any]] = []
+            for shot in edit_script.get("editing_structure", []) or []:
+                if not isinstance(shot, dict):
+                    continue
+                shot_id = str(shot.get("shot_id") or "")
+                target = float(shot.get("target_duration_seconds") or shot.get("duration_seconds") or 0)
+                min_d = float(shot.get("min_duration_seconds") or (target * 0.65 if target else 0))
+                max_d = float(shot.get("max_duration_seconds") or (target * 1.35 if target else 0))
+                tts_seg = tts_by_shot.get(shot_id)
+                actual = float((tts_seg or {}).get("actual_duration_seconds") or 0)
+                if not tts_seg or actual <= 0:
+                    status = "missing_tts"
+                elif min_d and actual < min_d:
+                    status = "too_short"
+                elif max_d and actual > max_d:
+                    status = "too_long"
+                elif target and actual / target < ok_min:
+                    status = "slightly_short"
+                elif target and actual / target > ok_max:
+                    status = "slightly_long"
+                else:
+                    status = "ok"
+                hard = bool(target and actual > 0 and (actual / target < hard_min or actual / target > hard_max)) or status == "missing_tts"
+                segment_checks.append({
+                    "shot_id": shot_id,
+                    "status": status,
+                    "hard": hard,
+                    "target_duration_seconds": round(target, 3),
+                    "min_duration_seconds": round(min_d, 3),
+                    "max_duration_seconds": round(max_d, 3),
+                    "tts_actual_duration_seconds": round(actual, 3),
+                    "text_chars": len(re.sub(r"\s+", "", str((voice_by_shot.get(shot_id) or {}).get("text") or ""))),
+                })
+            videos.append({
+                "short_video_id": sid,
+                "ok": all(seg.get("status") in {"ok", "slightly_short", "slightly_long"} for seg in segment_checks),
+                "segments": segment_checks,
+            })
+        result = {"ok": all(video.get("ok") for video in videos), "videos": videos}
+        if hasattr(self, "task_dir"):
+            write_json(self.task_dir / "tts_duration_reconcile.json", result)
+        return result
 
     def _voiceover_segments_for_tts(self, script: dict[str, Any]) -> list[dict[str, Any]]:
         raw_segments = script.get("narration_segments")
@@ -4650,6 +4943,92 @@ class PipelineRunner:
         self._record_step(step="subtitles", version=version, status="success", output=relpath(out_index, self.task_dir), input_hash=input_hash, output_files=[out_index])
         print("完成: subtitles")
 
+    def _compact_debug_segment(self, seg: dict[str, Any]) -> dict[str, Any]:
+        keys = (
+            "shot_id",
+            "source_id",
+            "source_start",
+            "source_end",
+            "source_start_seconds",
+            "source_end_seconds",
+            "local_start",
+            "local_end",
+            "local_start_seconds",
+            "local_end_seconds",
+            "start",
+            "end",
+            "duration_seconds",
+        )
+        return {key: seg.get(key) for key in keys if key in seg}
+
+    def _build_clips_from_editing_structure(self, editing_structure: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        clips: list[dict[str, Any]] = []
+        invalid: list[dict[str, Any]] = []
+        cursor = 0.0
+        for index, seg in enumerate(editing_structure or []):
+            if not isinstance(seg, dict):
+                invalid.append({"index": index, "reason": "not_object"})
+                continue
+            start, end = self._segment_start_end_seconds(seg)
+            if start is None or end is None:
+                invalid.append({
+                    "index": index,
+                    "shot_id": seg.get("shot_id"),
+                    "reason": "missing_start_or_end",
+                    "segment": self._compact_debug_segment(seg),
+                })
+                continue
+            duration = float(end - start)
+            if duration <= 0:
+                invalid.append({
+                    "index": index,
+                    "shot_id": seg.get("shot_id"),
+                    "reason": "end_lte_start",
+                    "start": start,
+                    "end": end,
+                })
+                continue
+            target_duration = float(seg.get("target_duration_seconds") or seg.get("duration_seconds") or duration)
+            target_duration = min(max(0.0, target_duration), duration)
+            if target_duration <= 0:
+                invalid.append({
+                    "index": index,
+                    "shot_id": seg.get("shot_id"),
+                    "reason": "target_duration_lte_zero",
+                    "target_duration_seconds": target_duration,
+                })
+                continue
+            audio_mode = seg.get("audio_mode") or ("mixed_evidence" if seg.get("original_audio_required") else "ai_voiceover")
+            clip = {
+                "shot_id": seg.get("shot_id", ""),
+                "source_id": seg.get("source_id", ""),
+                "source_index": seg.get("source_index", ""),
+                "source_start": seconds_to_timecode(start, ms=True),
+                "source_end": seconds_to_timecode(start + target_duration, ms=True),
+                "source_start_seconds": round(start, 3),
+                "source_end_seconds": round(start + target_duration, 3),
+                "source_max_end_seconds": round(end, 3),
+                "target_start": seconds_to_timecode(cursor, ms=True),
+                "target_start_seconds": round(cursor, 3),
+                "target_end_seconds": round(cursor + target_duration, 3),
+                "duration_seconds": round(target_duration, 3),
+                "target_duration_seconds": round(target_duration, 3),
+                "min_duration_seconds": seg.get("min_duration_seconds"),
+                "max_duration_seconds": seg.get("max_duration_seconds"),
+                "purpose": seg.get("purpose", ""),
+                "audio_mode": audio_mode,
+                "original_audio_reason": seg.get("original_audio_reason") or seg.get("visual_selection_reason") or seg.get("editing_note") or "",
+                "original_audio_policy": seg.get("original_audio_policy", ""),
+                "original_audio_type": seg.get("original_audio_type", ""),
+                "original_audio_value_score": seg.get("original_audio_value_score", ""),
+                "original_audio_complete_unit": seg.get("original_audio_complete_unit", ""),
+                "original_audio_transcript_summary": seg.get("original_audio_transcript_summary", ""),
+                "crop_mode": "fit_blur" if self.options.aspect_ratio == "9:16" else "original",
+            }
+            clips.append(clip)
+            cursor += target_duration
+        return clips, invalid
+
     def step_cut_plan(self) -> None:
         editing = self._load_step_json("editing_script")
         voiceover_script = self._load_step_json("voiceover_script")
@@ -4696,32 +5075,21 @@ class PipelineRunner:
             warnings: list[str] = []
             repair_reasons: list[str] = []
             voiceover_duration = float(tts_item.get("actual_duration_seconds") or script.get("estimated_total_duration_seconds") or validation["video_duration_seconds"])
-            for seg in script.get("editing_structure", []):
-                start = timecode_to_seconds(seg.get("source_start"))
-                end = timecode_to_seconds(seg.get("source_end"))
-                if end <= start:
-                    continue
-                clip_duration = end - start
-                audio_mode = seg.get("audio_mode") or ("mixed_evidence" if seg.get("original_audio_required") else "ai_voiceover")
-                raw_clip = {
-                    "shot_id": seg.get("shot_id", ""),
-                    "source_id": seg.get("source_id", ""),
-                    "source_index": seg.get("source_index", ""),
-                    "source_start": seconds_to_timecode(start, ms=True),
-                    "source_end": seconds_to_timecode(end, ms=True),
-                    "target_start": seconds_to_timecode(target, ms=True),
-                    "duration_seconds": round(clip_duration, 3),
-                    "purpose": seg.get("purpose", ""),
-                    "audio_mode": audio_mode,
-                    "original_audio_reason": seg.get("original_audio_reason") or seg.get("visual_selection_reason") or seg.get("editing_note") or "",
-                    "original_audio_policy": seg.get("original_audio_policy", ""),
-                    "original_audio_type": seg.get("original_audio_type", ""),
-                    "original_audio_value_score": seg.get("original_audio_value_score", ""),
-                    "original_audio_complete_unit": seg.get("original_audio_complete_unit", ""),
-                    "original_audio_transcript_summary": seg.get("original_audio_transcript_summary", ""),
-                    "crop_mode": "fit_blur" if self.options.aspect_ratio == "9:16" else "original",
-                }
-                normalized_raw_clips = self._normalize_reassembly_clip_to_source_boundaries(raw_clip, start, end)
+            raw_clips, invalid_clips = self._build_clips_from_editing_structure(script.get("editing_structure", []))
+            cut_plan_debug = {
+                "short_video_id": sid,
+                "editing_structure_count": len(script.get("editing_structure", []) or []),
+                "valid_clip_count": len(raw_clips),
+                "invalid_clip_count": len(invalid_clips),
+                "invalid_clips": invalid_clips[:20],
+            }
+            if not raw_clips:
+                blocked_reasons.append("剪辑计划无有效画面片段：editing_structure 中没有可用 source_start/source_end")
+                write_json(vdir / f"{sid}_cut_plan_debug.json", cut_plan_debug)
+            for raw_clip in raw_clips:
+                start = float(raw_clip.get("source_start_seconds") or timecode_to_seconds(raw_clip.get("source_start")) or 0)
+                clip_duration = float(raw_clip.get("duration_seconds") or 0)
+                normalized_raw_clips = self._normalize_reassembly_clip_to_source_boundaries(raw_clip, start, start + clip_duration)
                 for normalized_raw_clip in normalized_raw_clips:
                     normalized_duration = float(normalized_raw_clip.get("duration_seconds") or clip_duration)
                     normalized_raw_clip["target_start"] = seconds_to_timecode(target, ms=True)
@@ -4879,6 +5247,7 @@ class PipelineRunner:
                 ),
                 "original_visual_duration_seconds": round(original_visual_duration, 3),
                 "compacted_visual_duration_seconds": video_duration,
+                "cut_plan_debug": cut_plan_debug,
                 "auto_extended_for_voiceover_seconds": auto_extended_seconds,
                 "evidence_audio_windows": evidence_windows,
                 "voiceover_timeline_required": voiceover_timeline_required,
@@ -4950,12 +5319,21 @@ class PipelineRunner:
         if self._is_virtual_source_manifest():
             aggregate = self._load_optional_step_json("source_aggregate", {})
             digest = aggregate.get("timeline_digest", {}) if isinstance(aggregate, dict) else {}
-            duration = float(digest.get("video_duration_seconds") or 0)
-            if duration > 0:
-                return duration
+            for key in ("video_duration_seconds", "total_source_duration_seconds", "duration_seconds"):
+                duration = float(digest.get(key) or 0)
+                if duration > 0:
+                    return duration
             try:
                 source_manifest = read_json(self._source_manifest_path(), {})
-                return float(source_manifest.get("total_duration_seconds") or 0)
+                for key in ("total_duration_seconds", "total_source_duration_seconds", "duration_seconds"):
+                    duration = float(source_manifest.get(key) or 0)
+                    if duration > 0:
+                        return duration
+                sources = source_manifest.get("sources") or []
+                total = sum(float(item.get("duration_seconds") or 0) for item in sources if isinstance(item, dict))
+                if total > 0:
+                    return total
+                return 0.0
             except Exception:
                 return 0.0
         try:
@@ -4985,12 +5363,27 @@ class PipelineRunner:
             shot_id = str(clip.get("shot_id") or clip.get("source_shot_id") or "")
             segment = active_by_shot_id.get(shot_id)
             if not segment:
+                duration = float(clip.get("duration_seconds") or 0)
+                if duration <= 0:
+                    continue
+                new_clip = dict(clip)
+                new_clip["target_start"] = seconds_to_timecode(cursor, ms=True)
+                new_clip["target_start_seconds"] = round(cursor, 3)
+                new_clip["target_end_seconds"] = round(cursor + duration, 3)
+                new_clip["compact_voiceover_timed"] = False
+                new_clip["compact_voiceover_unmatched"] = True
+                compacted.append(new_clip)
+                cursor += duration
                 continue
-            duration = float(segment.get("actual_duration_seconds") or segment.get("target_duration_seconds") or 0)
+            duration, duration_reason = self._resolve_final_clip_duration(clip, segment)
             if duration <= 0:
                 continue
             source_start = timecode_to_seconds(clip.get("source_start"))
             source_end = source_start + duration
+            source_max_end = float(clip.get("source_max_end_seconds") or timecode_to_seconds(clip.get("source_end")) or 0)
+            if source_max_end > source_start:
+                source_end = min(source_end, source_max_end)
+                duration = max(0.1, source_end - source_start)
             if source_duration > 0:
                 source_end = min(source_end, source_duration)
                 duration = max(0.1, source_end - source_start)
@@ -5001,12 +5394,38 @@ class PipelineRunner:
             new_clip["source_end"] = seconds_to_timecode(source_end, ms=True)
             new_clip["duration_seconds"] = round(duration, 3)
             new_clip["compact_voiceover_timed"] = True
+            new_clip["compact_voiceover_duration_reason"] = duration_reason
+            new_clip["tts_actual_duration_seconds"] = round(float(segment.get("actual_duration_seconds") or 0), 3)
             new_clip["voiceover_segment_shot_id"] = shot_id
             compacted.append(new_clip)
             cursor += duration
-            if len(compacted) < len(active_by_shot_id):
+            if len(compacted) < len(clips):
                 cursor += gap
         return compacted or clips
+
+    def _resolve_final_clip_duration(self, shot: dict[str, Any], tts_seg: dict[str, Any]) -> tuple[float, str]:
+        target = float(shot.get("target_duration_seconds") or shot.get("duration_seconds") or 0)
+        actual = float(tts_seg.get("actual_duration_seconds") or 0)
+        has_contract_bounds = shot.get("min_duration_seconds") not in (None, "") or shot.get("max_duration_seconds") not in (None, "")
+        if not has_contract_bounds:
+            if actual > 0:
+                return actual, "use_tts_duration"
+            return max(0.0, target), "fallback_target"
+        min_d = float(shot.get("min_duration_seconds") or (target * 0.65 if target else 0))
+        max_d = float(shot.get("max_duration_seconds") or (target * 1.35 if target else 0))
+        if target <= 0:
+            target = actual
+        if min_d <= 0:
+            min_d = target
+        if max_d <= 0:
+            max_d = target
+        if actual <= 0:
+            return max(0.0, target), "fallback_target"
+        if min_d <= actual <= max_d:
+            return actual, "use_tts_duration"
+        if actual < min_d:
+            return min_d, "tts_too_short_clamped"
+        return max_d, "tts_too_long_clamped"
 
     def step_reassembly_cut_plan(self) -> None:
         plan = self._load_step_json("highlight_reassembly_plan")

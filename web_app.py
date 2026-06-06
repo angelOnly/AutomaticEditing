@@ -1559,6 +1559,8 @@ def _refresh_job(job_id: str, schedule_next: bool = True) -> dict[str, Any]:
     process = job.get("process")
     changed_to_finished = False
     if not process and job.get("status") in {"pending", "running"}:
+        if job.get("status") == "pending" and job_id in PENDING_JOB_IDS:
+            return _public_job(job)
         pid = int(job.get("pid") or 0)
         if job.get("status") == "running" and _pid_exists(pid):
             return _public_job(job)
