@@ -2862,10 +2862,20 @@ class PipelineRunner:
             source_ids = {str(seg.get("source_id") or "source_1") for seg in group_segments}
             if len(source_ids) != 1:
                 continue
-            start = min(float(seg.get("source_start_seconds") or 0) for seg in group_segments)
-            end = max(float(seg.get("source_end_seconds") or 0) for seg in group_segments)
-            if end <= start:
+            
+            ranges = []
+            for seg in group_segments:
+                seg_start, seg_end = self._segment_start_end_seconds(seg)
+                if seg_start is None or seg_end is None or seg_end <= seg_start:
+                    continue
+                ranges.append((seg_start, seg_end))
+
+            if not ranges:
                 continue
+
+            start = min(item[0] for item in ranges)
+            end = max(item[1] for item in ranges)
+
             per_source_count[source_id] = per_source_count.get(source_id, 0) + 1
             source_digits = re.sub(r"\D+", "", source_id) or str(group_segments[0].get("source_index") or 1)
             clip_id = f"src{int(source_digits):02d}_evt_{per_source_count[source_id]:03d}" if source_digits.isdigit() else f"{source_id}_evt_{per_source_count[source_id]:03d}"
@@ -2960,6 +2970,28 @@ class PipelineRunner:
             "raw_model_plan": result,
         }
 
+    def _normalize_clip_time_fields(self, clip: dict[str, Any]) -> dict[str, Any]:
+        item = dict(clip)
+        start, end = self._clip_start_end(item)
+        duration = max(0.0, end - start)
+
+        item["local_start_seconds"] = round(start, 3)
+        item["local_end_seconds"] = round(end, 3)
+        item["source_start_seconds"] = round(start, 3)
+        item["source_end_seconds"] = round(end, 3)
+        item["start_seconds"] = round(start, 3)
+        item["end_seconds"] = round(end, 3)
+
+        item["local_start"] = seconds_to_timecode(start, ms=True)
+        item["local_end"] = seconds_to_timecode(end, ms=True)
+        item["source_start"] = seconds_to_timecode(start, ms=True)
+        item["source_end"] = seconds_to_timecode(end, ms=True)
+        item["start"] = seconds_to_timecode(start, ms=True)
+        item["end"] = seconds_to_timecode(end, ms=True)
+
+        item["duration_seconds"] = round(duration, 3)
+        return item
+
     def _build_filtered_candidate_pool(self, pool: list[dict[str, Any]], filter_doc: dict[str, Any]) -> list[dict[str, Any]]:
         by_id = {str(clip.get("clip_id")): clip for clip in pool if clip.get("clip_id")}
         keep_ids = filter_doc.get("ranked_clip_ids") or filter_doc.get("keep_clip_ids") or []
@@ -2972,7 +3004,7 @@ class PipelineRunner:
         for cid in keep_ids:
             if cid not in by_id:
                 continue
-            clip = dict(by_id[cid])
+            clip = self._normalize_clip_time_fields(by_id[cid])
             if cid in group_by_clip:
                 clip["story_group_id"] = group_by_clip[cid]
                 clip["merge_group_id"] = group_by_clip[cid]
@@ -3162,6 +3194,33 @@ class PipelineRunner:
                 return number
         return None
 
+    def _time_value_seconds(self, value: Any) -> float | None:
+        if value in (None, ""):
+            return None
+
+        if isinstance(value, (int, float)):
+            number = float(value)
+            return number if math.isfinite(number) else None
+
+        text = str(value).strip()
+        if not text:
+            return None
+
+        try:
+            number = float(text)
+            return number if math.isfinite(number) else None
+        except (TypeError, ValueError):
+            pass
+
+        if ":" in text:
+            try:
+                seconds = float(timecode_to_seconds(text))
+                return seconds if math.isfinite(seconds) else None
+            except Exception:
+                return None
+
+        return None
+
     def _timecode_field_seconds(self, seg: dict[str, Any], *keys: str) -> float | None:
         for key in keys:
             value = seg.get(key)
@@ -3176,23 +3235,38 @@ class PipelineRunner:
         return None
 
     def _segment_start_end_seconds(self, seg: dict[str, Any]) -> tuple[float | None, float | None]:
-        start = self._first_number(
-            seg.get("source_start_seconds"),
-            seg.get("local_start_seconds"),
-            seg.get("start_seconds"),
-        )
-        end = self._first_number(
-            seg.get("source_end_seconds"),
-            seg.get("local_end_seconds"),
-            seg.get("end_seconds"),
-        )
+        start = self._time_value_seconds(seg.get("source_start_seconds"))
         if start is None:
-            start = self._timecode_field_seconds(seg, "source_start", "local_start", "start")
+            start = self._time_value_seconds(seg.get("local_start_seconds"))
+        if start is None:
+            start = self._time_value_seconds(seg.get("start_seconds"))
+        if start is None:
+            start = self._time_value_seconds(seg.get("source_start"))
+        if start is None:
+            start = self._time_value_seconds(seg.get("local_start"))
+        if start is None:
+            start = self._time_value_seconds(seg.get("start"))
+
+        end = self._time_value_seconds(seg.get("source_end_seconds"))
         if end is None:
-            end = self._timecode_field_seconds(seg, "source_end", "local_end", "end")
-        duration = self._first_number(seg.get("duration_seconds"))
-        if start is not None and (end is None or end <= start) and duration and duration > 0:
+            end = self._time_value_seconds(seg.get("local_end_seconds"))
+        if end is None:
+            end = self._time_value_seconds(seg.get("end_seconds"))
+        if end is None:
+            end = self._time_value_seconds(seg.get("source_end"))
+        if end is None:
+            end = self._time_value_seconds(seg.get("local_end"))
+        if end is None:
+            end = self._time_value_seconds(seg.get("end"))
+
+        duration = self._time_value_seconds(seg.get("duration_seconds"))
+
+        if start is not None and (end is None or end <= start) and duration is not None and duration > 0:
             end = start + duration
+
+        if end is not None and start is None and duration is not None and duration > 0:
+            start = max(0.0, end - duration)
+
         return start, end
 
     def _resolve_voiceover_target_duration(self, visual_total: float, plan: dict[str, Any] | None = None) -> float:
@@ -3284,6 +3358,7 @@ class PipelineRunner:
             "model_output_empty": not bool(raw_videos),
             "fallback_used": False,
             "candidate_clip_count": len(clips_by_id),
+            "invalid_time_clips": [],
         }
         if not raw_videos and clips_by_id:
             raw_videos = [{
@@ -3310,8 +3385,18 @@ class PipelineRunner:
             rid = f"hr_{len(output_videos) + 1:03d}"
             selected_clips: list[dict[str, Any]] = []
             for clip in selected:
-                start, end = self._clip_start_end(clip)
                 source_clip_id = self._clip_id(clip, len(selected_clips))
+                try:
+                    clip = self._normalize_clip_time_fields(clip)
+                    start, end = self._clip_start_end(clip)
+                except Exception as exc:
+                    diagnostics["invalid_time_clips"].append({
+                        "clip_id": source_clip_id,
+                        "error": str(exc),
+                        "raw_time_fields": self._clip_time_debug_fields(clip),
+                    })
+                    continue
+
                 local_start = seconds_to_timecode(start, ms=True)
                 local_end = seconds_to_timecode(end, ms=True)
                 used_clip_ids.add(source_clip_id)
@@ -3331,6 +3416,10 @@ class PipelineRunner:
                     "role": clip.get("type") or clip.get("clip_type") or "",
                     "transition_after": "hard_cut",
                 })
+            
+            if not selected_clips:
+                continue
+
             output_videos.append({
                 "reassembly_id": rid,
                 "title": "",
@@ -3338,6 +3427,21 @@ class PipelineRunner:
                 "excluded_clip_ids": [cid for cid in clips_by_id if cid not in used_clip_ids],
                 **({"fallback_reason": video.get("fallback_reason")} if video.get("fallback_reason") else {}),
             })
+
+        if not output_videos:
+            raise UserFacingPipelineError(
+                "highlight_reassembly_no_valid_clips",
+                user_message="重组失败：候选片段时间字段无效，无法生成可信剪辑方案。",
+                suggestions=[
+                    "请重跑 asr_event_candidate 和 candidate_filter。",
+                    "检查 candidate_clip_pool_filtered.json 里的 *_seconds 字段是否是数字。",
+                    "确认时间码字符串只出现在 source_start/source_end/local_start/local_end/start/end 字段。",
+                ],
+                technical_detail={
+                    "candidate_clip_count": len(clips_by_id),
+                    "invalid_time_clips": diagnostics.get("invalid_time_clips", []),
+                },
+            )
 
         return {
             "version": "highlight_reassembly_materialized_v2",
@@ -3619,17 +3723,40 @@ class PipelineRunner:
         return str(clip.get("clip_id") or clip.get("id") or clip.get("source_clip_id") or f"clip_{index + 1:03d}")
 
     def _clip_start_end(self, clip: dict[str, Any]) -> tuple[float, float]:
-        start = clip.get("local_start_seconds", clip.get("source_start_seconds", clip.get("start_seconds")))
-        end = clip.get("local_end_seconds", clip.get("source_end_seconds", clip.get("end_seconds")))
-        if start is None:
-            start = self._clip_time_seconds(clip, "start", "local_start", "source_start")
-        if end is None:
-            end = self._clip_time_seconds(clip, "end", "local_end", "source_end")
-        start_f = float(start or 0)
-        end_f = float(end or 0)
-        if end_f <= start_f and clip.get("duration_seconds"):
-            end_f = start_f + float(clip.get("duration_seconds") or 0)
-        return start_f, end_f
+        start, end = self._segment_start_end_seconds(clip)
+        clip_id = clip.get("clip_id") or clip.get("id") or clip.get("source_clip_id") or ""
+
+        if start is None or end is None:
+            raise ValueError(
+                f"invalid clip time fields: clip_id={clip_id}, "
+                f"times={self._clip_time_debug_fields(clip)}"
+            )
+
+        if end <= start:
+            raise ValueError(
+                f"invalid clip time range: clip_id={clip_id}, start={start}, end={end}, "
+                f"times={self._clip_time_debug_fields(clip)}"
+            )
+
+        return float(start), float(end)
+
+    def _clip_time_debug_fields(self, clip: dict[str, Any]) -> dict[str, Any]:
+        keys = [
+            "local_start_seconds",
+            "local_end_seconds",
+            "source_start_seconds",
+            "source_end_seconds",
+            "start_seconds",
+            "end_seconds",
+            "local_start",
+            "local_end",
+            "source_start",
+            "source_end",
+            "start",
+            "end",
+            "duration_seconds",
+        ]
+        return {key: clip.get(key) for key in keys if key in clip}
 
     def _format_clip_time(self, clip: dict[str, Any]) -> str:
         if clip.get("local_start") and clip.get("local_end"):
