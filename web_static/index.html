@@ -216,13 +216,7 @@
                   <span>抽帧间隔</span>
                   <input id="frameInterval" type="number" min="1" max="30" value="5" />
                 </label>
-                <label class="select-like">
-                  <span>允许详述</span>
-                  <select id="allowLongVideoSelect">
-                    <option value="true">最长 60 秒</option>
-                    <option value="false">严格控制</option>
-                  </select>
-                </label>
+
                 <label class="select-like">
                   <span>TTS</span>
                   <select id="requireTtsSelect">
@@ -283,8 +277,8 @@
                   <span>允许证据原声</span>
                 </label>
                 <label class="inline-option visually-hidden-control">
-                  <input id="allowLongVideo" type="checkbox" />
-                  <span>允许讲清楚（最长 60 秒）</span>
+                  <input id="allowLongVideo" type="checkbox" checked />
+                  <span>允许详述</span>
                 </label>
                 <label class="inline-option visually-hidden-control">
                   <input id="requireTts" type="checkbox" checked />

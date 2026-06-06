@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import threading
 import time
@@ -228,6 +229,27 @@ def _append_common_log(common_dir: Path, message: str) -> None:
         f.write(f"[{timestamp}] {message}\n")
 
 
+def _read_common_state(common_dir: Path) -> dict[str, Any]:
+    return read_json(common_dir / "common_state.json", {})
+
+
+def _write_common_state(common_dir: Path, data: dict[str, Any]) -> None:
+    data["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    write_json(common_dir / "common_state.json", data)
+
+
+def _wait_for_common_ready(common_dir: Path, timeout_seconds: int = 7200, poll_seconds: float = 3.0) -> bool:
+    started = time.time()
+    while time.time() - started < timeout_seconds:
+        if _common_analysis_ready(common_dir):
+            return True
+        manifest = read_json(common_dir / "manifest.json", {})
+        if manifest.get("status") == "failed":
+            raise RuntimeError(manifest.get("user_message") or "common analysis failed")
+        time.sleep(poll_seconds)
+    raise RuntimeError(f"waiting common analysis timeout: {common_dir.name}")
+
+
 def _ensure_common_analysis(*, common_dir: Path, request: dict[str, Any], args: argparse.Namespace, passthrough: list[str]) -> None:
     ensure_dir(common_dir)
     ensure_dir(common_dir / "web_jobs")
@@ -243,10 +265,26 @@ def _ensure_common_analysis(*, common_dir: Path, request: dict[str, Any], args: 
             
     force_rerun_common = bool(_is_common_rerun_step(rerun) or _is_common_rerun_step(rerun_from))
     
-    with file_slot_lock(lock_name, slots=1):
+    if not force_rerun_common and _common_analysis_ready(common_dir):
+        _write_common_state(common_dir, {"common_task_id": common_dir.name, "status": "success"})
+        return
+
+    state = _read_common_state(common_dir)
+    if not force_rerun_common and state.get("status") == "running":
+        _append_common_log(common_dir, f"wait existing common analysis")
+        _wait_for_common_ready(common_dir)
+        return
+
+    with file_slot_lock(lock_name, slots=1, enable_pid_stale_check=False):
         if not force_rerun_common and _common_analysis_ready(common_dir):
             print(f"Reuse common analysis outputs: {common_dir}")
-            _append_common_log(common_dir, "reuse common analysis outputs")
+            _append_common_log(common_dir, "reuse common analysis outputs after lock")
+            _write_common_state(common_dir, {"common_task_id": common_dir.name, "status": "success"})
+            return
+
+        state = _read_common_state(common_dir)
+        if not force_rerun_common and state.get("status") == "running":
+            _wait_for_common_ready(common_dir)
             return
 
         source_count = len(_request_source_items(request))
@@ -256,6 +294,13 @@ def _ensure_common_analysis(*, common_dir: Path, request: dict[str, Any], args: 
             print(f"Start common analysis: {common_dir} ({source_count} sources)")
         _append_common_log(common_dir, "start common analysis")
         _mark_source_prepare(common_dir, "running", request=request)
+        _write_common_state(common_dir, {
+            "common_task_id": common_dir.name,
+            "status": "running",
+            "owner_pid": os.getpid(),
+            "owner_task_id": request.get("task_id") or "",
+            "started_at": datetime.now().isoformat(timespec="seconds"),
+        })
         try:
             config = load_config(ROOT / "config.toml")
             sources = _resolve_sources(request, config)
@@ -341,8 +386,23 @@ def _ensure_common_analysis(*, common_dir: Path, request: dict[str, Any], args: 
                 _mark_common_failed(common_dir, message, failed_step=failed_step)
                 raise RuntimeError(message)
             _append_common_log(common_dir, "common analysis ready")
+            _write_common_state(common_dir, {
+                "common_task_id": common_dir.name,
+                "status": "success",
+                "owner_pid": os.getpid(),
+                "owner_task_id": request.get("task_id") or "",
+                "finished_at": datetime.now().isoformat(timespec="seconds"),
+            })
         except Exception as exc:
             _append_common_log(common_dir, f"common analysis failed: {exc}")
+            _write_common_state(common_dir, {
+                "common_task_id": common_dir.name,
+                "status": "failed",
+                "owner_pid": os.getpid(),
+                "owner_task_id": request.get("task_id") or "",
+                "error": str(exc),
+                "finished_at": datetime.now().isoformat(timespec="seconds"),
+            })
             wrapper_error = read_json(common_dir / "manifest.json", {}).get("common_wrapper_error") or {}
             if not wrapper_error:
                 failed_step, detail = _find_failed_common_step(common_dir)

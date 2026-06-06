@@ -346,6 +346,7 @@ function applyDefaultControls() {
   $("productionMode").value = "ai_voiceover";
   $("audioPolicy").value = "ai_voiceover";
   $("allowOriginalAudioEvidence").checked = false;
+  if ($("maxOutputVideos")) $("maxOutputVideos").value = 5;
   syncFriendlyControls();
   updateSummaryControls();
   onProductionModeChange();
@@ -1510,7 +1511,7 @@ function restoreRunControls(manifest) {
   if (typeof opts.require_tts === "boolean") $("requireTts").checked = opts.require_tts;
   $("productionMode").value = opts.production_mode || "ai_voiceover";
   if ($("outputMode")) $("outputMode").value = opts.output_mode || (opts.reassembly_output_mode === "multiple" ? "multiple" : "single");
-  if ($("maxOutputVideos")) $("maxOutputVideos").value = opts.max_output_videos || 5;
+  if ($("maxOutputVideos")) $("maxOutputVideos").value = (opts.max_output_videos > 1) ? opts.max_output_videos : 5;
   $("audioPolicy").value = opts.production_mode === "highlight_reassembly" ? "original" : "ai_voiceover";
   $("allowOriginalAudioEvidence").checked = opts.production_mode === "highlight_reassembly";
   $("reassemblyOutputMode").value = $("outputMode")?.value === "multiple" ? "multiple" : "single";

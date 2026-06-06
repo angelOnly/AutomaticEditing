@@ -1025,11 +1025,11 @@ def run_pipeline(req: RunRequest) -> dict[str, Any]:
     source_items: list[MultiSourceItem] = []
     source_manifest_path: Path | None = None
     source_request_path: Path | None = None
+    common_source_key = _common_source_key(req, raw_source_items) if should_use_source_request else ""
+    common_task_id = f"common_{common_source_key}" if common_source_key else ""
     if should_use_source_request:
         _validate_source_request_items(raw_source_items)
         fingerprint = _source_request_fingerprint(req, raw_source_items)
-        common_source_key = _common_source_key(req, raw_source_items)
-        common_task_id = f"common_{common_source_key}"
         input_name_for_task = _display_source_request_name(raw_source_items)
         task_id = _normalize_new_task_id(req.task_id, input_name_for_task, req.production_mode, fingerprint)
         task_id = _with_mode_suffix(task_id, req.production_mode)
@@ -1143,6 +1143,8 @@ def run_pipeline(req: RunRequest) -> dict[str, Any]:
             "returncode": None,
             "submitted_by": req.client_id or "anonymous",
             "task_fingerprint": fingerprint,
+            "common_task_id": common_task_id,
+            "common_source_key": common_source_key,
         }
         JOBS[job_id] = job
         PENDING_JOB_IDS.append(job_id)
@@ -1742,6 +1744,20 @@ def _find_active_job_by_task_id(task_id: str) -> dict[str, Any] | None:
         public = _refresh_job(job_id)
         if public.get("status") in {"pending", "running"}:
             return job
+    return None
+
+
+def _find_active_job_by_common_task_id(common_task_id: str) -> dict[str, Any] | None:
+    if not common_task_id:
+        return None
+
+    for job_id, job in list(JOBS.items()):
+        public = _refresh_job(job_id)
+        if public.get("status") not in {"pending", "running"}:
+            continue
+        if job.get("common_task_id") == common_task_id:
+            return job
+
     return None
 
 

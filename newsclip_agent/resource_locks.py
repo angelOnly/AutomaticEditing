@@ -11,7 +11,7 @@ LOCK_DIR = Path("outputs/.locks")
 
 
 @contextmanager
-def file_slot_lock(name: str, slots: int = 1, poll_seconds: float = 1.0, stale_after_seconds: float = 12 * 60 * 60) -> Iterator[None]:
+def file_slot_lock(name: str, slots: int = 1, poll_seconds: float = 1.0, stale_after_seconds: float = 12 * 60 * 60, enable_pid_stale_check: bool = True) -> Iterator[None]:
     LOCK_DIR.mkdir(parents=True, exist_ok=True)
     acquired: Path | None = None
     try:
@@ -25,7 +25,7 @@ def file_slot_lock(name: str, slots: int = 1, poll_seconds: float = 1.0, stale_a
                     acquired = path
                     break
                 except FileExistsError:
-                    _remove_stale_lock(path, stale_after_seconds)
+                    _remove_stale_lock(path, stale_after_seconds, enable_pid_stale_check)
                     continue
             if acquired is None:
                 time.sleep(poll_seconds)
@@ -38,16 +38,19 @@ def file_slot_lock(name: str, slots: int = 1, poll_seconds: float = 1.0, stale_a
                 pass
 
 
-def _remove_stale_lock(path: Path, stale_after_seconds: float) -> None:
+def _remove_stale_lock(path: Path, stale_after_seconds: float, enable_pid_stale_check: bool = True) -> None:
     is_dead = False
     try:
         content = path.read_text(encoding="utf-8").splitlines()
         if content:
             pid = int(content[0].strip())
-            try:
-                os.kill(pid, 0)
-            except OSError:
-                is_dead = True
+            if os.name == "nt" or not enable_pid_stale_check:
+                is_dead = False
+            else:
+                try:
+                    os.kill(pid, 0)
+                except OSError:
+                    is_dead = True
     except Exception:
         pass
 

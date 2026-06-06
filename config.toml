@@ -77,6 +77,13 @@ vision_max_frames_per_chunk = 6
 default_run_mode = "all"
 use_unified_source_pipeline = true
 
+[common_analysis]
+wait_existing_common = true
+wait_timeout_seconds = 7200
+wait_poll_seconds = 3
+disable_pid_stale_check_on_windows = true
+state_file = "common_state.json"
+
 [multi_source_analysis]
 enabled = true
 source_max_workers = 2
@@ -140,6 +147,12 @@ allow_long_video_default = true
 max_long_video_seconds = 90
 
 [voiceover]
+char_budget_soft_tolerance_chars = 3
+char_budget_soft_tolerance_ratio = 0.12
+char_budget_hard_tolerance_ratio = 0.25
+char_budget_under_soft_tolerance_chars = 3
+char_budget_under_soft_tolerance_ratio = 0.12
+char_budget_under_hard_tolerance_ratio = 0.25
 chars_per_second = 4.2
 default_target_duration_seconds = 60
 voiceover_chars_per_second = 4.8

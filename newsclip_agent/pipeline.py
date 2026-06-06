@@ -4134,7 +4134,16 @@ class PipelineRunner:
             missing = [shot_id for shot_id in shot_ids if shot_id not in segment_ids]
             extra = [shot_id for shot_id in segment_ids if shot_id not in shot_ids]
             empty_text = [str(seg.get("shot_id") or "") for seg in segments if not str(seg.get("text") or "").strip()]
-            char_issues: list[dict[str, Any]] = []
+            voice_cfg = self.config.raw.get("voiceover", {}) if hasattr(self, "config") else {}
+            soft_over_chars = int(voice_cfg.get("char_budget_soft_tolerance_chars") or 3)
+            soft_over_ratio = float(voice_cfg.get("char_budget_soft_tolerance_ratio") or 0.12)
+            hard_over_ratio = float(voice_cfg.get("char_budget_hard_tolerance_ratio") or 0.25)
+            soft_under_chars = int(voice_cfg.get("char_budget_under_soft_tolerance_chars") or 3)
+            soft_under_ratio = float(voice_cfg.get("char_budget_under_soft_tolerance_ratio") or 0.12)
+            hard_under_ratio = float(voice_cfg.get("char_budget_under_hard_tolerance_ratio") or 0.25)
+
+            char_budget_issues: list[dict[str, Any]] = []
+            char_budget_warnings: list[dict[str, Any]] = []
             shot_by_id = {str(shot.get("shot_id")): shot for shot in shots if shot.get("shot_id")}
             for seg in segments:
                 shot_id = str(seg.get("shot_id") or "")
@@ -4144,11 +4153,50 @@ class PipelineRunner:
                 text_chars = len(re.sub(r"\s+", "", str(seg.get("text") or "")))
                 min_chars = self._first_number(shot.get("narration_min_chars"))
                 max_chars = self._first_number(shot.get("narration_max_chars"))
-                if min_chars is not None and text_chars < min_chars:
-                    char_issues.append({"shot_id": shot_id, "chars": text_chars, "min_chars": int(min_chars), "type": "too_short"})
+                
                 if max_chars is not None and text_chars > max_chars:
-                    char_issues.append({"shot_id": shot_id, "chars": text_chars, "max_chars": int(max_chars), "type": "too_long"})
-            ok = not missing and not extra and not empty_text and not char_issues and len(segments) == len(shots)
+                    over = text_chars - int(max_chars)
+                    over_ratio = over / max(float(max_chars), 1.0)
+                    item = {
+                        "shot_id": shot_id,
+                        "chars": text_chars,
+                        "max_chars": int(max_chars),
+                        "over_chars": over,
+                        "over_ratio": round(over_ratio, 3),
+                        "type": "too_long",
+                    }
+                    if over <= soft_over_chars or over_ratio <= soft_over_ratio:
+                        item["severity"] = "warning"
+                        char_budget_warnings.append(item)
+                    elif over_ratio >= hard_over_ratio:
+                        item["severity"] = "hard"
+                        char_budget_issues.append(item)
+                    else:
+                        item["severity"] = "warning"
+                        char_budget_warnings.append(item)
+
+                if min_chars is not None and text_chars < min_chars:
+                    under = int(min_chars) - text_chars
+                    under_ratio = under / max(float(min_chars), 1.0)
+                    item = {
+                        "shot_id": shot_id,
+                        "chars": text_chars,
+                        "min_chars": int(min_chars),
+                        "under_chars": under,
+                        "under_ratio": round(under_ratio, 3),
+                        "type": "too_short",
+                    }
+                    if under <= soft_under_chars or under_ratio <= soft_under_ratio:
+                        item["severity"] = "warning"
+                        char_budget_warnings.append(item)
+                    elif under_ratio >= hard_under_ratio:
+                        item["severity"] = "hard"
+                        char_budget_issues.append(item)
+                    else:
+                        item["severity"] = "warning"
+                        char_budget_warnings.append(item)
+
+            ok = not missing and not extra and not empty_text and not char_budget_issues and len(segments) == len(shots)
             check = {
                 "short_video_id": sid,
                 "ok": ok,
@@ -4157,14 +4205,19 @@ class PipelineRunner:
                 "missing_shot_ids": missing,
                 "extra_shot_ids": extra,
                 "empty_text_shot_ids": empty_text,
-                "char_budget_issues": char_issues,
+                "char_budget_issues": char_budget_issues,
+                "char_budget_warnings": char_budget_warnings,
             }
             checks.append(check)
             if not ok:
                 hard_issues.append(
                     f"{sid}: shot/voiceover mismatch "
-                    f"(shots={len(shots)}, segments={len(segments)}, missing={missing}, extra={extra}, empty={empty_text}, char_issues={len(char_issues)})"
+                    f"(shots={len(shots)}, segments={len(segments)}, missing={missing}, extra={extra}, empty={empty_text}, char_issues={len(char_budget_issues)})"
                 )
+            if char_budget_warnings:
+                print("Voiceover alignment warnings:")
+                for w in char_budget_warnings:
+                    print(f"- {w}")
         result = {"ok": not hard_issues, "checks": checks}
         if hasattr(self, "task_dir"):
             write_json(self.task_dir / "voiceover_alignment_check.json", result)
@@ -5195,12 +5248,26 @@ class PipelineRunner:
             tts_item = tts_by_id.get(sid, {})
             voice_item = voice_by_id.get(sid, {})
             tts_success = tts_item.get("status") == "success" and bool(tts_item.get("voice_file_exists", True)) and bool(tts_item.get("file"))
-            blocked_reasons = list(validation.get("blocked_reasons", []))
+            
+            raw_blocked_reasons = list(validation.get("blocked_reasons", []))
+            blocked_reasons: list[str] = []
+            warnings: list[str] = []
+            repair_reasons: list[str] = []
+
+            for reason in raw_blocked_reasons:
+                reason_text = str(reason)
+                if (
+                    self.options.production_mode == "ai_voiceover"
+                    and "超过允许上限" in reason_text
+                ):
+                    warnings.append(reason_text + "；AI配音模式不再因最大成片时长阻断。")
+                    repair_reasons.append("max_output_duration_warning_only")
+                else:
+                    blocked_reasons.append(reason_text)
+
             tts_is_hard_required = self.options.require_tts and self.options.audio_policy in {"ai_voiceover", "mixed"}
             if tts_is_hard_required and not tts_success:
                 blocked_reasons.append("require_tts=true 且音频策略需要 AI 配音，但 AI 配音未成功生成")
-            warnings: list[str] = []
-            repair_reasons: list[str] = []
             voiceover_duration = float(tts_item.get("actual_duration_seconds") or script.get("estimated_total_duration_seconds") or validation["video_duration_seconds"])
             raw_clips, invalid_clips = self._build_clips_from_editing_structure(script.get("editing_structure", []))
             cut_plan_debug = {
@@ -5330,16 +5397,21 @@ class PipelineRunner:
                 threshold_seconds=self.duration_settings.duration_mismatch_block_threshold_seconds,
             )
             if mismatch_reason:
-                blocked_reasons.append(mismatch_reason)
-            duration_status = (
-                "blocked"
-                if blocked_reasons
-                else (
-                    "mismatch"
-                    if duration_delta > self.duration_settings.duration_mismatch_block_threshold_seconds
-                    else "ok"
-                )
-            )
+                if self.options.production_mode == "ai_voiceover":
+                    warnings.append(mismatch_reason + "；AI配音模式不再因总时长误差阻断。")
+                    repair_reasons.append("voiceover_duration_mismatch_warning_only")
+                else:
+                    blocked_reasons.append(mismatch_reason)
+
+            if blocked_reasons:
+                duration_status = "blocked"
+            elif (
+                self.options.production_mode != "ai_voiceover"
+                and duration_delta > self.duration_settings.duration_mismatch_block_threshold_seconds
+            ):
+                duration_status = "mismatch"
+            else:
+                duration_status = "ok"
             voiceover_enabled = self.options.audio_policy != "original" and tts_success
             voiceover = {
                 "enabled": voiceover_enabled,
