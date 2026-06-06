@@ -21,6 +21,8 @@ VISION_CHUNK_PROMPT = _load_prompt("vision_chunk.txt")
 VIDEO_UNDERSTANDING_PROMPT = _load_prompt("video_understanding.txt")
 # AI 配音候选片段：从时间轴中选择适合解说短视频的 chunk 组合。
 CONTENT_ANALYSIS_PROMPT = _load_prompt("content_analysis.txt")
+# ASR 微片段：根据连续 ASR 句子合并成语义小片段。
+ASR_MICRO_SEGMENT_PROMPT = _load_prompt("asr_micro_segment.txt")
 # 原声高光候选片段：从时间轴中选择适合原声重组的 chunk 组合。
 HIGHLIGHT_DETECTION_PROMPT = _load_prompt("highlight_detection.txt")
 # 原声高光 ASR 事件候选：模型只输出 segment_id 保留/合并判断。

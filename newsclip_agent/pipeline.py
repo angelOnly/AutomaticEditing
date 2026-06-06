@@ -88,6 +88,7 @@ AGENT_INFO = {
     "candidate_filter": ("agents/candidate_filter", "candidate_filter.json", prompts.CANDIDATE_FILTER_PROMPT, "candidate_filter_v1"),
     "short_video_planning": ("agents/short_video_planning", "short_video_plan.json", prompts.SHORT_VIDEO_EDIT_PLAN_TEXT_PROMPT, "short_video_planning_compat_v2"),
     "editing_script": ("agents/editing_script", "editing_script.json", prompts.SHORT_VIDEO_EDIT_PLAN_TEXT_PROMPT, "editing_script_compat_v2"),
+    "asr_micro_segment": ("agents/asr_micro_segment", "micro_segments.json", prompts.ASR_MICRO_SEGMENT_PROMPT, "asr_micro_segment_v1"),
     "content_analysis": ("agents/content_analysis", "content_analysis.json", prompts.CONTENT_ANALYSIS_PROMPT, "content_analysis_v1"),
     "short_video_edit_plan": ("agents/short_video_edit_plan", "short_video_edit_plan.json", prompts.SHORT_VIDEO_EDIT_PLAN_TEXT_PROMPT, "short_video_edit_plan_text_v1"),
     "voiceover_script": ("agents/voiceover_script", "voiceover_script.json", prompts.VOICEOVER_SCRIPT_TEXT_PROMPT, "voiceover_script_text_v1"),
@@ -2447,10 +2448,436 @@ class PipelineRunner:
         }
         return json.dumps(payload, ensure_ascii=False, indent=2)
 
+
+    def step_asr_micro_segment(self) -> None:
+        cfg = self.config.raw.get("asr_micro_segment", {})
+        if not cfg.get("enabled", True):
+            self._mark_skipped("asr_micro_segment", "disabled in config")
+            return
+
+        input_hash = stable_hash({
+            "timeline_digest": self._step_content_hash("timeline_digest") if "timeline_digest" in self.manifest.get("steps", {}) else None,
+            "source_aggregate": self._step_content_hash("source_aggregate") if "source_aggregate" in self.manifest.get("steps", {}) else None,
+            "asr_micro_segment_cfg": cfg,
+            "prompt_version": 1,
+        })
+        if self._can_reuse("asr_micro_segment", input_hash):
+            print("复用缓存: asr_micro_segment")
+            return
+
+        version, vdir = self._version_dir("asr_micro_segment", "asr_micro_segment")
+        ensure_dir(vdir)
+
+        sentences = self._build_asr_sentence_units()
+        if cfg.get("include_visual_summary", True):
+            sentences = self._attach_visual_to_asr_sentences(sentences)
+            
+        write_json(vdir / "asr_sentences.json", sentences)
+
+        from collections import defaultdict
+        source_groups = defaultdict(list)
+        for s in sentences:
+            source_groups[s.get("source_id", "source_1")].append(s)
+
+        groups = []
+        raw_responses = []
+        inputs = []
+        for source_id, source_sentences in source_groups.items():
+            windows = self._window_sentences(
+                source_sentences,
+                window_size=cfg.get("window_sentence_count", 40),
+                overlap=cfg.get("window_overlap_sentence_count", 5),
+            )
+            for window in windows:
+                text_input = self._build_asr_micro_segment_text(window, source_id)
+                inputs.append(text_input)
+                result = self._run_text_agent("asr_micro_segment", text_input)
+                raw_responses.append(result)
+                groups.extend(result.get("groups", []))
+
+        write_json(vdir / "raw_response.json", raw_responses)
+        write_text(vdir / "input.txt", "\n\n---\n\n".join(inputs))
+
+        groups = self._dedupe_and_validate_sentence_groups(groups, sentences)
+        segments = self._materialize_micro_segments_from_sentence_groups(groups, sentences)
+        segments = self._enforce_micro_segment_limits(segments, cfg, sentences)
+
+        output = {"segments": segments}
+        out = write_json(vdir / "micro_segments.json", output)
+        
+        self._write_status(vdir, self._base_status("asr_micro_segment", version, input_hash, [out]))
+        self._record_step(step="asr_micro_segment", version=version, status="success", output=relpath(out, self.task_dir), input_hash=input_hash, output_files=[out], extra={"summary": {"segments": len(segments)}})
+        print("完成: asr_micro_segment")
+
+    def _build_asr_sentence_units(self) -> list[dict[str, Any]]:
+        digest = self._load_current_timeline_digest()
+        timeline = digest.get("chunks", [])
+        cfg = self.config.raw.get("asr_micro_segment", {})
+        max_chars = cfg.get("max_sentence_chars", 120)
+        
+        sentences = []
+        for item in timeline:
+            text = str(item.get("speech") or item.get("asr_text") or "").strip()
+            if not text:
+                continue
+            
+            parts = re.split(r'([。！？；.!?;\n])', text)
+            sub_texts = []
+            current = ""
+            for i in range(0, len(parts), 2):
+                frag = parts[i]
+                punct = parts[i+1] if i+1 < len(parts) else ""
+                if current and len(current) + len(frag) > max_chars:
+                    sub_texts.append(current)
+                    current = frag + punct
+                else:
+                    current += frag + punct
+            if current:
+                sub_texts.append(current)
+            
+            start = float(item.get("local_start_seconds", item.get("start_seconds", 0)))
+            end = float(item.get("local_end_seconds", item.get("end_seconds", 0)))
+            duration = end - start
+            total_chars = sum(len(t) for t in sub_texts)
+            
+            curr_start = start
+            for sub_text in sub_texts:
+                if not sub_text.strip():
+                    continue
+                sub_duration = duration * (len(sub_text) / total_chars) if total_chars else 0
+                sentences.append({
+                    "sentence_id": f"s{len(sentences)+1:04d}",
+                    "source_id": item.get("source_id", "source_1"),
+                    "source_index": item.get("source_index", 0),
+                    "start_seconds": round(curr_start, 3),
+                    "end_seconds": round(curr_start + sub_duration, 3),
+                    "text": sub_text.strip()
+                })
+                curr_start += sub_duration
+                
+        return sentences
+
+    def _attach_visual_to_asr_sentences(self, sentences: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        digest = self._load_current_timeline_digest()
+        timeline = digest.get("chunks", [])
+        cfg = self.config.raw.get("asr_micro_segment", {})
+        visual_chars = cfg.get("visual_summary_chars", 80)
+        
+        for s in sentences:
+            s_start = s["start_seconds"]
+            s_end = s["end_seconds"]
+            visuals = []
+            for item in timeline:
+                if item.get("source_id", "source_1") != s.get("source_id", "source_1"):
+                    continue
+                t_start = float(item.get("local_start_seconds", item.get("start_seconds", 0)))
+                t_end = float(item.get("local_end_seconds", item.get("end_seconds", 0)))
+                if max(s_start, t_start) < min(s_end, t_end):
+                    v = str(item.get("visual") or item.get("visual_summary") or "").strip()
+                    if v and v not in visuals:
+                        visuals.append(v)
+            s["visual_summary"] = compact_text("，".join(visuals), max_chars=visual_chars)
+        return sentences
+
+    def _window_sentences(self, sentences: list[dict[str, Any]], window_size: int, overlap: int) -> list[list[dict[str, Any]]]:
+        windows = []
+        if not sentences:
+            return windows
+        i = 0
+        while i < len(sentences):
+            windows.append(sentences[i:i+window_size])
+            if i + window_size >= len(sentences):
+                break
+            i += (window_size - overlap)
+        return windows
+
+    def _build_asr_micro_segment_text(self, sentences: list[dict[str, Any]], source_id: str) -> str:
+        lines = []
+        for s in sentences:
+            sid = s["sentence_id"]
+            lines.append(f"[{sid}]")
+            lines.append(f"{s['text']}")
+            lines.append("")
+        return "\n".join(lines).strip()
+
+    def _dedupe_and_validate_sentence_groups(self, groups: list[Any], sentences: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        valid_groups = []
+        used_sids = set()
+        smap = {s["sentence_id"]: s for s in sentences}
+        
+        for g in groups:
+            if isinstance(g, list):
+                sids = g
+                group_data = {}
+            elif isinstance(g, dict):
+                sids = g.get("sentence_ids", [])
+                group_data = g
+            else:
+                continue
+                
+            if not isinstance(sids, list):
+                continue
+            
+            clean_sids = []
+            for sid in sids:
+                if sid in smap and sid not in used_sids:
+                    clean_sids.append(sid)
+                    used_sids.add(sid)
+                    
+            if not clean_sids:
+                continue
+                
+            valid_group = dict(group_data) if isinstance(g, dict) else {}
+            valid_group["sentence_ids"] = clean_sids
+            valid_groups.append(valid_group)
+            
+        missing_sentences = [s for s in sentences if s["sentence_id"] not in used_sids]
+        for s in missing_sentences:
+            valid_groups.append({
+                "group_id": f"fallback_{s['sentence_id']}",
+                "sentence_ids": [s["sentence_id"]],
+                "summary": s["text"][:20],
+                "segment_type": "fact",
+                "keep_candidate": 1
+            })
+            
+        valid_groups.sort(key=lambda g: smap[g["sentence_ids"][0]]["start_seconds"])
+        return valid_groups
+
+    def _materialize_micro_segments_from_sentence_groups(self, groups: list[dict[str, Any]], sentences: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        smap = {s["sentence_id"]: s for s in sentences}
+        segments = []
+        for i, g in enumerate(groups):
+            sids = g["sentence_ids"]
+            s_list = [smap[sid] for sid in sids]
+            
+            start = s_list[0]["start_seconds"]
+            end = s_list[-1]["end_seconds"]
+            source_id = s_list[0].get("source_id", "source_1")
+            source_index = s_list[0].get("source_index", 0)
+            
+            asr_text = "".join(s["text"] for s in s_list)
+            visuals = []
+            for s in s_list:
+                v = s.get("visual_summary")
+                if v and v not in visuals:
+                    visuals.append(v)
+                    
+            segments.append({
+                "segment_id": f"{source_id}_m{i+1:03d}",
+                "source_id": source_id,
+                "source_index": source_index,
+                "sentence_ids": sids,
+                "start_seconds": round(start, 3),
+                "end_seconds": round(end, 3),
+                "duration_seconds": round(end - start, 3),
+                "source_start": seconds_to_timecode(start, ms=True),
+                "source_end": seconds_to_timecode(end, ms=True),
+                "asr_text": asr_text,
+                "summary": g.get("summary", ""),
+                "visual_summary": "，".join(visuals),
+                "segment_type": g.get("segment_type", "fact"),
+                "keep_candidate": g.get("keep_candidate", 1)
+            })
+        return segments
+
+    def _enforce_micro_segment_limits(self, segments: list[dict[str, Any]], cfg: dict[str, Any], sentences: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        hard_max = float(cfg.get("hard_max_segment_seconds", 45))
+        min_seg = float(cfg.get("min_segment_seconds", 5))
+        
+        fixed = []
+        for seg in segments:
+            if seg["duration_seconds"] > hard_max and cfg.get("split_overlong_group", True):
+                fixed.extend(self._split_segment_by_sentence_boundary(seg, hard_max, sentences))
+            elif seg["duration_seconds"] < min_seg:
+                fixed.append(seg)
+            else:
+                fixed.append(seg)
+                
+        fixed = self._merge_too_short_adjacent_segments(fixed, min_seg)
+        return fixed
+        
+    def _split_segment_by_sentence_boundary(self, segment: dict[str, Any], hard_max: float, sentences: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        smap = {s["sentence_id"]: s for s in sentences}
+        sids = segment.get("sentence_ids", [])
+        if len(sids) <= 1:
+            return [segment]
+            
+        parts = []
+        current_sids = []
+        current_dur = 0.0
+        
+        for sid in sids:
+            s = smap[sid]
+            dur = s["end_seconds"] - s["start_seconds"]
+            if current_dur + dur > hard_max and current_sids:
+                parts.append(current_sids)
+                current_sids = [sid]
+                current_dur = dur
+            else:
+                current_sids.append(sid)
+                current_dur += dur
+        if current_sids:
+            parts.append(current_sids)
+            
+        result = []
+        for i, part_sids in enumerate(parts):
+            sub_seg = dict(segment)
+            sub_seg["segment_id"] = f"{segment['segment_id']}_{i+1}"
+            sub_seg["sentence_ids"] = part_sids
+            
+            s_list = [smap[sid] for sid in part_sids]
+            start = s_list[0]["start_seconds"]
+            end = s_list[-1]["end_seconds"]
+            sub_seg["start_seconds"] = round(start, 3)
+            sub_seg["end_seconds"] = round(end, 3)
+            sub_seg["duration_seconds"] = round(end - start, 3)
+            sub_seg["source_start"] = seconds_to_timecode(start, ms=True)
+            sub_seg["source_end"] = seconds_to_timecode(end, ms=True)
+            sub_seg["asr_text"] = "".join(s["text"] for s in s_list)
+            result.append(sub_seg)
+            
+        return result
+
+    def _merge_too_short_adjacent_segments(self, segments: list[dict[str, Any]], min_seg: float) -> list[dict[str, Any]]:
+        if not segments:
+            return segments
+            
+        merged = []
+        current = segments[0]
+        
+        for i in range(1, len(segments)):
+            nxt = segments[i]
+            if current["duration_seconds"] < min_seg and current["source_id"] == nxt["source_id"]:
+                # merge into nxt
+                nxt["start_seconds"] = current["start_seconds"]
+                nxt["source_start"] = current["source_start"]
+                nxt["duration_seconds"] = round(nxt["end_seconds"] - nxt["start_seconds"], 3)
+                nxt["asr_text"] = current["asr_text"] + nxt["asr_text"]
+                nxt["sentence_ids"] = current["sentence_ids"] + nxt["sentence_ids"]
+                current = nxt
+            else:
+                merged.append(current)
+                current = nxt
+        merged.append(current)
+        
+        # also check if the last one is still too short, merge backwards if possible
+        if len(merged) > 1 and merged[-1]["duration_seconds"] < min_seg and merged[-1]["source_id"] == merged[-2]["source_id"]:
+            last = merged.pop()
+            prev = merged[-1]
+            prev["end_seconds"] = last["end_seconds"]
+            prev["source_end"] = last["source_end"]
+            prev["duration_seconds"] = round(prev["end_seconds"] - prev["start_seconds"], 3)
+            prev["asr_text"] = prev["asr_text"] + last["asr_text"]
+            prev["sentence_ids"] = prev["sentence_ids"] + last["sentence_ids"]
+            
+        return merged
+
+    def _build_content_analysis_micro_segment_text(self) -> str:
+        micro_segments = self._load_step_json("asr_micro_segment").get("segments", [])
+        cfg = self.config.raw.get("asr_micro_segment", {})
+        max_segments = cfg.get("max_segments_for_content_analysis", 120)
+        
+        lines = [
+            "你将看到一组已经按 ASR 语义切好的 micro_segments。",
+            "任务：判断哪些片段适合进入 AI 配音短视频候选池。",
+            "不要合并多个 segment。",
+            "不要输出新的时间码。",
+            "只输出 segment_id。",
+            ""
+        ]
+        
+        for seg in micro_segments[:max_segments]:
+            lines.append(f"[{seg['segment_id']}]")
+            lines.append(f"source={seg['source_id']}")
+            lines.append(f"time={seg['source_start']}-{seg['source_end']}")
+            lines.append(f"duration={seg['duration_seconds']}")
+            lines.append(f"声：{seg['asr_text']}")
+            if seg.get("visual_summary"):
+                lines.append(f"画：{seg['visual_summary']}")
+            if seg.get("summary"):
+                lines.append(f"摘要：{seg['summary']}")
+            lines.append("")
+            
+        return "\n".join(lines).strip()
+
+    def _materialize_content_analysis_candidates_from_segments(self, result: Any) -> dict[str, Any]:
+        if isinstance(result, list):
+            raw_clips = result
+            base_result = {}
+        elif isinstance(result, dict):
+            raw_clips = result.get("candidate_segments", result.get("candidate_clips", []))
+            base_result = dict(result)
+        else:
+            raw_clips = []
+            base_result = {}
+            
+        if isinstance(raw_clips, dict):
+            raw_clips = raw_clips.get("candidate_segments", raw_clips.get("candidate_clips", []))
+            
+        micro_segments = self._load_step_json("asr_micro_segment").get("segments", [])
+        seg_map = {s["segment_id"]: s for s in micro_segments}
+        
+        materialized = []
+        for i, raw in enumerate(raw_clips):
+            if not isinstance(raw, dict):
+                continue
+                
+            seg_id = raw.get("segment_id") or raw.get("id") or raw.get("clip_id")
+            if not seg_id or seg_id not in seg_map:
+                continue
+                
+            seg = seg_map[seg_id]
+            clip_id = f"clip_{i+1:03d}"
+            
+            materialized.append({
+                "clip_id": clip_id,
+                "source_id": seg["source_id"],
+                "source_index": seg["source_index"],
+                "source_start": seg["source_start"],
+                "source_end": seg["source_end"],
+                "source_start_seconds": seg["start_seconds"],
+                "source_end_seconds": seg["end_seconds"],
+                "duration_seconds": seg["duration_seconds"],
+                "start": seg["source_start"],
+                "end": seg["source_end"],
+                "start_seconds": seg["start_seconds"],
+                "end_seconds": seg["end_seconds"],
+                "summary": str(raw.get("summary") or raw.get("reason") or seg.get("summary") or "").strip(),
+                "speech": seg["asr_text"],
+                "visual": seg.get("visual_summary", ""),
+                "micro_segment_id": seg_id,
+                "sentence_ids": seg.get("sentence_ids", []),
+                "type": "fact",
+            })
+            
+        base_result["candidate_clips"] = materialized
+        return base_result
+
+
     def step_content_analysis(self) -> None:
-        text_input = self._build_content_analysis_brief_text()
+        cfg = self.config.raw.get("asr_micro_segment", {})
+        use_micro_segments = cfg.get("enabled", True)
+        micro_segments_file = self.task_dir / "agents" / "asr_micro_segment"
+        
+        if use_micro_segments:
+            # Check if micro_segments step actually succeeded
+            if self.manifest.get("steps", {}).get("asr_micro_segment", {}).get("status") == "success":
+                text_input = self._build_content_analysis_micro_segment_text()
+            else:
+                use_micro_segments = False
+                text_input = self._build_content_analysis_brief_text()
+        else:
+            text_input = self._build_content_analysis_brief_text()
+            
         result = self._run_text_agent("content_analysis", text_input)
-        result = self._materialize_candidate_clips_from_chunks(result, source_step="content_analysis")
+        
+        if use_micro_segments and ("candidate_segments" in result or "candidate_clips" not in result):
+            # Try to materialize from micro segments
+            result = self._materialize_content_analysis_candidates_from_segments(result)
+        else:
+            result = self._materialize_candidate_clips_from_chunks(result, source_step="content_analysis")
+            
         self._overwrite_step_json("content_analysis", result, materialized=True)
         self._write_compat_content_analysis(result)
 

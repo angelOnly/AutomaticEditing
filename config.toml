@@ -113,6 +113,21 @@ max_llm_candidate_clips = 14
 max_llm_context_chunks = 3
 max_llm_key_facts = 8
 
+[asr_micro_segment]
+enabled = true
+min_segment_seconds = 5
+preferred_min_segment_seconds = 8
+preferred_max_segment_seconds = 35
+hard_max_segment_seconds = 45
+window_sentence_count = 40
+window_overlap_sentence_count = 5
+max_sentence_chars = 120
+max_segments_for_content_analysis = 120
+include_visual_summary = true
+visual_summary_chars = 80
+split_overlong_group = true
+drop_empty_text_segment = true
+
 [asr_digest]
 enabled = true
 model_name = "ep-20260604155430-pt5bq"
