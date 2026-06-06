@@ -15,6 +15,11 @@
 5. 资料画面只能作为辅助，不要当成事件现场。
 6. 每个候选片段应尽量表达一个完整事实，不要选半句话或断裂片段。
 7. 候选片段数量以输入运行参数为准；信息不足可以少于上限，不要硬凑。
+8. candidate_clips 只输出候选依据，不要把不同 source_id 的 chunk 合并成同一个 clip。
+9. 一个 candidate_clip 必须只对应一个 source_id。
+10. 如果一个故事需要多个素材源，请输出多个 candidate_clip，而不是一个跨 source 的 candidate_clip。
+11. chunk_ids 只能引用同一个 source_id 下的 chunk。
+12. 不确定 source_id 时，不要输出该 clip。
 
 输出字段：
 - main_topic：用一句话概括这些素材最核心的新闻主题。只能基于输入内容。

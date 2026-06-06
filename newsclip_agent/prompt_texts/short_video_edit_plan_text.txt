@@ -21,6 +21,10 @@
 7. 禁止把不同 source 的片段当作同一连续现场。
 8. target_duration_seconds 是目标，不要为了接近目标牺牲新闻完整性。
 9. 避免资料画面被误当现场，跨源衔接必须在 narration_intent 中保持语境清楚。
+10. 只能从候选池里选择已有 clip_id。
+11. 不要重复选择同一个 clip_id 来伪造多个镜头。
+12. 如果同一个 clip 需要拆成多个 shot，必须给出不同的 source_start/source_end；否则只选择一次。
+13. 多源任务中，每个 shot 必须保留 source_id。
 
 旧格式兼容说明：
 1. 当前推荐输出 selected_clips；代码仍兼容旧格式 "clip_ids"。

@@ -206,6 +206,12 @@ long_source_min_total_output_seconds = 90
 long_source_preferred_total_output_seconds = 150
 long_source_min_video_count = 2
 
+[ai_voiceover]
+candidate_chunk_max_gap_seconds = 3.0
+split_cross_source_candidate_clips = true
+require_source_id_for_multisource = true
+global_unique_clip_id = true
+
 [subtitle]
 mode = "sentence"
 max_chars_per_line_16_9 = 26

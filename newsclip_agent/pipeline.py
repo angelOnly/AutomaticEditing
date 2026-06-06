@@ -2350,30 +2350,74 @@ class PipelineRunner:
                 "source_start_seconds": round(local_start, 3),
                 "source_end_seconds": round(local_end, 3),
                 "time_range_for_reference": f"{seconds_to_timecode(local_start, ms=True)}-{seconds_to_timecode(local_end, ms=True)}",
-                "speech": compact_text(speech, max_chars=500),
+                "speech": compact_text(speech, max_chars=160),
                 "nearby_context": "",
-                "visual_summary": compact_text(str(chunk.get("visual") or chunk.get("visual_summary") or ""), max_chars=240),
+                "visual_summary": compact_text(str(chunk.get("visual") or chunk.get("visual_summary") or ""), max_chars=80),
                 "source_chunk_ids": [str(chunk.get("chunk_id") or chunk.get("global_chunk_id") or f"chunk_{index:04d}")],
             })
         return segments
 
+    def _format_asr_event_segment_for_llm(self, segment: dict[str, Any]) -> str:
+        segment_id = str(segment.get("segment_id") or "").strip()
+        source_id = str(segment.get("source_id") or "").strip()
+        time_range = str(segment.get("time_range_for_reference") or "").strip()
+        speech = compact_text(str(segment.get("speech") or ""), max_chars=160)
+        visual = compact_text(str(segment.get("visual_summary") or ""), max_chars=80)
+
+        lines = [f"[{segment_id}] src={source_id} t={time_range}"]
+        if speech:
+            lines.append(f"声：{speech}")
+        if visual:
+            lines.append(f"画：{visual}")
+        return "\n".join(lines)
+
     def _build_asr_event_candidate_text(self) -> str:
         video = self._load_optional_step_json("video_understanding", {})
         segments = self._asr_event_segments()
+
+        llm_cfg = self.config.raw.get("llm_input", {})
+        limit = int(
+            llm_cfg.get(
+                "max_asr_event_candidate_input_chars",
+                llm_cfg.get("max_text_agent_input_chars", 20000),
+            )
+            or 20000
+        )
+        budget = max(6000, int(limit * 0.75))
+
+        main_topic = compact_text(str(video.get("main_topic") or video.get("topic") or ""), max_chars=120)
+        summary = compact_text(str(video.get("summary") or video.get("understanding") or ""), max_chars=240)
+
         lines = [
-            "任务：请从 ASR segment 中选择适合原声高光重组的新闻事件候选。",
+            "任务：请从下面的 ASR 片段中选择适合原声高光重组的新闻事件候选。",
+            "要求：",
+            "1. 只选择信息密度高、能独立表达新闻事件的片段。",
+            "2. 半句话、弱背景、重复信息、无明确事件的片段不要选。",
+            "3. 同一 source 内连续相关片段可以合并。",
+            "4. 不要跨 source 合并，因为不同 source 是独立素材。",
             "",
             "视频理解：",
-            f"主题：{video.get('main_topic') or video.get('topic') or ''}",
-            f"摘要：{video.get('summary') or video.get('understanding') or ''}",
+            f"主题：{main_topic}",
+            f"摘要：{summary}",
             "",
-            "ASR segments：",
+            "候选片段：",
         ]
+
+        included = 0
         for segment in segments:
-            lines.append(json.dumps(segment, ensure_ascii=False, separators=(",", ":")))
-        lines.append("")
-        lines.append("只输出 {\"keep\":[],\"merge\":[]}，不要输出时间码。")
-        return "\n".join(lines)
+            block = self._format_asr_event_segment_for_llm(segment)
+            candidate_size = len("\n".join(lines)) + len(block) + 2
+            if candidate_size > budget:
+                remaining = len(segments) - included
+                lines.append(f"【输入已压缩】后续 {remaining} 个片段未展开；请只基于已给片段选择。")
+                break
+            lines.append(block)
+            lines.append("")
+            included += 1
+
+        lines.append('输出 JSON 只允许：{"keep":["segment_id"],"merge":[["segment_id1","segment_id2"]]}')
+        lines.append("不要输出时间码，不要解释。")
+        return "\n".join(lines).strip()
 
     def _build_candidate_filter_text(self) -> str:
         video = self._load_optional_step_json("video_understanding", {})
@@ -2497,9 +2541,55 @@ class PipelineRunner:
             "run_options": self._run_options_payload(),
         })
 
+    def _validate_ai_voiceover_editing_structure_or_raise(self, edit_plan: dict[str, Any]) -> None:
+        if self.options.production_mode != "ai_voiceover":
+            return
+
+        issues: list[str] = []
+        scripts = edit_plan.get("scripts", []) if isinstance(edit_plan, dict) else []
+
+        for script in scripts:
+            sid = str(script.get("short_video_id") or "unknown")
+            shots = script.get("editing_structure", [])
+            if not isinstance(shots, list) or not shots:
+                issues.append(f"{sid}: editing_structure 为空")
+                continue
+
+            for idx, shot in enumerate(shots, start=1):
+                if not isinstance(shot, dict):
+                    issues.append(f"{sid}: shot {idx} 不是对象")
+                    continue
+
+                shot_id = str(shot.get("shot_id") or f"shot_{idx}")
+                source_id = str(shot.get("source_id") or "").strip()
+                start, end = self._segment_start_end_seconds(shot)
+
+                if self._is_virtual_source_manifest() and not source_id:
+                    issues.append(f"{sid}/{shot_id}: 多源 AI 配音 shot 缺少 source_id")
+
+                if start is None or end is None:
+                    issues.append(f"{sid}/{shot_id}: 缺少 source_start/source_end")
+                elif end <= start:
+                    issues.append(f"{sid}/{shot_id}: source_end <= source_start ({start}-{end})")
+
+        if issues:
+            raise UserFacingPipelineError(
+                "invalid_ai_voiceover_edit_plan",
+                user_message="AI 配音剪辑规划无效：存在无法定位原视频的画面片段。",
+                suggestions=[
+                    "请从 content_analysis 或 short_video_edit_plan 重跑。",
+                    "如果是多源任务，请检查候选 clip 是否都带有 source_id。",
+                ],
+                technical_detail={
+                    "error_type": "invalid_ai_voiceover_edit_plan",
+                    "issues": issues[:50],
+                },
+            )
+
     def step_short_video_edit_plan(self) -> None:
         result = self._run_text_agent("short_video_edit_plan", self._build_short_video_edit_plan_text())
         result = self._materialize_short_video_edit_plan(result)
+        self._validate_ai_voiceover_editing_structure_or_raise(result)
         self._overwrite_step_json("short_video_edit_plan", result, materialized=True)
         self._write_compat_short_video_plan_and_editing_script(result)
 
@@ -2713,6 +2803,138 @@ class PipelineRunner:
             "raw_model_plan": result,
         }
 
+    def _group_chunks_by_source_and_contiguity(
+        self,
+        chunks: list[dict[str, Any]],
+        *,
+        max_gap_seconds: float = 3.0,
+    ) -> list[list[dict[str, Any]]]:
+        by_source: dict[str, list[dict[str, Any]]] = {}
+
+        for chunk in chunks:
+            source_id = str(chunk.get("source_id") or "source_1").strip()
+            if not source_id:
+                continue
+            by_source.setdefault(source_id, []).append(chunk)
+
+        groups: list[list[dict[str, Any]]] = []
+
+        for _source_id, source_chunks in by_source.items():
+            items = sorted(source_chunks, key=lambda c: self._chunk_start_end(c)[0])
+            current: list[dict[str, Any]] = []
+            current_end: float | None = None
+
+            for chunk in items:
+                start, end = self._chunk_start_end(chunk)
+                if end <= start:
+                    continue
+
+                if current and current_end is not None and start > current_end + max_gap_seconds:
+                    groups.append(current)
+                    current = []
+
+                current.append(chunk)
+                current_end = max(current_end or end, end)
+
+            if current:
+                groups.append(current)
+
+        return groups
+
+    def _source_safe_clip_id(
+        self,
+        *,
+        raw_clip_id: str,
+        source_id: str,
+        index: int,
+    ) -> str:
+        source_slug = re.sub(r"[^0-9A-Za-z_]+", "_", source_id).strip("_")
+        if not source_slug:
+            source_slug = "source"
+        return f"{source_slug}_clip_{index:03d}"
+
+    def _materialize_clip_from_chunk_group(
+        self,
+        *,
+        raw: dict[str, Any],
+        chunks: list[dict[str, Any]],
+        clip_id: str,
+    ) -> dict[str, Any] | None:
+        if not chunks:
+            return None
+
+        starts_ends = [self._chunk_start_end(chunk) for chunk in chunks]
+        starts_ends = [(s, e) for s, e in starts_ends if e > s]
+        if not starts_ends:
+            return None
+
+        start = min(s for s, _e in starts_ends)
+        end = max(e for _s, e in starts_ends)
+        if end <= start:
+            return None
+
+        source_ids = [str(chunk.get("source_id") or "source_1") for chunk in chunks]
+        unique_source_ids = list(dict.fromkeys(source_ids))
+        if len(unique_source_ids) != 1:
+            return None
+
+        source_id = unique_source_ids[0]
+        source_index = chunks[0].get("source_index", "")
+
+        chunk_ids = [
+            str(chunk.get("chunk_id") or chunk.get("global_chunk_id") or "")
+            for chunk in chunks
+            if str(chunk.get("chunk_id") or chunk.get("global_chunk_id") or "").strip()
+        ]
+
+        speech = " ".join(
+            compact_text(str(chunk.get("speech") or chunk.get("asr_digest") or ""), max_chars=260)
+            for chunk in chunks
+            if str(chunk.get("speech") or chunk.get("asr_digest") or "").strip()
+        ).strip()
+
+        visual = " ".join(
+            compact_text(str(chunk.get("visual") or chunk.get("visual_summary") or ""), max_chars=180)
+            for chunk in chunks
+            if str(chunk.get("visual") or chunk.get("visual_summary") or "").strip()
+        ).strip()
+
+        summary = str(raw.get("summary") or raw.get("reason") or speech or visual).strip()
+        clip_type = str(raw.get("type") or raw.get("clip_type") or raw.get("candidate_type") or "").strip()
+
+        return {
+            "clip_id": clip_id,
+            "raw_clip_id": str(raw.get("clip_id") or raw.get("id") or ""),
+            "chunk_ids": chunk_ids,
+            "source_chunk_ids": chunk_ids,
+
+            "source_id": source_id,
+            "source_index": source_index,
+            "source_ids": [source_id],
+
+            "local_start": seconds_to_timecode(start, ms=True),
+            "local_end": seconds_to_timecode(end, ms=True),
+            "local_start_seconds": round(start, 3),
+            "local_end_seconds": round(end, 3),
+
+            "source_start": seconds_to_timecode(start, ms=True),
+            "source_end": seconds_to_timecode(end, ms=True),
+            "source_start_seconds": round(start, 3),
+            "source_end_seconds": round(end, 3),
+
+            "start": seconds_to_timecode(start, ms=True),
+            "end": seconds_to_timecode(end, ms=True),
+            "start_seconds": round(start, 3),
+            "end_seconds": round(end, 3),
+            "duration_seconds": round(end - start, 3),
+
+            "speech": speech,
+            "visual": visual,
+            "summary": summary,
+            "type": clip_type,
+            "clip_type": clip_type,
+        }
+
     def _materialize_candidate_clips_from_chunks(self, result: Any, *, source_step: str) -> dict[str, Any]:
         if isinstance(result, list):
             raw_clips = result
@@ -2730,6 +2952,7 @@ class PipelineRunner:
             raw_clips = []
 
         materialized: list[dict[str, Any]] = []
+        per_source_clip_count: dict[str, int] = {}
         for index, raw in enumerate(raw_clips, start=1):
             if not isinstance(raw, dict):
                 continue
@@ -2741,29 +2964,39 @@ class PipelineRunner:
             )
             chunks = [chunk_by_id[cid] for cid in chunk_ids if cid in chunk_by_id]
             if chunks:
-                starts_ends = [self._chunk_start_end(chunk) for chunk in chunks]
-                start = min(start for start, _end in starts_ends)
-                end = max(end for _start, end in starts_ends)
-                source_ids = [str(chunk.get("source_id") or "source_1") for chunk in chunks]
-                unique_source_ids = list(dict.fromkeys(source_ids))
-                source_id = unique_source_ids[0] if len(unique_source_ids) == 1 else ""
-                source_index = chunks[0].get("source_index", "")
-                speech = " ".join(
-                    compact_text(str(chunk.get("speech") or chunk.get("asr_digest") or ""), max_chars=260)
-                    for chunk in chunks
-                    if str(chunk.get("speech") or chunk.get("asr_digest") or "").strip()
-                ).strip()
-                visual = " ".join(
-                    compact_text(str(chunk.get("visual") or chunk.get("visual_summary") or ""), max_chars=180)
-                    for chunk in chunks
-                    if str(chunk.get("visual") or chunk.get("visual_summary") or "").strip()
-                ).strip()
+                chunk_groups = self._group_chunks_by_source_and_contiguity(
+                    chunks,
+                    max_gap_seconds=float(
+                        self.config.raw.get("ai_voiceover", {}).get("candidate_chunk_max_gap_seconds", 3.0)
+                    ),
+                )
+                for group in chunk_groups:
+                    source_id = str(group[0].get("source_id") or "source_1").strip()
+                    per_source_clip_count[source_id] = per_source_clip_count.get(source_id, 0) + 1
+
+                    raw_clip_id = str(raw.get("clip_id") or raw.get("id") or f"clip_{index:03d}")
+                    new_clip_id = self._source_safe_clip_id(
+                        raw_clip_id=raw_clip_id,
+                        source_id=source_id,
+                        index=per_source_clip_count[source_id],
+                    )
+
+                    item = self._materialize_clip_from_chunk_group(
+                        raw=raw,
+                        chunks=group,
+                        clip_id=new_clip_id,
+                    )
+                    if item:
+                        materialized.append(item)
+                continue
             else:
                 start = self._clip_time_seconds(raw, "start", "source_start")
                 end = self._clip_time_seconds(raw, "end", "source_end")
                 if end <= start and raw.get("duration_seconds"):
                     end = start + float(raw.get("duration_seconds") or 0)
-                source_id = str(raw.get("source_id") or "source_1")
+                source_id = str(raw.get("source_id") or "source_1").strip()
+                if self._is_virtual_source_manifest() and not source_id:
+                    continue
                 unique_source_ids = [source_id] if source_id else []
                 source_index = raw.get("source_index", "")
                 speech = str(raw.get("speech") or raw.get("asr_text") or "").strip()
@@ -2772,11 +3005,19 @@ class PipelineRunner:
                     chunk_ids = self._coerce_id_list(raw.get("source_chunk_ids"))
             if end <= start:
                 continue
-            clip_id = str(raw.get("clip_id") or raw.get("id") or f"clip_{len(materialized) + 1:03d}")
+            
+            per_source_clip_count[source_id] = per_source_clip_count.get(source_id, 0) + 1
+            raw_clip_id = str(raw.get("clip_id") or raw.get("id") or f"clip_{index:03d}")
+            new_clip_id = self._source_safe_clip_id(
+                raw_clip_id=raw_clip_id,
+                source_id=source_id,
+                index=per_source_clip_count[source_id],
+            )
             summary = str(raw.get("summary") or raw.get("reason") or speech or visual).strip()
             clip_type = str(raw.get("type") or raw.get("clip_type") or raw.get("candidate_type") or "").strip()
             materialized.append({
-                "clip_id": clip_id,
+                "clip_id": new_clip_id,
+                "raw_clip_id": raw_clip_id,
                 "chunk_ids": chunk_ids,
                 "source_chunk_ids": chunk_ids,
                 "local_start": seconds_to_timecode(start, ms=True),
@@ -3049,8 +3290,34 @@ class PipelineRunner:
         )
 
     def _candidate_clips_by_id(self) -> dict[str, dict[str, Any]]:
-        clips = self._load_candidate_clip_pool(filtered=True) if self.options.production_mode == "highlight_reassembly" else self._load_candidate_clips_for_current_mode()
-        return {self._clip_id(clip, index): clip for index, clip in enumerate(clips)}
+        clips = (
+            self._load_candidate_clip_pool(filtered=True)
+            if self.options.production_mode == "highlight_reassembly"
+            else self._load_candidate_clips_for_current_mode()
+        )
+
+        by_id: dict[str, dict[str, Any]] = {}
+        duplicate_raw_ids: dict[str, list[dict[str, Any]]] = {}
+
+        for index, clip in enumerate(clips):
+            clip_id = self._clip_id(clip, index)
+            if clip_id:
+                by_id[clip_id] = clip
+
+            source_id = str(clip.get("source_id") or "").strip()
+            if source_id and clip_id:
+                by_id[f"{source_id}:{clip_id}"] = clip
+
+            raw_clip_id = str(clip.get("raw_clip_id") or "").strip()
+            if raw_clip_id:
+                duplicate_raw_ids.setdefault(raw_clip_id, []).append(clip)
+
+        # 只有 raw_clip_id 唯一时才兼容旧 ID
+        for raw_clip_id, items in duplicate_raw_ids.items():
+            if len(items) == 1:
+                by_id.setdefault(raw_clip_id, items[0])
+
+        return by_id
 
     def _stringify_fact_points(self, values: Any) -> list[str]:
         if not isinstance(values, list):
@@ -5270,6 +5537,23 @@ class PipelineRunner:
                 blocked_reasons.append("require_tts=true 且音频策略需要 AI 配音，但 AI 配音未成功生成")
             voiceover_duration = float(tts_item.get("actual_duration_seconds") or script.get("estimated_total_duration_seconds") or validation["video_duration_seconds"])
             raw_clips, invalid_clips = self._build_clips_from_editing_structure(script.get("editing_structure", []))
+            
+            if self.options.production_mode == "ai_voiceover" and self._is_virtual_source_manifest():
+                missing_source_clips = [
+                    clip for clip in raw_clips
+                    if not str(clip.get("source_id") or "").strip()
+                ]
+                if missing_source_clips:
+                    blocked_reasons.append(
+                        "多源 AI 配音剪辑计划中存在 source_id 为空的画面片段，无法定位原视频；"
+                        "请回查 content_analysis/short_video_edit_plan 的候选片段物化。"
+                    )
+                    cut_plan_debug = {
+                        "short_video_id": sid,
+                        "missing_source_id_clips": missing_source_clips[:20]
+                    }
+                    write_json(vdir / f"{sid}_cut_plan_debug.json", cut_plan_debug)
+
             cut_plan_debug = {
                 "short_video_id": sid,
                 "editing_structure_count": len(script.get("editing_structure", []) or []),
