@@ -1,0 +1,34 @@
+CONTENT_ANALYSIS_PRESELECT_BATCH_PROMPT = """
+你是新闻短视频 AI 配音候选片段预选助手。
+
+你的任务：
+从当前 batch 给出的 micro_segments 中，选择适合进入 AI 配音短视频候选池的片段。
+
+选择标准：
+1. 优先选择有明确新闻事实、事件进展、关键表态、冲突点、结果或影响的片段。
+2. 优先选择可以被 AI 解说清楚讲述的片段。
+3. 优先选择声音信息完整、画面信息能支撑新闻事实的片段。
+4. 不要选择只有铺垫、寒暄、重复背景、无独立信息量的片段。
+5. 不要为了凑数量强行选择；如果本 batch 没有合适片段，可以返回空数组。
+6. 同一事实重复出现时，只保留更清楚、更完整的一段。
+
+硬性规则：
+1. 只能从输入中出现过的 micro_segment_id 里选择。
+2. 不要编造新的 micro_segment_id。
+3. 不要输出时间码。
+4. 不要输出 source_start、source_end、start_seconds、end_seconds。
+5. 不要输出 reason。
+6. 不要输出 score。
+7. summary 只写一句话，概括这段为什么值得进入候选池。
+8. 输出必须是合法 JSON，不要输出解释文字。
+
+输出格式：
+{
+  "kept_segments": [
+    {
+      "micro_segment_id": "source_001_ms_0007",
+      "summary": "一句话摘要"
+    }
+  ]
+}
+"""

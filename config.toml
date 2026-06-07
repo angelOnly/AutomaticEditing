@@ -112,6 +112,26 @@ max_llm_sources = 20
 max_llm_candidate_clips = 14
 max_llm_context_chunks = 3
 max_llm_key_facts = 8
+max_content_analysis_preselect_input_chars = 9000
+max_content_analysis_input_chars = 12000
+
+[content_analysis_preselect]
+enabled = true
+direct_threshold = 10
+small_total_threshold = 30
+small_batch_size = 10
+small_max_keep_per_batch = 5
+small_max_final_candidates = 20
+large_batch_size = 10
+large_max_keep_per_batch = 3
+large_max_final_candidates = 30
+max_workers = 4
+max_asr_chars_per_segment = 220
+max_visual_chars_per_segment = 100
+max_summary_chars_per_segment = 120
+max_input_chars_per_batch = 8000
+require_micro_segment_id = true
+allow_empty_batch_result = true
 
 [asr_micro_segment]
 enabled = true
