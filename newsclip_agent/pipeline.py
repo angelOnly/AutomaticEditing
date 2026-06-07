@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import copy
 import os
 import re
 import shutil
@@ -6091,6 +6092,32 @@ class PipelineRunner:
             segments.append({"shot_id": shot.get("shot_id") or f"{short_video_id}_s{index:02d}", "text": text})
         return {"short_video_id": short_video_id, "narration_text": narration, "narration_segments": segments}
 
+    def _resolve_script_visual_target_duration(self, edit_script: dict[str, Any], voice_script: dict[str, Any]) -> float:
+        editing_structure = edit_script.get("editing_structure", [])
+        total_target = sum(float(shot.get("target_duration_seconds", 0) or 0) for shot in editing_structure if isinstance(shot, dict) and shot.get("target_duration_seconds"))
+        if total_target > 0 and math.isfinite(total_target):
+            return total_target
+        
+        fallback_vals = [
+            editing_structure_duration(editing_structure),
+            edit_script.get("estimated_total_duration_seconds"),
+            voice_script.get("target_duration_seconds"),
+            self.options.target_duration_seconds,
+            (self.config.raw.get("voiceover", {}) if hasattr(self, "config") else {}).get("default_target_duration_seconds")
+        ]
+        for val in fallback_vals:
+            try:
+                v = float(val or 0)
+                if v > 0 and math.isfinite(v):
+                    return v
+            except (ValueError, TypeError):
+                continue
+        return 0.0
+
+    def _voiceover_text_chars(self, text: str) -> int:
+        clean = clean_voiceover_text(str(text or ""))
+        return len(re.sub(r"\s+", "", clean))
+
     def _attach_voiceover_script_timings(self, voiceover_output: dict[str, Any], edit_plan: dict[str, Any]) -> None:
         scripts = voiceover_output.get("scripts", []) if isinstance(voiceover_output, dict) else []
         edit_scripts = edit_plan.get("scripts", []) if isinstance(edit_plan, dict) else []
@@ -6126,7 +6153,9 @@ class PipelineRunner:
         for index, shot in enumerate(editing_structure, start=1):
             if not isinstance(shot, dict):
                 continue
-            duration = shot.get("duration_seconds")
+            duration = shot.get("target_duration_seconds")
+            if duration is None:
+                duration = shot.get("duration_seconds")
             if duration is None:
                 start = timecode_to_seconds(shot.get("source_start"))
                 end = timecode_to_seconds(shot.get("source_end"))
@@ -6186,6 +6215,192 @@ class PipelineRunner:
             if clean_texts:
                 script["narration_text"] = " ".join(clean_texts)
 
+    def _collect_voiceover_segment_duration_issues(self, voiceover_output: dict[str, Any]) -> list[dict[str, Any]]:
+        if self.options.production_mode != "ai_voiceover":
+            return []
+        voice_cfg = self.config.raw.get("voiceover", {}) if hasattr(self, "config") else {}
+        min_ratio = float(voice_cfg.get("pre_tts_segment_min_ratio", 0.65))
+        cps = float(voice_cfg.get("voiceover_chars_per_second", 4.8))
+        
+        issues = []
+        scripts = voiceover_output.get("scripts", []) if isinstance(voiceover_output, dict) else []
+        for script in scripts:
+            if not isinstance(script, dict):
+                continue
+            sid = str(script.get("short_video_id") or "")
+            for seg in script.get("narration_segments", []):
+                if not isinstance(seg, dict):
+                    continue
+                target = float(seg.get("target_duration_seconds") or 0)
+                if target <= 0:
+                    continue
+                text = str(seg.get("text") or "")
+                chars = self._voiceover_text_chars(text)
+                estimated = chars / max(cps, 1.0)
+                required = target * min_ratio
+                
+                if estimated < required:
+                    issues.append({
+                        "short_video_id": sid,
+                        "shot_id": str(seg.get("shot_id") or ""),
+                        "type": "segment_duration_too_short",
+                        "source": "pre_tts_segment_duration",
+                        "target_duration_seconds": target,
+                        "estimated_text_duration_seconds": round(estimated, 2),
+                        "required_estimated_seconds": round(required, 2),
+                        "chars": chars,
+                        "required_chars": int(required * cps),
+                        "under_chars": max(0, int(required * cps) - chars),
+                        "severity": "hard"
+                    })
+        return issues
+
+    def _collect_voiceover_script_duration_issues(self, voiceover_output: dict[str, Any], edit_plan: dict[str, Any]) -> list[dict[str, Any]]:
+        if self.options.production_mode != "ai_voiceover":
+            return []
+        script_cfg = self.config.raw.get("voiceover_script", {}) if hasattr(self, "config") else {}
+        voice_cfg = self.config.raw.get("voiceover", {}) if hasattr(self, "config") else {}
+        soft_min_ratio = float(script_cfg.get("script_estimated_soft_min_ratio", 0.85))
+        hard_min_ratio = float(script_cfg.get("script_estimated_hard_min_ratio", 0.65))
+        cps = float(voice_cfg.get("voiceover_chars_per_second", 4.8))
+        
+        issues = []
+        voice_scripts = voiceover_output.get("scripts", []) if isinstance(voiceover_output, dict) else []
+        edit_scripts = edit_plan.get("scripts", []) if isinstance(edit_plan, dict) else []
+        edit_by_id = {str(script.get("short_video_id")): script for script in edit_scripts if isinstance(script, dict) and script.get("short_video_id")}
+        
+        for index, voice_script in enumerate(voice_scripts):
+            if not isinstance(voice_script, dict):
+                continue
+            sid = str(voice_script.get("short_video_id") or f"v_{index + 1:03d}")
+            edit_script = edit_by_id.get(sid)
+            if not edit_script and index < len(edit_scripts):
+                edit_script = edit_scripts[index]
+            if not edit_script:
+                continue
+                
+            target = self._resolve_script_visual_target_duration(edit_script, voice_script)
+            if target <= 0:
+                continue
+                
+            text = voice_script.get("narration_text")
+            if not text:
+                text = " ".join(str(seg.get("text", "")) for seg in voice_script.get("narration_segments", []) if isinstance(seg, dict))
+            
+            chars = self._voiceover_text_chars(text)
+            estimated = chars / max(cps, 1.0)
+            ratio = estimated / target if target > 0 else 1.0
+            
+            severity = None
+            if ratio < hard_min_ratio:
+                severity = "hard"
+            elif ratio < soft_min_ratio:
+                severity = "warning"
+                
+            if severity:
+                required = target * soft_min_ratio
+                issues.append({
+                    "short_video_id": sid,
+                    "shot_id": None,
+                    "type": "script_duration_too_short",
+                    "source": "pre_tts_script_duration",
+                    "script_target_duration_seconds": target,
+                    "script_estimated_duration_seconds": round(estimated, 2),
+                    "script_required_duration_seconds": round(required, 2),
+                    "script_missing_chars": max(0, int((required - estimated) * cps)),
+                    "severity": severity
+                })
+        return issues
+
+    def _expand_script_duration_issue_to_segment_issues(
+        self,
+        script_issues: list[dict[str, Any]],
+        voiceover_output: dict[str, Any],
+        edit_plan: dict[str, Any],
+        existing_segment_issues: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        expanded = []
+        voice_scripts = voiceover_output.get("scripts", []) if isinstance(voiceover_output, dict) else []
+        voice_by_id = {str(s.get("short_video_id")): s for s in voice_scripts if isinstance(s, dict) and s.get("short_video_id")}
+        
+        for issue in script_issues:
+            sid = issue.get("short_video_id")
+            script = voice_by_id.get(sid)
+            if not script:
+                continue
+            segments = [seg for seg in script.get("narration_segments", []) if isinstance(seg, dict)]
+            if not segments:
+                continue
+                
+            missing_chars = issue.get("script_missing_chars", 0)
+            if missing_chars <= 0:
+                continue
+                
+            # Find segments that already have issues
+            seg_issues_for_sid = [si for si in existing_segment_issues if si.get("short_video_id") == sid and si.get("shot_id")]
+            target_segments = []
+            
+            if seg_issues_for_sid:
+                target_shot_ids = {si["shot_id"] for si in seg_issues_for_sid}
+                target_segments = [seg for seg in segments if str(seg.get("shot_id")) in target_shot_ids]
+            
+            if not target_segments:
+                target_segments = segments
+                
+            total_target_dur = sum(float(seg.get("target_duration_seconds") or 0) for seg in target_segments)
+            if total_target_dur <= 0:
+                # Fallback to equal distribution
+                chars_per_seg = max(8, missing_chars // len(target_segments))
+                for seg in target_segments:
+                    expanded.append({
+                        "short_video_id": sid,
+                        "shot_id": str(seg.get("shot_id") or ""),
+                        "type": "script_duration_too_short",
+                        "source": "pre_tts_script_duration",
+                        "suggested_add_chars": chars_per_seg,
+                        "severity": issue.get("severity", "warning")
+                    })
+            else:
+                for seg in target_segments:
+                    dur = float(seg.get("target_duration_seconds") or 0)
+                    if dur > 0:
+                        suggested = max(8, int(missing_chars * (dur / total_target_dur)))
+                        expanded.append({
+                            "short_video_id": sid,
+                            "shot_id": str(seg.get("shot_id") or ""),
+                            "type": "script_duration_too_short",
+                            "source": "pre_tts_script_duration",
+                            "suggested_add_chars": suggested,
+                            "severity": issue.get("severity", "warning")
+                        })
+        return expanded
+
+    def _merge_voiceover_duration_issues_into_alignment(
+        self,
+        alignment: dict[str, Any],
+        segment_issues: list[dict[str, Any]],
+        expanded_script_issues: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        merged = copy.deepcopy(alignment)
+        all_issues = segment_issues + expanded_script_issues
+        
+        for check in merged.get("checks", []):
+            sid = check.get("short_video_id")
+            issues_for_sid = [i for i in all_issues if i.get("short_video_id") == sid]
+            
+            if issues_for_sid:
+                if "char_budget_issues" not in check:
+                    check["char_budget_issues"] = []
+                check["char_budget_issues"].extend(issues_for_sid)
+                
+                # Check if any of these are 'hard' severity
+                has_hard = any(i.get("severity") == "hard" for i in issues_for_sid)
+                if has_hard:
+                    check["ok"] = False
+                    
+        merged["ok"] = all(check.get("ok", True) for check in merged.get("checks", []))
+        return merged
+
     def _check_is_text_patch_repairable(self, check: dict[str, Any], *, repair_on_warnings: bool = False) -> bool:
         if check.get("missing_shot_ids") or check.get("extra_shot_ids"):
             return False
@@ -6228,8 +6443,14 @@ class PipelineRunner:
         segments = voice_script.get("narration_segments", [])
         
         issue_map = {}
+        issues_by_shot = {}
         for issue in alignment_check.get("char_budget_issues", []) + alignment_check.get("char_budget_warnings", []):
-            issue_map[str(issue.get("shot_id"))] = issue.get("type", "unknown")
+            sid = str(issue.get("shot_id") or "")
+            if sid:
+                issue_map[sid] = issue.get("type", "unknown")
+                if sid not in issues_by_shot:
+                    issues_by_shot[sid] = []
+                issues_by_shot[sid].append(issue)
         for empty_id in alignment_check.get("empty_text_shot_ids", []):
             issue_map[str(empty_id)] = "empty"
             
@@ -6244,6 +6465,7 @@ class PipelineRunner:
             problem_segments.append({
                 "shot_id": shot_id,
                 "issue_type": issue_map[shot_id],
+                "issues": issues_by_shot.get(shot_id, []),
                 "current_chars": len(re.sub(r"\s+", "", str(seg.get("text", "")))),
                 "min_chars": self._first_number(shot.get("narration_min_chars")),
                 "target_chars": self._first_number(shot.get("narration_target_chars")),
@@ -6381,6 +6603,11 @@ class PipelineRunner:
             raise_on_error=False,
         )
         
+        segment_issues = self._collect_voiceover_segment_duration_issues(final_output)
+        script_issues = self._collect_voiceover_script_duration_issues(final_output, edit_plan)
+        expanded_script_issues = self._expand_script_duration_issue_to_segment_issues(script_issues, final_output, edit_plan, segment_issues)
+        merged_alignment = self._merge_voiceover_duration_issues_into_alignment(alignment, segment_issues, expanded_script_issues)
+        
         cfg = self.config.raw.get("voiceover_script", {})
         repair_enabled = bool(cfg.get("repair_enabled", True))
         max_repair_rounds = int(cfg.get("max_repair_rounds", 2))
@@ -6399,10 +6626,10 @@ class PipelineRunner:
             "details": []
         }
         
-        if not alignment.get("ok") and repair_enabled:
+        if not merged_alignment.get("ok") and repair_enabled:
             for round_index in range(1, max_repair_rounds + 1):
                 round_applied = False
-                for check in alignment.get("checks", []):
+                for check in merged_alignment.get("checks", []):
                     if check.get("ok"):
                         continue
                     if not self._check_is_text_patch_repairable(check, repair_on_warnings=repair_on_warnings):
@@ -6443,16 +6670,21 @@ class PipelineRunner:
                     edit_plan,
                     raise_on_error=False,
                 )
+                segment_issues = self._collect_voiceover_segment_duration_issues(final_output)
+                script_issues = self._collect_voiceover_script_duration_issues(final_output, edit_plan)
+                expanded_script_issues = self._expand_script_duration_issue_to_segment_issues(script_issues, final_output, edit_plan, segment_issues)
+                merged_alignment = self._merge_voiceover_duration_issues_into_alignment(alignment, segment_issues, expanded_script_issues)
+                
                 ensure_dir(vdir / f"repair_round_{round_index}")
-                write_json(vdir / f"repair_round_{round_index}" / "alignment_after_repair.json", alignment)
-                if alignment.get("ok"):
+                write_json(vdir / f"repair_round_{round_index}" / "alignment_after_repair.json", merged_alignment)
+                if merged_alignment.get("ok"):
                     break
                     
             write_json(vdir / "voiceover_repair_summary.json", repair_summary)
             # 覆盖原 voiceover_script.json
             write_json(vdir / "voiceover_script.json", final_output)
 
-        if not alignment.get("ok"):
+        if not merged_alignment.get("ok"):
             self._validate_voiceover_script_against_editing_structure(
                 final_output,
                 edit_plan,
@@ -7228,6 +7460,7 @@ class PipelineRunner:
         reconcile = self._build_tts_duration_reconcile(editing, voiceover, {"outputs": outputs})
         reconcile_ok = bool(reconcile.get("ok", True))
         reconcile_hard_segments = self._tts_reconcile_hard_segments(reconcile)
+        reconcile_hard_videos = self._tts_reconcile_hard_videos(reconcile)
         failed = sum(1 for item in outputs if item.get("status") == "failed")
         success = sum(1 for item in outputs if item.get("status") == "success")
         expected_tts_segments = self._expected_tts_segment_keys() if tts_is_hard_required else set()
@@ -7255,6 +7488,9 @@ class PipelineRunner:
         elif tts_is_hard_required and not reconcile_ok:
             overall_status = "failed"
             hard_error = "TTS duration reconcile failed"
+        elif tts_is_hard_required and reconcile_hard_videos:
+            overall_status = "failed"
+            hard_error = "TTS duration has hard mismatch videos"
         elif tts_is_hard_required and reconcile_hard_segments:
             overall_status = "failed"
             hard_error = "TTS duration has hard mismatch segments"
@@ -7301,6 +7537,16 @@ class PipelineRunner:
                     item["short_video_id"] = sid
                     hard_segments.append(item)
         return hard_segments
+
+    def _tts_reconcile_hard_videos(self, reconcile: dict[str, Any]) -> list[dict[str, Any]]:
+        hard_videos = []
+        for video in reconcile.get("videos") or []:
+            if not isinstance(video, dict):
+                continue
+            total_check = video.get("total_check") or {}
+            if total_check.get("hard") or total_check.get("status") in {"too_short", "too_long"}:
+                hard_videos.append(video)
+        return hard_videos
 
     def _build_tts_duration_reconcile(
         self,
@@ -7365,13 +7611,38 @@ class PipelineRunner:
             video_target_total = sum(float(seg.get("target_duration_seconds") or 0) for seg in segment_checks)
             video_tts_total = sum(float(seg.get("tts_actual_duration_seconds") or 0) for seg in segment_checks)
             coverage_ratio = video_tts_total / video_target_total if video_target_total > 0 else 0.0
+            
+            script_ok_min = float(voice_cfg.get("tts_script_ok_min_ratio") or 0.90)
+            script_hard_min = float(voice_cfg.get("tts_script_hard_min_ratio") or 0.75)
+            script_ok_max = float(voice_cfg.get("tts_script_ok_max_ratio") or 1.15)
+            script_hard_max = float(voice_cfg.get("tts_script_hard_max_ratio") or 1.40)
+            
+            total_status = "ok"
+            total_hard = False
+            if video_target_total > 0:
+                if coverage_ratio < script_hard_min:
+                    total_status = "too_short"
+                    total_hard = True
+                elif coverage_ratio < script_ok_min:
+                    total_status = "slightly_short"
+                elif coverage_ratio > script_hard_max:
+                    total_status = "too_long"
+                    total_hard = True
+                elif coverage_ratio > script_ok_max:
+                    total_status = "slightly_long"
+
             hard_count = sum(1 for seg in segment_checks if seg.get("hard"))
             videos.append({
                 "short_video_id": sid,
-                "ok": all(seg.get("status") in {"ok", "slightly_short", "slightly_long"} for seg in segment_checks),
+                "ok": all(seg.get("status") in {"ok", "slightly_short", "slightly_long"} for seg in segment_checks) and not total_hard,
                 "target_total_duration_seconds": round(video_target_total, 3),
                 "tts_total_duration_seconds": round(video_tts_total, 3),
                 "coverage_ratio": round(coverage_ratio, 3),
+                "total_check": {
+                    "ratio": round(coverage_ratio, 3),
+                    "status": total_status,
+                    "hard": total_hard
+                },
                 "hard_segment_count": hard_count,
                 "segments": segment_checks,
             })
@@ -7793,6 +8064,46 @@ class PipelineRunner:
                 technical_detail={"errors": errors},
             )
 
+    def _validate_ai_voiceover_coverage_before_render(self, renderable_videos: list[dict[str, Any]]) -> None:
+        if self.options.production_mode != "ai_voiceover":
+            return
+            
+        cfg = self.config.raw.get("voiceover", {}) if hasattr(self, "config") else {}
+        if not cfg.get("ai_voiceover_block_duration_mismatch", True):
+            return
+            
+        errors = []
+        for video in renderable_videos:
+            vid = video.get("short_video_id") or ""
+            video_dur = float(video.get("video_duration_seconds") or 0)
+            voice_dur = float(video.get("voiceover_duration_seconds") or 0)
+            
+            if video_dur > 0 and voice_dur > 0:
+                ratio = voice_dur / video_dur
+                hard_min = float(cfg.get("tts_script_hard_min_ratio", 0.75))
+                
+                if ratio < hard_min:
+                    errors.append({
+                        "short_video_id": vid,
+                        "video_duration_seconds": round(video_dur, 2),
+                        "voiceover_duration_seconds": round(voice_dur, 2),
+                        "coverage_ratio": round(ratio, 2),
+                        "required_min_ratio": hard_min,
+                        "reason": f"AI配音总时长占比过低 ({ratio:.1%} < {hard_min:.1%})，导致视频后半段无解说",
+                    })
+
+        if errors:
+            raise UserFacingPipelineError(
+                "ai_voiceover_coverage_too_low",
+                user_message="最终剪辑计划中 AI 配音时长未能充分覆盖视频时长，成片后半段可能出现长时间无声。",
+                suggestions=[
+                    "文案内容过少或目标时长过长，导致画面多而解说少。",
+                    "建议：重新调整生成配音文案，增加解说词；或者在「视频时长设定」中调小期望时长。",
+                    "或者修改 config.toml 中的 tts_script_hard_min_ratio 降低硬性拦截标准。",
+                ],
+                technical_detail={"errors": errors},
+            )
+
     def step_cut_plan(self) -> None:
         editing = self._load_step_json("editing_script")
         voiceover_script = self._load_step_json("voiceover_script")
@@ -8080,6 +8391,7 @@ class PipelineRunner:
                 video.setdefault("blocked_reasons", []).extend(audio_check["issues"])
                 video["duration_status"] = "blocked"
         renderable_videos = [video for video in output_videos if video.get("duration_status") != "blocked"]
+        self._validate_ai_voiceover_coverage_before_render(renderable_videos)
         renderable_total_seconds = round(sum(float(video.get("video_duration_seconds") or 0) for video in renderable_videos), 3)
         if (
             source_duration >= self.duration_settings.long_source_threshold_seconds

@@ -196,6 +196,10 @@ repair_temperature = 0.1
 repair_max_tokens = 1000
 repair_on_warnings = false
 repair_structural_mismatch = false
+repair_on_segment_duration_issues = true
+repair_on_script_duration_issues = true
+script_estimated_soft_min_ratio = 0.85
+script_estimated_hard_min_ratio = 0.65
 
 [short_video]
 default_target_seconds = 30
@@ -270,6 +274,12 @@ long_source_threshold_seconds = 600
 long_source_min_total_output_seconds = 90
 long_source_preferred_total_output_seconds = 150
 long_source_min_video_count = 2
+tts_script_ok_min_ratio = 0.90
+tts_script_hard_min_ratio = 0.75
+tts_script_ok_max_ratio = 1.15
+tts_script_hard_max_ratio = 1.40
+voiceover_cover_min_ratio = 0.90
+subtitle_cover_min_ratio = 0.90
 
 [ai_voiceover]
 candidate_chunk_max_gap_seconds = 3.0
