@@ -61,7 +61,9 @@ if __name__ == "__main__":
     if args.port is not None:
         port = args.port
     else:
-        port = find_free_port(host=host, start=7860)
+        probe_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
+        port = find_free_port(host=probe_host, start=7860)
 
-    print(f"Web 工作台地址: http://{host}:{port}")
+    display_host = "127.0.0.1" if host == "0.0.0.0" else host
+    print(f"Web 工作台地址: http://{display_host}:{port}")
     uvicorn.run("web_app:app", host=host, port=port, reload=False)

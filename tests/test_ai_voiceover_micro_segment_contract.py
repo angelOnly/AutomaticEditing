@@ -3,7 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
-from newsclip_agent.pipeline import PipelineRunner, read_json
+import pytest
+
+from newsclip_agent.pipeline import PipelineRunner, UserFacingPipelineError, read_json, write_json
 
 
 def _runner(tmp_path: Path | None = None) -> PipelineRunner:
@@ -117,3 +119,83 @@ def test_candidate_materialize_records_short_clip_without_extending(tmp_path: Pa
     assert clip["source_end_seconds"] == 2.0
     assert clip["duration_seconds"] == 1.0
     assert debug["diagnostics"]["short_clips"][0]["micro_segment_id"] == "ms_001"
+
+
+def test_asr_sentence_units_loads_standalone_raw_index(tmp_path: Path) -> None:
+    runner = _runner(tmp_path)
+    raw_index = {
+        "sources": [
+            {
+                "source_id": "source_001",
+                "source_index": 1,
+                "asr_segments": [
+                    {
+                        "asr_segment_id": "a1",
+                        "start_seconds": 1.0,
+                        "end_seconds": 3.0,
+                        "normalized_text": "standalone raw asr",
+                    }
+                ],
+            }
+        ]
+    }
+    raw_path = tmp_path / "source_aggregate" / "v1" / "source_raw_asr_index.json"
+    write_json(raw_path, raw_index)
+    runner.manifest = {
+        "source_mode": "multi_source_pool",
+        "source_videos": [{"source_id": "source_001"}],
+        "source_manifest": "input/source_manifest.json",
+        "steps": {"source_aggregate": {"output": "source_aggregate/v1/source_aggregate.json"}},
+    }
+    runner.config.raw = {"asr_micro_segment": {"max_sentence_chars": 120}}
+    runner._load_optional_step_json = lambda step, default=None: {
+        "raw_asr_index_file": "source_aggregate/v1/source_raw_asr_index.json",
+        "raw_asr_index": {"sources": []},
+    }
+
+    sentences = runner._build_asr_sentence_units()
+
+    assert len(sentences) == 1
+    assert sentences[0]["text"] == "standalone raw asr"
+
+
+def test_asr_sentence_units_missing_raw_index_fails_fast(tmp_path: Path) -> None:
+    runner = _runner(tmp_path)
+    runner.manifest = {
+        "source_mode": "multi_source_pool",
+        "source_videos": [{"source_id": "source_001"}],
+        "source_manifest": "input/source_manifest.json",
+        "steps": {"source_aggregate": {"output": "source_aggregate/v1/source_aggregate.json"}},
+    }
+    runner.config.raw = {"asr_micro_segment": {"max_sentence_chars": 120}}
+    runner._load_optional_step_json = lambda step, default=None: {"raw_asr_index_file": "source_aggregate/v1/missing.json"}
+
+    with pytest.raises(UserFacingPipelineError, match="source_raw_asr_index_missing"):
+        runner._build_asr_sentence_units()
+
+
+def test_tts_missing_segment_keys_are_detected(tmp_path: Path) -> None:
+    runner = _runner(tmp_path)
+    runner._load_step_json = lambda step: {
+        "scripts": [
+            {
+                "short_video_id": "v_001",
+                "narration_segments": [{"shot_id": "v_001_s01", "text": "hello"}],
+            }
+        ]
+    }
+
+    expected = runner._expected_tts_segment_keys()
+
+    assert expected == {("v_001", "v_001_s01")}
+    actual: set[tuple[str, str]] = set()
+    assert sorted(expected - actual) == [("v_001", "v_001_s01")]
+
+
+def test_cut_plan_empty_clips_fails_fast(tmp_path: Path) -> None:
+    runner = _runner(tmp_path)
+
+    with pytest.raises(UserFacingPipelineError, match="cut_plan_clips_invalid"):
+        runner._validate_cut_plan_not_empty_or_raise({
+            "output_videos": [{"short_video_id": "v_001", "clips": []}]
+        })

@@ -139,7 +139,7 @@ min_clip_seconds = 3.0
 max_clip_seconds = 30.0
 fail_on_empty = true
 truncate_overlong = false
-fail_on_overlong = false
+fail_on_overlong = true
 fail_on_short = false
 
 [compat]
