@@ -3808,7 +3808,7 @@ class PipelineRunner:
         )
         print("完成: content_analysis_preselect")
 
-\n    def step_content_analysis(self) -> None:
+    def step_content_analysis(self) -> None:
         cfg = self.config.raw.get("asr_micro_segment", {})
         use_micro_segments = cfg.get("enabled", True)
         if not use_micro_segments or self.manifest.get("steps", {}).get("asr_micro_segment", {}).get("status") != "success":
