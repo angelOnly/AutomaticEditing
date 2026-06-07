@@ -200,6 +200,7 @@ class PipelineRunner:
     def run(self) -> dict[str, Any]:
         selected = self._resolve_selected_steps()
         self._record_run_options(selected)
+        self._write_effective_runtime_flags(selected)
         print(f"任务目录: {self.task_dir}")
         print(f"执行步骤: {', '.join(selected)}")
         try:
@@ -359,6 +360,30 @@ class PipelineRunner:
         self.manifest["last_run_options"] = run_options
         self.manifest.setdefault("run_history", []).append(run_options)
         self.manifest["run_history"] = self.manifest["run_history"][-20:]
+        self._save_manifest()
+
+    def _write_effective_runtime_flags(self, selected_steps: list[str]) -> None:
+        unified = self._is_virtual_source_manifest()
+        workflow_key = f"{self.options.production_mode}:{'unified' if unified else 'legacy'}"
+        source_manifest = str(self.options.source_manifest or self.manifest.get("source_manifest") or "")
+        doc = {
+            "version": "effective_runtime_flags_v1",
+            "created_at": now_iso(),
+            "production_mode": self.options.production_mode,
+            "audio_policy": self.options.audio_policy,
+            "require_tts": bool(self.options.require_tts),
+            "skip_tts": bool(self.options.skip_tts),
+            "skip_render": bool(self.options.skip_render),
+            "only_analysis": bool(self.options.only_analysis),
+            "common_only": bool(self.options.common_only),
+            "source_manifest": source_manifest,
+            "source_mode": "unified" if unified else "legacy",
+            "resolved_workflow_key": workflow_key,
+            "resolved_workflow_steps": self._active_step_order(),
+            "selected_steps": selected_steps,
+        }
+        out = write_json(self.task_dir / "effective_runtime_flags.json", doc)
+        self.manifest["effective_runtime_flags"] = relpath(out, self.task_dir)
         self._save_manifest()
 
     def _make_llm(self, kind: str) -> OpenAICompatibleClient | None:
@@ -1269,10 +1294,16 @@ class PipelineRunner:
                 continue
             child_manifest = read_json(self.task_dir / work_task_dir / "manifest.json", {})
             asr_step = (child_manifest.get("steps") or {}).get("asr") or {}
+            asr_output = str(asr_step.get("output") or "")
+            asr_output_hash = str(asr_step.get("output_hash") or "")
+            if asr_output and not asr_output_hash:
+                asr_path = self.task_dir / work_task_dir / asr_output
+                if asr_path.exists():
+                    asr_output_hash = output_hash([asr_path])
             hashes.append({
                 "source_id": summary_doc.get("source_id") or source_result.get("source_id") or "",
-                "asr_output": asr_step.get("output", ""),
-                "asr_output_hash": asr_step.get("output_hash", ""),
+                "asr_output": asr_output,
+                "asr_output_hash": asr_output_hash,
             })
         return hashes
 
@@ -1342,6 +1373,16 @@ class PipelineRunner:
                 end=float(end),
                 chunks=chunks,
             )
+            chunk_diagnostics = []
+            if not source_chunk_ids:
+                chunk_diagnostics.append({
+                    "reason": "asr_chunk_no_overlap",
+                    "source_id": source_id,
+                    "asr_segment_id": f"{source_id}_asr_{idx:06d}",
+                    "start_seconds": round(float(start), 3),
+                    "end_seconds": round(float(end), 3),
+                    "source_chunk_id_hint": seg.get("chunk_id", ""),
+                })
             out.append({
                 "asr_segment_id": f"{source_id}_asr_{idx:06d}",
                 "source_raw_asr_segment_id": seg.get("asr_segment_id") or seg.get("id") or "",
@@ -1356,6 +1397,7 @@ class PipelineRunner:
                 "primary_chunk_id": primary_chunk_id,
                 "source_chunk_ids": source_chunk_ids,
                 "source_chunk_id_hint": seg.get("chunk_id", ""),
+                "diagnostics": chunk_diagnostics,
                 "removed_tokens": seg.get("removed_tokens", []),
             })
         return out
@@ -1432,6 +1474,7 @@ class PipelineRunner:
         ))
         raw_sources: list[dict[str, Any]] = []
         raw_segments_all: list[dict[str, Any]] = []
+        raw_asr_diagnostics: list[dict[str, Any]] = []
         for summary_doc in summary_docs:
             source_id = str(summary_doc.get("source_id") or "").strip()
             if not source_id:
@@ -1444,6 +1487,10 @@ class PipelineRunner:
                 chunks=chunks,
             )
             raw_segments_all.extend(asr_segments)
+            for seg in asr_segments:
+                for item in seg.get("diagnostics") or []:
+                    if isinstance(item, dict):
+                        raw_asr_diagnostics.append(item)
             raw_sources.append({
                 "source_id": source_id,
                 "source_index": source_index,
@@ -1455,6 +1502,7 @@ class PipelineRunner:
         raw_asr_index = {
             "version": "source_raw_asr_index_v1",
             "raw_asr_segment_count": len(raw_segments_all),
+            "diagnostics": raw_asr_diagnostics,
             "sources": raw_sources,
         }
         aggregate = {
@@ -1470,9 +1518,11 @@ class PipelineRunner:
                 "chunks": chunks,
             },
             "raw_asr_index": raw_asr_index,
+            "raw_asr_segment_count": len(raw_segments_all),
         }
-        out = write_json(vdir / "source_aggregate.json", aggregate)
         raw_asr_out = write_json(vdir / "source_raw_asr_index.json", raw_asr_index)
+        aggregate["raw_asr_index_file"] = relpath(raw_asr_out, self.task_dir)
+        out = write_json(vdir / "source_aggregate.json", aggregate)
         self._write_status(vdir, self._base_status("source_aggregate", version, input_hash, [out, raw_asr_out]))
         self._record_step(
             step="source_aggregate",
@@ -2645,9 +2695,22 @@ class PipelineRunner:
         write_json(vdir / "raw_response.json", raw_responses)
         write_text(vdir / "input.txt", "\n\n---\n\n".join(inputs))
 
-        groups = self._dedupe_and_validate_sentence_groups(groups, sentences)
+        groups, group_diagnostics = self._dedupe_and_validate_sentence_groups(
+            groups,
+            sentences,
+            allow_sentence_fallback=bool(cfg.get("allow_sentence_fallback", False)),
+        )
+        group_diagnostics_out = write_json(vdir / "group_diagnostics.json", group_diagnostics)
         segments = self._materialize_micro_segments_from_sentence_groups(groups, sentences)
         segments = self._enforce_micro_segment_limits(segments, cfg, sentences)
+        fail_on_empty_groups = bool(cfg.get("fail_on_empty_groups", cfg.get("fail_on_empty", True)))
+        if not groups and fail_on_empty_groups:
+            raise UserFacingPipelineError(
+                "asr_micro_segment_empty_groups",
+                user_message="ASR 微分段失败：模型没有返回任何可用 sentence group。",
+                suggestions=["回查 agents/asr_micro_segment/v*/raw_response.json。", "检查模型输出 sentence_ids 是否来自输入。"],
+                technical_detail=group_diagnostics,
+            )
         if not segments and cfg.get("fail_on_empty", True):
             raise UserFacingPipelineError(
                 "asr_micro_segment_empty",
@@ -2655,11 +2718,15 @@ class PipelineRunner:
                 suggestions=["回查 agents/asr_micro_segment/v*/asr_sentences.json。", "检查 ASR 文本是否为空或时间是否无效。"],
             )
 
-        output = {"segments": segments}
+        output = {
+            "version": "asr_micro_segment_raw_asr_v2",
+            "segments": segments,
+            "diagnostics": group_diagnostics,
+        }
         out = write_json(vdir / "micro_segments.json", output)
         
-        self._write_status(vdir, self._base_status("asr_micro_segment", version, input_hash, [out]))
-        self._record_step(step="asr_micro_segment", version=version, status="success", output=relpath(out, self.task_dir), input_hash=input_hash, output_files=[out], extra={"summary": {"segments": len(segments)}})
+        self._write_status(vdir, self._base_status("asr_micro_segment", version, input_hash, [out, group_diagnostics_out]))
+        self._record_step(step="asr_micro_segment", version=version, status="success", output=relpath(out, self.task_dir), input_hash=input_hash, output_files=[out, group_diagnostics_out], extra={"summary": {"segments": len(segments), "groups": len(groups), "missing_sentences": len(group_diagnostics.get("missing_sentence_ids", []))}})
         print("完成: asr_micro_segment")
 
     def _build_asr_sentence_units(self) -> list[dict[str, Any]]:
@@ -2803,12 +2870,27 @@ class PipelineRunner:
             lines.append("")
         return "\n".join(lines).strip()
 
-    def _dedupe_and_validate_sentence_groups(self, groups: list[Any], sentences: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _dedupe_and_validate_sentence_groups(
+        self,
+        groups: list[Any],
+        sentences: list[dict[str, Any]],
+        *,
+        allow_sentence_fallback: bool = False,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         valid_groups = []
         used_sids = set()
         smap = {s["sentence_id"]: s for s in sentences}
+        diagnostics: dict[str, Any] = {
+            "input_group_count": len(groups) if isinstance(groups, list) else 0,
+            "valid_group_count": 0,
+            "invalid_groups": [],
+            "duplicate_sentence_ids": [],
+            "missing_sentence_ids": [],
+            "fallback_groups_added": 0,
+            "allow_sentence_fallback": allow_sentence_fallback,
+        }
         
-        for g in groups:
+        for group_index, g in enumerate(groups):
             if isinstance(g, list):
                 sids = g
                 group_data = {}
@@ -2816,18 +2898,27 @@ class PipelineRunner:
                 sids = g.get("sentence_ids", [])
                 group_data = g
             else:
+                diagnostics["invalid_groups"].append({"index": group_index, "reason": "group_not_object_or_list"})
                 continue
                 
             if not isinstance(sids, list):
+                diagnostics["invalid_groups"].append({"index": group_index, "reason": "sentence_ids_not_list", "value": sids})
                 continue
             
             clean_sids = []
             for sid in sids:
-                if sid in smap and sid not in used_sids:
-                    clean_sids.append(sid)
-                    used_sids.add(sid)
+                sid = str(sid).strip()
+                if not sid or sid not in smap:
+                    diagnostics["invalid_groups"].append({"index": group_index, "reason": "unknown_sentence_id", "sentence_id": sid})
+                    continue
+                if sid in used_sids:
+                    diagnostics["duplicate_sentence_ids"].append(sid)
+                    continue
+                clean_sids.append(sid)
+                used_sids.add(sid)
                     
             if not clean_sids:
+                diagnostics["invalid_groups"].append({"index": group_index, "reason": "empty_after_validation"})
                 continue
                 
             valid_group = dict(group_data) if isinstance(g, dict) else {}
@@ -2835,17 +2926,23 @@ class PipelineRunner:
             valid_groups.append(valid_group)
             
         missing_sentences = [s for s in sentences if s["sentence_id"] not in used_sids]
-        for s in missing_sentences:
-            valid_groups.append({
-                "group_id": f"fallback_{s['sentence_id']}",
-                "sentence_ids": [s["sentence_id"]],
-                "summary": s["text"][:20],
-                "segment_type": "fact",
-                "keep_candidate": 1
-            })
+        diagnostics["missing_sentence_ids"] = [s["sentence_id"] for s in missing_sentences]
+        if allow_sentence_fallback:
+            for s in missing_sentences:
+                valid_groups.append({
+                    "group_id": f"fallback_{s['sentence_id']}",
+                    "sentence_ids": [s["sentence_id"]],
+                    "summary": s["text"][:20],
+                    "segment_type": "fact",
+                    "keep_candidate": 1,
+                })
+            diagnostics["fallback_groups_added"] = len(missing_sentences)
             
         valid_groups.sort(key=lambda g: smap[g["sentence_ids"][0]]["start_seconds"])
-        return valid_groups
+        diagnostics["valid_group_count"] = len(valid_groups)
+        diagnostics["covered_sentence_count"] = len(used_sids)
+        diagnostics["sentence_count"] = len(sentences)
+        return valid_groups, diagnostics
 
     def _materialize_micro_segments_from_sentence_groups(self, groups: list[dict[str, Any]], sentences: list[dict[str, Any]]) -> list[dict[str, Any]]:
         smap = {s["sentence_id"]: s for s in sentences}
@@ -3020,19 +3117,21 @@ class PipelineRunner:
         
         lines = [
             "你将看到一组已经按 ASR 语义切好的 micro_segments。",
-            "任务：判断哪些片段适合进入 AI 配音短视频候选池。",
-            "不要合并多个 segment。",
+            "每个 micro_segment_id 是唯一标识。",
+            "任务：只从这些 micro_segment_id 中选择适合 AI 配音短视频的事实段。",
+            "不要合并多个 micro_segment。",
             "不要输出新的时间码。",
-            "只输出 segment_id。",
-            ""
+            "输出 JSON 格式：{\"selected_segments\":[{\"micro_segment_id\":\"...\",\"summary\":\"...\",\"role\":\"fact\"}]}",
+            "",
         ]
-        
+
         for seg in micro_segments[:max_segments]:
-            msid = seg.get("micro_segment_id") or seg.get("segment_id")
+            msid = str(seg.get("micro_segment_id") or "").strip()
+            if not msid:
+                continue
             lines.append(f"[{msid}]")
-            lines.append(f"source={seg['source_id']}")
-            lines.append(f"time={seg['source_start']}-{seg['source_end']}")
-            lines.append(f"duration={seg['duration_seconds']}")
+            lines.append(f"source={seg.get('source_id', '')}")
+            lines.append(f"duration={seg.get('duration_seconds', '')}")
             lines.append(f"声：{seg['asr_text']}")
             if seg.get("visual_summary"):
                 lines.append(f"画：{seg['visual_summary']}")
@@ -3068,23 +3167,36 @@ class PipelineRunner:
         }
         selected: list[dict[str, Any]] = []
         seen: set[str] = set()
-        for raw in raw_items:
+        diagnostics: dict[str, Any] = {
+            "legacy_segment_id_used": 0,
+            "invalid_items": [],
+            "selected_count": 0,
+        }
+        for index, raw in enumerate(raw_items):
             if isinstance(raw, str):
                 micro_segment_id = raw.strip()
                 summary = ""
                 role = ""
             elif isinstance(raw, dict):
-                micro_segment_id = str(
-                    raw.get("micro_segment_id")
-                    or raw.get("segment_id")
-                    or raw.get("id")
-                    or ""
-                ).strip()
+                raw_micro_id = raw.get("micro_segment_id")
+                raw_legacy_id = raw.get("segment_id") or raw.get("id")
+                if raw_micro_id:
+                    micro_segment_id = str(raw_micro_id).strip()
+                else:
+                    micro_segment_id = str(raw_legacy_id or "").strip()
+                    if micro_segment_id:
+                        diagnostics["legacy_segment_id_used"] += 1
                 summary = str(raw.get("summary") or "").strip()
                 role = str(raw.get("role") or raw.get("segment_type") or "fact").strip()
             else:
+                diagnostics["invalid_items"].append({"index": index, "reason": "item_not_string_or_object"})
                 continue
             if not micro_segment_id or micro_segment_id in seen or micro_segment_id not in seg_map:
+                diagnostics["invalid_items"].append({
+                    "index": index,
+                    "reason": "missing_duplicate_or_unknown_micro_segment_id",
+                    "micro_segment_id": micro_segment_id,
+                })
                 continue
             seg = seg_map[micro_segment_id]
             selected.append({
@@ -3093,11 +3205,13 @@ class PipelineRunner:
                 "role": role or "fact",
             })
             seen.add(micro_segment_id)
+        diagnostics["selected_count"] = len(selected)
 
         return {
             "version": "ai_voiceover_content_analysis_v2",
             "input_unit": "micro_segment",
             "selected_segments": selected,
+            "diagnostics": diagnostics,
             "materialized_by_code": True,
             "raw_model_plan": result,
             **({
@@ -3172,7 +3286,23 @@ class PipelineRunner:
                 user_message="内容分析失败：AI 配音主链路必须先生成 micro_segments，不能回退到 chunk 分析。",
                 suggestions=["回查 agents/asr_micro_segment/v*/micro_segments.json。", "从 asr_micro_segment 重新运行。"],
             )
+        _base, _out_name, bound_prompt, prompt_version = AGENT_INFO["content_analysis"]
+        if bound_prompt != prompts.CONTENT_ANALYSIS_MICRO_SEGMENT_PROMPT or prompt_version != "content_analysis_micro_segment_v1":
+            raise UserFacingPipelineError(
+                "content_analysis_prompt_binding_invalid",
+                user_message="content_analysis 提示词绑定无效：AI 配音 micro_segment 链路不能使用旧 chunk/content_analysis prompt。",
+                suggestions=["确认 AGENT_INFO['content_analysis'] 绑定 CONTENT_ANALYSIS_MICRO_SEGMENT_PROMPT。"],
+                technical_detail={"prompt_version": prompt_version},
+            )
         text_input = self._build_content_analysis_micro_segment_text()
+        legacy_segment_hint = "只输出 segment_id" in text_input or "[segment_id]" in text_input
+        if legacy_segment_hint or "\ntime=" in text_input:
+            raise UserFacingPipelineError(
+                "content_analysis_prompt_binding_invalid",
+                user_message="content_analysis 输入协议无效：不得向模型提示 segment_id 或 time 时间码。",
+                suggestions=["检查 _build_content_analysis_micro_segment_text() 是否只输出 micro_segment_id。"],
+                technical_detail={"legacy_segment_hint": legacy_segment_hint, "contains_time": "\ntime=" in text_input},
+            )
         result = self._run_text_agent("content_analysis", text_input)
         result = self._normalize_content_analysis_selected_segments(result)
         if not result.get("selected_segments"):
@@ -3205,6 +3335,9 @@ class PipelineRunner:
         min_clip_seconds = float(cfg.get("min_clip_seconds", 3.0) or 0.0)
         max_clip_seconds = float(cfg.get("max_clip_seconds", 30.0) or 0.0)
         fail_on_empty = bool(cfg.get("fail_on_empty", True))
+        truncate_overlong = bool(cfg.get("truncate_overlong", False))
+        fail_on_overlong = bool(cfg.get("fail_on_overlong", False))
+        fail_on_short = bool(cfg.get("fail_on_short", False))
 
         micro_segments = [
             seg for seg in micro_doc.get("segments", [])
@@ -3214,14 +3347,26 @@ class PipelineRunner:
             str(seg.get("micro_segment_id") or seg.get("segment_id") or ""): seg
             for seg in micro_segments
         }
-        source_bounds = {
-            str(item.get("source_id") or ""): float(item.get("local_end") or item.get("end") or item.get("duration_seconds") or 0)
-            for item in self._source_boundaries()
-            if isinstance(item, dict)
-        }
+        source_bounds: dict[str, float] = {}
+        for item in self._source_boundaries():
+            if not isinstance(item, dict):
+                continue
+            source_id = str(item.get("source_id") or "").strip()
+            if not source_id:
+                continue
+            duration = self._time_value_seconds(item.get("duration_seconds"))
+            end_value = self._time_value_seconds(item.get("local_end") or item.get("end"))
+            source_bounds[source_id] = float(duration or end_value or 0.0)
 
         candidate_clips: list[dict[str, Any]] = []
         missing_segment_ids: list[str] = []
+        diagnostics: dict[str, Any] = {
+            "missing_segment_ids": missing_segment_ids,
+            "invalid_time_segments": [],
+            "clamped_clips": [],
+            "overlong_clips": [],
+            "short_clips": [],
+        }
         for selected in content.get("selected_segments") or []:
             if not isinstance(selected, dict):
                 continue
@@ -3239,24 +3384,55 @@ class PipelineRunner:
             start = self._time_value_seconds(seg.get("source_start_seconds") or seg.get("start_seconds"))
             end = self._time_value_seconds(seg.get("source_end_seconds") or seg.get("end_seconds"))
             if start is None or end is None or end <= start:
+                diagnostics["invalid_time_segments"].append({
+                    "micro_segment_id": micro_segment_id,
+                    "start_seconds": start,
+                    "end_seconds": end,
+                })
                 continue
             source_id = str(seg.get("source_id") or "").strip()
             source_duration = source_bounds.get(source_id, 0.0)
-            padded_start = max(0.0, float(start) - padding_before)
+            requested_start = float(start) - padding_before
+            requested_end = float(end) + padding_after
+            padded_start = max(0.0, requested_start)
             padded_end = float(end) + padding_after
             if source_duration > 0:
                 padded_end = min(source_duration, padded_end)
+            if padded_start != requested_start or padded_end != requested_end:
+                diagnostics["clamped_clips"].append({
+                    "micro_segment_id": micro_segment_id,
+                    "source_id": source_id,
+                    "requested_start_seconds": round(requested_start, 3),
+                    "requested_end_seconds": round(requested_end, 3),
+                    "clamped_start_seconds": round(padded_start, 3),
+                    "clamped_end_seconds": round(padded_end, 3),
+                    "source_duration_seconds": round(source_duration, 3) if source_duration else None,
+                })
             if max_clip_seconds > 0 and padded_end - padded_start > max_clip_seconds:
-                padded_end = padded_start + max_clip_seconds
+                diagnostics["overlong_clips"].append({
+                    "micro_segment_id": micro_segment_id,
+                    "source_id": source_id,
+                    "duration_seconds": round(padded_end - padded_start, 3),
+                    "max_clip_seconds": max_clip_seconds,
+                    "truncated": truncate_overlong,
+                })
+                if truncate_overlong:
+                    padded_end = padded_start + max_clip_seconds
             duration = round(max(0.0, padded_end - padded_start), 3)
             if min_clip_seconds > 0 and duration < min_clip_seconds:
-                extra = min_clip_seconds - duration
-                padded_end += extra
-                if source_duration > 0 and padded_end > source_duration:
-                    padded_start = max(0.0, padded_start - (padded_end - source_duration))
-                    padded_end = source_duration
-                duration = round(max(0.0, padded_end - padded_start), 3)
+                diagnostics["short_clips"].append({
+                    "micro_segment_id": micro_segment_id,
+                    "source_id": source_id,
+                    "duration_seconds": duration,
+                    "min_clip_seconds": min_clip_seconds,
+                })
             if duration <= 0:
+                diagnostics["invalid_time_segments"].append({
+                    "micro_segment_id": micro_segment_id,
+                    "reason": "non_positive_duration_after_padding",
+                    "padded_start_seconds": round(padded_start, 3),
+                    "padded_end_seconds": round(padded_end, 3),
+                })
                 continue
             clip_id = f"av_clip_{len(candidate_clips) + 1:04d}"
             candidate_clips.append({
@@ -3299,11 +3475,15 @@ class PipelineRunner:
             "micro_segment_count": len(micro_segments),
             "candidate_clip_count": len(candidate_clips),
             "missing_segment_ids": missing_segment_ids,
+            "diagnostics": diagnostics,
             "config": {
                 "padding_before_seconds": padding_before,
                 "padding_after_seconds": padding_after,
                 "min_clip_seconds": min_clip_seconds,
                 "max_clip_seconds": max_clip_seconds,
+                "truncate_overlong": truncate_overlong,
+                "fail_on_overlong": fail_on_overlong,
+                "fail_on_short": fail_on_short,
             },
         }
         out = write_json(vdir / "candidate_clips.json", output)
@@ -3328,6 +3508,20 @@ class PipelineRunner:
                 "ai_voiceover_candidate_clips_empty",
                 user_message="AI 配音候选片段为空：content_analysis 没有形成可物化的 micro_segment。",
                 suggestions=["回查 agents/content_analysis/v*/content_analysis.json。", "回查 agents/asr_micro_segment/v*/micro_segments.json。"],
+                technical_detail=debug,
+            )
+        if fail_on_overlong and diagnostics["overlong_clips"]:
+            raise UserFacingPipelineError(
+                "ai_voiceover_candidate_overlong",
+                user_message="AI 配音候选片段存在超过 max_clip_seconds 的片段。",
+                suggestions=["回查 ai_voiceover_candidates/v*/materialize_debug.json。", "调大 max_clip_seconds 或在 debug 场景启用 truncate_overlong。"],
+                technical_detail=debug,
+            )
+        if fail_on_short and diagnostics["short_clips"]:
+            raise UserFacingPipelineError(
+                "ai_voiceover_candidate_too_short",
+                user_message="AI 配音候选片段存在短于 min_clip_seconds 的片段。",
+                suggestions=["回查 ai_voiceover_candidates/v*/materialize_debug.json。", "调小 min_clip_seconds 或重新选择更完整的 micro_segment。"],
                 technical_detail=debug,
             )
 
@@ -3472,8 +3666,44 @@ class PipelineRunner:
                 user_message="选片规划失败：AI 配音候选片段为空。",
                 suggestions=["回查 ai_voiceover_candidates/v*/candidate_clips.json。", "从 content_analysis 重新运行。"],
             )
-        result = self._run_text_agent("short_video_edit_plan", self._build_short_video_edit_plan_text())
-        result = self._materialize_short_video_edit_plan(result)
+        text_input = self._build_short_video_edit_plan_text()
+        raw_result = self._run_text_agent("short_video_edit_plan", text_input)
+        first_diagnostics = self._short_video_edit_plan_semantic_diagnostics(raw_result)
+        retry_diagnostics: dict[str, Any] | None = None
+        if self.options.production_mode == "ai_voiceover" and not first_diagnostics.get("ok"):
+            first_out = self.task_dir / self._step_output("short_video_edit_plan")
+            if first_out.exists():
+                write_json(first_out.parent / "semantic_retry_first_output.json", raw_result)
+                write_json(first_out.parent / "semantic_retry_first_diagnostics.json", first_diagnostics)
+            retry_input = (
+                text_input
+                + "\n\n---\n"
+                + "上一次输出未通过业务校验，请只使用输入中存在的 clip_id 重新输出 JSON。"
+                + f"\n失败原因：{first_diagnostics.get('reason')}"
+                + f"\n无效 clip_id：{first_diagnostics.get('invalid_clip_ids', [])}"
+                + f"\n可用 clip_id：{first_diagnostics.get('candidate_clip_ids', [])}"
+            )
+            raw_result = self._run_text_agent("short_video_edit_plan", retry_input)
+            retry_diagnostics = self._short_video_edit_plan_semantic_diagnostics(raw_result)
+            retry_out = self.task_dir / self._step_output("short_video_edit_plan")
+            if retry_out.exists():
+                write_json(retry_out.parent / "semantic_retry_response.json", raw_result)
+                write_json(retry_out.parent / "semantic_retry_diagnostics.json", {
+                    "first": first_diagnostics,
+                    "retry": retry_diagnostics,
+                })
+            if not retry_diagnostics.get("ok"):
+                raise UserFacingPipelineError(
+                    "short_video_edit_plan_semantic_retry_failed",
+                    user_message="AI 配音选片规划失败：模型重试后仍未返回可用 clip_id。",
+                    suggestions=["回查 agents/short_video_edit_plan/v*/semantic_retry_diagnostics.json。", "检查 candidate_clips 是否为空或 clip_id 是否过长难以复制。"],
+                    technical_detail={"first": first_diagnostics, "retry": retry_diagnostics},
+                )
+        result = self._materialize_short_video_edit_plan(raw_result)
+        if retry_diagnostics is not None:
+            result["semantic_retry"] = {"first": first_diagnostics, "retry": retry_diagnostics}
+        else:
+            result["semantic_retry"] = {"first": first_diagnostics}
         self._validate_ai_voiceover_editing_structure_or_raise(result)
         self._overwrite_step_json("short_video_edit_plan", result, materialized=True)
         self._write_compat_short_video_plan_and_editing_script(result)
@@ -4347,6 +4577,64 @@ class PipelineRunner:
             "discarded_clip_ids": discarded,
             "materialized_by_code": True,
             "raw_model_plan": result,
+        }
+
+    def _short_video_edit_plan_semantic_diagnostics(self, result: Any) -> dict[str, Any]:
+        if isinstance(result, list):
+            raw_videos = result
+        elif isinstance(result, dict):
+            raw_videos = result.get("videos")
+            if not isinstance(raw_videos, list):
+                raw_videos = result.get("scripts") if isinstance(result.get("scripts"), list) else []
+        else:
+            raw_videos = []
+
+        clips_by_id = self._candidate_clips_by_id()
+        invalid_clip_ids: list[str] = []
+        empty_items: list[int] = []
+        valid_clip_ids: list[str] = []
+        if not isinstance(raw_videos, list) or not raw_videos:
+            return {
+                "ok": False,
+                "reason": "empty_business_result",
+                "raw_video_count": 0,
+                "candidate_clip_ids": list(clips_by_id),
+            }
+
+        for index, video in enumerate(raw_videos):
+            if not isinstance(video, dict):
+                empty_items.append(index)
+                continue
+            clip_ids = self._coerce_id_list(video.get("clip_ids") or video.get("source_clip_ids"))
+            selected_clips = video.get("selected_clips")
+            if not clip_ids and isinstance(selected_clips, list):
+                clip_ids = self._coerce_id_list([
+                    item.get("clip_id") or item.get("source_clip_id") or ""
+                    for item in selected_clips
+                    if isinstance(item, dict)
+                ])
+            if not clip_ids:
+                empty_items.append(index)
+                continue
+            for clip_id in clip_ids:
+                if clip_id in clips_by_id:
+                    valid_clip_ids.append(clip_id)
+                else:
+                    invalid_clip_ids.append(clip_id)
+
+        reason = ""
+        if invalid_clip_ids:
+            reason = "invalid_clip_ids"
+        elif not valid_clip_ids:
+            reason = "empty_business_result"
+        return {
+            "ok": not reason,
+            "reason": reason,
+            "raw_video_count": len(raw_videos),
+            "valid_clip_ids": list(dict.fromkeys(valid_clip_ids)),
+            "invalid_clip_ids": list(dict.fromkeys(invalid_clip_ids)),
+            "empty_items": empty_items,
+            "candidate_clip_ids": list(clips_by_id),
         }
 
     def _first_number(self, *values: Any) -> float | None:
@@ -7256,6 +7544,7 @@ class PipelineRunner:
             },
             "source_step": source_step,
         }
+
         if not ok:
             output["diagnostic_error"] = self._reassembly_error("quality_gate_failed", issues=issues)
             if self.options.production_mode == "ai_voiceover":
