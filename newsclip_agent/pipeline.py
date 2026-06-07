@@ -3119,20 +3119,25 @@ class PipelineRunner:
         return segments
 
     def _enforce_micro_segment_limits(self, segments: list[dict[str, Any]], cfg: dict[str, Any], sentences: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        hard_max = float(cfg.get("hard_max_segment_seconds", 45))
-        min_seg = float(cfg.get("min_segment_seconds", 5))
+        hard_max = float(cfg.get("hard_max_segment_seconds", 35))
+        min_seg = float(cfg.get("min_segment_seconds", 4))
         
         fixed = []
         for seg in segments:
             if seg["duration_seconds"] > hard_max and cfg.get("split_overlong_group", True):
                 fixed.extend(self._split_segment_by_sentence_boundary(seg, hard_max, sentences))
-            elif seg["duration_seconds"] < min_seg:
-                fixed.append(seg)
             else:
                 fixed.append(seg)
                 
-        fixed = self._merge_too_short_adjacent_segments(fixed, min_seg)
-        return fixed
+        fixed = self._merge_too_short_adjacent_segments(fixed, min_seg, hard_max)
+        
+        final_fixed = []
+        for seg in fixed:
+            if seg["duration_seconds"] > hard_max and cfg.get("split_overlong_group", True):
+                final_fixed.extend(self._split_segment_by_sentence_boundary(seg, hard_max, sentences))
+            else:
+                final_fixed.append(seg)
+        return final_fixed
         
     def _split_segment_by_sentence_boundary(self, segment: dict[str, Any], hard_max: float, sentences: list[dict[str, Any]]) -> list[dict[str, Any]]:
         smap = {s["sentence_id"]: s for s in sentences}
@@ -3191,7 +3196,7 @@ class PipelineRunner:
             
         return result
 
-    def _merge_too_short_adjacent_segments(self, segments: list[dict[str, Any]], min_seg: float) -> list[dict[str, Any]]:
+    def _merge_too_short_adjacent_segments(self, segments: list[dict[str, Any]], min_seg: float, hard_max: float) -> list[dict[str, Any]]:
         if not segments:
             return segments
             
@@ -3200,7 +3205,13 @@ class PipelineRunner:
         
         for i in range(1, len(segments)):
             nxt = segments[i]
-            if current["duration_seconds"] < min_seg and current["source_id"] == nxt["source_id"]:
+            merged_duration = float(nxt.get("end_seconds") or 0) - float(current.get("start_seconds") or 0)
+            can_merge = (
+                current["duration_seconds"] < min_seg
+                and current["source_id"] == nxt["source_id"]
+                and (hard_max <= 0 or merged_duration <= hard_max)
+            )
+            if can_merge:
                 # merge into nxt
                 nxt["start_seconds"] = current["start_seconds"]
                 nxt["source_start_seconds"] = current.get("source_start_seconds", current["start_seconds"])
@@ -3217,17 +3228,25 @@ class PipelineRunner:
         merged.append(current)
         
         # also check if the last one is still too short, merge backwards if possible
-        if len(merged) > 1 and merged[-1]["duration_seconds"] < min_seg and merged[-1]["source_id"] == merged[-2]["source_id"]:
-            last = merged.pop()
-            prev = merged[-1]
-            prev["end_seconds"] = last["end_seconds"]
-            prev["source_end_seconds"] = last.get("source_end_seconds", last["end_seconds"])
-            prev["source_end"] = last["source_end"]
-            prev["duration_seconds"] = round(prev["end_seconds"] - prev["start_seconds"], 3)
-            prev["asr_text"] = prev["asr_text"] + last["asr_text"]
-            prev["sentence_ids"] = prev["sentence_ids"] + last["sentence_ids"]
-            prev["asr_segment_ids"] = list(dict.fromkeys((prev.get("asr_segment_ids") or []) + (last.get("asr_segment_ids") or [])))
-            prev["source_chunk_ids"] = list(dict.fromkeys((prev.get("source_chunk_ids") or []) + (last.get("source_chunk_ids") or [])))
+        if len(merged) > 1:
+            last = merged[-1]
+            prev = merged[-2]
+            merged_duration_back = float(last.get("end_seconds") or 0) - float(prev.get("start_seconds") or 0)
+            can_merge_back = (
+                last["duration_seconds"] < min_seg
+                and last["source_id"] == prev["source_id"]
+                and (hard_max <= 0 or merged_duration_back <= hard_max)
+            )
+            if can_merge_back:
+                merged.pop()
+                prev["end_seconds"] = last["end_seconds"]
+                prev["source_end_seconds"] = last.get("source_end_seconds", last["end_seconds"])
+                prev["source_end"] = last["source_end"]
+                prev["duration_seconds"] = round(prev["end_seconds"] - prev["start_seconds"], 3)
+                prev["asr_text"] = prev["asr_text"] + last["asr_text"]
+                prev["sentence_ids"] = prev["sentence_ids"] + last["sentence_ids"]
+                prev["asr_segment_ids"] = list(dict.fromkeys((prev.get("asr_segment_ids") or []) + (last.get("asr_segment_ids") or [])))
+                prev["source_chunk_ids"] = list(dict.fromkeys((prev.get("source_chunk_ids") or []) + (last.get("source_chunk_ids") or [])))
             
         return merged
 
@@ -3243,6 +3262,12 @@ class PipelineRunner:
             "不要合并多个 micro_segment。",
             "不要输出新的时间码。",
             "输出 JSON 格式：{\"selected_segments\":[{\"micro_segment_id\":\"...\",\"summary\":\"...\",\"role\":\"fact\"}]}",
+            "",
+            "选择偏好：",
+            "优先选择 10～35 秒内的 micro_segment。",
+            "22～35 秒属于偏长片段，只有在完整表态、连续现场动作、不可拆事实时才选择。",
+            "不要因为片段长就自动丢弃，但不要选择多个信息混杂的长片段。",
+            "同一事实重复出现时，优先选择画面更清楚、信息更完整的一段。",
             "",
         ]
 
@@ -3457,9 +3482,10 @@ class PipelineRunner:
         version, vdir = self._version_dir("ai_voiceover_candidate_materialize", "ai_voiceover_candidates")
         ensure_dir(vdir)
         padding_before = float(cfg.get("padding_before_seconds", 0.5) or 0.0)
-        padding_after = float(cfg.get("padding_after_seconds", 0.5) or 0.0)
-        min_clip_seconds = float(cfg.get("min_clip_seconds", 3.0) or 0.0)
-        max_clip_seconds = float(cfg.get("max_clip_seconds", 30.0) or 0.0)
+        padding_after = float(cfg.get("padding_after_seconds", 0.8) or 0.0)
+        min_clip_seconds = float(cfg.get("min_clip_seconds", 5.0) or 0.0)
+        preferred_max_clip_seconds = float(cfg.get("preferred_max_clip_seconds", 45.0) or 0.0)
+        max_clip_seconds = float(cfg.get("max_clip_seconds", 60.0) or 0.0)
         fail_on_empty = bool(cfg.get("fail_on_empty", True))
         truncate_overlong = bool(cfg.get("truncate_overlong", False))
         fail_on_overlong = bool(cfg.get("fail_on_overlong", False))
@@ -3490,8 +3516,9 @@ class PipelineRunner:
             "missing_segment_ids": missing_segment_ids,
             "invalid_time_segments": [],
             "clamped_clips": [],
-            "overlong_clips": [],
             "short_clips": [],
+            "long_but_allowed_clips": [],
+            "overlong_clips": [],
         }
         for selected in content.get("selected_segments") or []:
             if not isinstance(selected, dict):
@@ -3534,16 +3561,26 @@ class PipelineRunner:
                     "clamped_end_seconds": round(padded_end, 3),
                     "source_duration_seconds": round(source_duration, 3) if source_duration else None,
                 })
-            if max_clip_seconds > 0 and padded_end - padded_start > max_clip_seconds:
+            raw_duration = padded_end - padded_start
+            
+            if max_clip_seconds > 0 and raw_duration > max_clip_seconds:
                 diagnostics["overlong_clips"].append({
                     "micro_segment_id": micro_segment_id,
                     "source_id": source_id,
-                    "duration_seconds": round(padded_end - padded_start, 3),
+                    "duration_seconds": round(raw_duration, 3),
                     "max_clip_seconds": max_clip_seconds,
                     "truncated": truncate_overlong,
                 })
                 if truncate_overlong:
                     padded_end = padded_start + max_clip_seconds
+            elif preferred_max_clip_seconds > 0 and raw_duration > preferred_max_clip_seconds:
+                diagnostics["long_but_allowed_clips"].append({
+                    "micro_segment_id": micro_segment_id,
+                    "source_id": source_id,
+                    "duration_seconds": round(raw_duration, 3),
+                    "preferred_max_clip_seconds": preferred_max_clip_seconds,
+                    "max_clip_seconds": max_clip_seconds,
+                })
             duration = round(max(0.0, padded_end - padded_start), 3)
             if min_clip_seconds > 0 and duration < min_clip_seconds:
                 diagnostics["short_clips"].append({
@@ -3596,16 +3633,33 @@ class PipelineRunner:
             "source": "asr_micro_segment",
             "candidate_clips": candidate_clips,
         }
+        durations = [
+            float(clip.get("duration_seconds") or 0)
+            for clip in candidate_clips
+            if float(clip.get("duration_seconds") or 0) > 0
+        ]
+        
+        duration_stats = {
+            "min": round(min(durations), 3) if durations else 0.0,
+            "max": round(max(durations), 3) if durations else 0.0,
+            "avg": round(sum(durations) / len(durations), 3) if durations else 0.0,
+            "count": len(durations),
+            "over_preferred_count": len(diagnostics["long_but_allowed_clips"]),
+            "over_hard_count": len(diagnostics["overlong_clips"]),
+        }
+
         debug = {
             "selected_segment_count": len(content.get("selected_segments") or []),
             "micro_segment_count": len(micro_segments),
             "candidate_clip_count": len(candidate_clips),
             "missing_segment_ids": missing_segment_ids,
             "diagnostics": diagnostics,
+            "duration_stats": duration_stats,
             "config": {
                 "padding_before_seconds": padding_before,
                 "padding_after_seconds": padding_after,
                 "min_clip_seconds": min_clip_seconds,
+                "preferred_max_clip_seconds": preferred_max_clip_seconds,
                 "max_clip_seconds": max_clip_seconds,
                 "truncate_overlong": truncate_overlong,
                 "fail_on_overlong": fail_on_overlong,
@@ -3635,7 +3689,7 @@ class PipelineRunner:
             output=relpath(out, self.task_dir),
             input_hash=input_hash,
             output_files=[out, debug_out],
-            extra={"summary": {"candidate_clips": len(candidate_clips), "fail_reasons": fail_reasons}},
+            extra={"summary": {"candidate_clips": len(candidate_clips), "fail_reasons": fail_reasons, "duration_stats": duration_stats}},
         )
         if fail_on_empty and not candidate_clips:
             raise UserFacingPipelineError(
@@ -3647,8 +3701,12 @@ class PipelineRunner:
         if fail_on_overlong and diagnostics["overlong_clips"]:
             raise UserFacingPipelineError(
                 "ai_voiceover_candidate_overlong",
-                user_message="AI 配音候选片段存在超过 max_clip_seconds 的片段。",
-                suggestions=["回查 ai_voiceover_candidates/v*/materialize_debug.json。", "调大 max_clip_seconds 或在 debug 场景启用 truncate_overlong。"],
+                user_message="AI 配音候选片段超过硬上限，请拆分超长 micro_segment 或调大 ai_voiceover_candidate.max_clip_seconds。",
+                suggestions=[
+                    "查看 ai_voiceover_candidates/*/materialize_debug.json 中的 diagnostics.overlong_clips。",
+                    "如果片段在 45～60 秒之间，应只作为 warning，不应失败。",
+                    "如果片段超过 60 秒，建议回到 asr_micro_segment 阶段拆分。",
+                ],
                 technical_detail=debug,
             )
         if fail_on_short and diagnostics["short_clips"]:
@@ -5407,62 +5465,6 @@ class PipelineRunner:
                 suggestions=["回查 ai_voiceover_candidates/v*/candidate_clips.json。", "从 content_analysis 重新运行。"],
             )
         return clips
-
-    def _load_video_topic_or_brief(self) -> str:
-        docs = [self._load_optional_step_json("content_analysis", {}), self._load_optional_step_json("video_understanding", {})]
-        parts: list[str] = []
-        for doc in docs:
-            for key in ("main_topic", "topic", "summary", "video_type", "video_news_type"):
-                value = str(doc.get(key) or "").strip()
-                if value and value not in parts:
-                    parts.append(value)
-        return "\n".join(parts[:4])
-
-    def _build_timeline_context_index(self) -> list[dict[str, Any]]:
-        try:
-            digest = self._load_current_timeline_digest()
-        except Exception:
-            digest = {}
-        out: list[dict[str, Any]] = []
-        for item in digest.get("chunks", []):
-            if not isinstance(item, dict):
-                continue
-            out.append({
-                "chunk_id": item.get("chunk_id", ""),
-                "source_id": item.get("source_id", ""),
-                "local_start_seconds": float(item.get("local_start_seconds", item.get("start_seconds", 0)) or 0),
-                "local_end_seconds": float(item.get("local_end_seconds", item.get("end_seconds", 0)) or 0),
-                "speech": sanitize_llm_text(str(item.get("speech", "")), max_chars=500),
-                "visual": item.get("visual", ""),
-            })
-        return out
-
-    def _nearby_context_for_clip(self, clip: dict[str, Any], context_index: list[dict[str, Any]], max_chunks: int = 3) -> list[dict[str, Any]]:
-        start, end = self._clip_start_end(clip)
-        center = (start + end) / 2
-        scored: list[tuple[float, dict[str, Any]]] = []
-        for item in context_index:
-            if clip.get("source_id") and item.get("source_id") and clip.get("source_id") != item.get("source_id"):
-                continue
-            item_start = float(item.get("local_start_seconds") or 0)
-            item_end = float(item.get("local_end_seconds") or item_start)
-            overlap = max(0.0, min(end, item_end) - max(start, item_start))
-            distance = 0.0 if overlap > 0 else min(abs(center - item_start), abs(center - item_end))
-            scored.append((distance, item))
-        scored.sort(key=lambda x: x[0])
-        return [
-            {
-                "id": item.get("chunk_id", ""),
-                "t": local_time_range(item),
-                "speech": compact_text(str(item.get("speech") or ""), max_chars=240),
-                "visual": compact_text(str(item.get("visual") or ""), max_chars=160),
-            }
-            for _distance, item in scored[:max(1, max_chunks)]
-        ]
-
-    def _normalize_candidate_refine_output(self, *, clip_id: str, parsed: dict[str, Any], fallback_rank: int) -> dict[str, Any]:
-        keep = int(parsed.get("k", parsed.get("keep", 1)) or 0)
-        usage = str(parsed.get("u", parsed.get("usage", "both")) or "both").lower()
         if usage not in {"av", "re", "both", "drop"}:
             usage = "both" if keep else "drop"
         return {
@@ -5499,7 +5501,22 @@ class PipelineRunner:
         llm_cfg = self.config.raw.get("llm_input", {})
         max_clips = int(llm_cfg.get("max_llm_candidate_clips", llm_cfg.get("max_candidate_clips_for_edit_plan", 14)) or 14)
         video = self._load_optional_step_json("video_understanding", {})
-        clips = self._load_ai_voiceover_candidate_clips_or_raise()[:max_clips]
+        clips = self._load_candidate_clips_for_current_mode()[:max_clips]
+        if not clips:
+            raise UserFacingPipelineError(
+                "highlight_reassembly_candidate_clips_missing",
+                user_message="视频重组候选片段缺失：candidate_filter / asr_event_candidate 没有生成可用原声片段。",
+                suggestions=[
+                    "回查 agents/candidate_filter/v*/candidate_filter.json。",
+                    "回查 agents/asr_event_candidate/v*/asr_event_candidate.json。",
+                    "确认当前任务 production_mode 为 highlight_reassembly。",
+                ],
+                technical_detail={
+                    "production_mode": self.options.production_mode,
+                    "candidate_filter": self.manifest.get("steps", {}).get("candidate_filter", {}),
+                    "asr_event_candidate": self.manifest.get("steps", {}).get("asr_event_candidate", {}),
+                },
+            )
         lines = [
             "任务：请规划原声高光重组视频。",
             "规则：不同 source 是独立素材池，不代表连续时间线；只选择并排序 clip_id，不要输出任何时间戳。",

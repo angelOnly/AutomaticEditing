@@ -119,9 +119,9 @@ source = "raw_asr"
 fail_on_empty = true
 fail_on_empty_groups = true
 allow_sentence_fallback = false
-min_segment_seconds = 3.0
+min_segment_seconds = 4.0
 preferred_min_segment_seconds = 8
-preferred_max_segment_seconds = 25
+preferred_max_segment_seconds = 22
 hard_max_segment_seconds = 35.0
 window_sentence_count = 40
 window_overlap_sentence_count = 5
@@ -134,9 +134,10 @@ drop_empty_text_segment = true
 
 [ai_voiceover_candidate]
 padding_before_seconds = 0.5
-padding_after_seconds = 0.5
-min_clip_seconds = 3.0
-max_clip_seconds = 30.0
+padding_after_seconds = 0.8
+min_clip_seconds = 5.0
+preferred_max_clip_seconds = 45.0
+max_clip_seconds = 60.0
 fail_on_empty = true
 truncate_overlong = false
 fail_on_overlong = true
