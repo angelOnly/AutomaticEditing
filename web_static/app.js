@@ -346,7 +346,7 @@ function applyDefaultControls() {
   $("frameInterval").value = state.defaults.default_frame_interval || 5;
   $("runMode").value = state.defaults.default_run_mode || "all";
   $("targetDuration").value = state.defaults.default_target_seconds || 30;
-  $("allowLongVideo").checked = Boolean(state.defaults.allow_long_video_default);
+  // removed allowLongVideo initial binding
   $("requireTts").checked = Boolean(state.defaults.tts_required_by_default);
   $("productionMode").value = "ai_voiceover";
   $("audioPolicy").value = "ai_voiceover";
@@ -415,10 +415,7 @@ function bindEvents() {
     $("audioPolicy").value = "ai_voiceover";
     $("allowOriginalAudioEvidence").checked = false;
   });
-  $("allowLongVideoSelect")?.addEventListener("change", () => {
-    $("allowLongVideo").checked = $("allowLongVideoSelect").value === "true";
-    updateSummaryControls();
-  });
+  // removed allowLongVideoSelect listener
   $("requireTtsSelect")?.addEventListener("change", () => {
     $("requireTts").checked = $("requireTtsSelect").value === "true";
   });
@@ -502,6 +499,7 @@ function onProductionModeChange() {
   $("allowOriginalAudioEvidence").checked = isReassembly;
   $("allowOriginalAudioEvidence").closest("label")?.classList.toggle("hidden", !isReassembly);
   $("requireTtsSelect")?.closest("label")?.classList.toggle("hidden", isReassembly);
+  // removed long video visibility toggles
   $("voiceSelectWrap")?.classList.toggle("hidden", isReassembly);
   $("previewVoice")?.classList.toggle("hidden", isReassembly);
   if (isReassembly && Number($("targetDuration").value || 0) < 60) $("targetDuration").value = 90;
@@ -565,7 +563,7 @@ async function previewSelectedVoice() {
 }
 
 function syncFriendlyControls() {
-  if ($("allowLongVideoSelect")) $("allowLongVideoSelect").value = $("allowLongVideo").checked ? "true" : "false";
+
   if ($("requireTtsSelect")) $("requireTtsSelect").value = $("requireTts").checked ? "true" : "false";
   syncModePicker();
 }
@@ -1512,7 +1510,7 @@ function restoreRunControls(manifest) {
   if (opts.chunk_seconds) $("chunkSeconds").value = opts.chunk_seconds;
   if (opts.frame_interval) $("frameInterval").value = opts.frame_interval;
   if (opts.target_duration_seconds) $("targetDuration").value = opts.target_duration_seconds;
-  if (typeof opts.allow_long_video === "boolean") $("allowLongVideo").checked = opts.allow_long_video;
+  // removed allow_long_video payload parser
   if (typeof opts.require_tts === "boolean") $("requireTts").checked = opts.require_tts;
   $("productionMode").value = opts.production_mode || "ai_voiceover";
   if ($("outputMode")) $("outputMode").value = opts.output_mode || (opts.reassembly_output_mode === "multiple" ? "multiple" : "single");
@@ -1969,7 +1967,7 @@ function handleRunError(error) {
 function baseRunRequest() {
   const mode = $("runMode").value;
   const targetDuration = Number($("targetDuration").value || state.defaults.default_target_seconds || 30);
-  const allowLongVideo = $("allowLongVideo").checked;
+  const allowLongVideo = false;
   const productionMode = $("productionMode").value;
   const outputMode = productionMode === "highlight_reassembly" ? ($("outputMode")?.value || "single") : "single";
   return {

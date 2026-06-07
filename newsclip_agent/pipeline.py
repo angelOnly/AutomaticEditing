@@ -4247,6 +4247,45 @@ class PipelineRunner:
                 },
             )
 
+    def _validate_ai_voiceover_plan_duration_or_raise(self, edit_plan: dict[str, Any]) -> None:
+        if self.options.production_mode != "ai_voiceover":
+            return
+
+        effective_max = self._effective_ai_voiceover_max_seconds()
+        allow_long = bool(self.options.allow_long_video)
+        issues: list[str] = []
+
+        for script in edit_plan.get("scripts") or []:
+            if not isinstance(script, dict):
+                continue
+            sid = str(script.get("short_video_id") or "unknown")
+            visual_seconds = editing_structure_duration(script.get("editing_structure") or [])
+
+            if visual_seconds <= 0:
+                issues.append(f"{sid}: visual duration is 0")
+                continue
+
+            if visual_seconds > effective_max + 0.01:
+                issues.append(
+                    f"{sid}: visual duration {visual_seconds:.1f}s exceeds effective max {effective_max:.1f}s"
+                )
+
+            if visual_seconds > self.duration_settings.hard_max_without_confirmation and not allow_long:
+                issues.append(
+                    f"{sid}: visual duration {visual_seconds:.1f}s exceeds hard max without long-video confirmation"
+                )
+
+        if issues:
+            raise UserFacingPipelineError(
+                "ai_voiceover_plan_duration_invalid",
+                user_message="AI 配音选片规划失败：规划画面时长超过当前任务允许范围。",
+                suggestions=[
+                    "去掉 --allow-long-video 或调小 --max-output-video-seconds 后，从 short_video_edit_plan 重跑。",
+                    "如果确实要长版，请确认长版并要求 voiceover_script 生成足够长文案。",
+                ],
+                technical_detail={"issues": issues[:50], "effective_max_output_video_seconds": effective_max},
+            )
+
     def step_short_video_edit_plan(self) -> None:
         if self.options.production_mode == "ai_voiceover" and not self._load_candidate_clips_for_current_mode():
             raise UserFacingPipelineError(
@@ -4293,6 +4332,7 @@ class PipelineRunner:
         else:
             result["semantic_retry"] = {"first": first_diagnostics}
         self._validate_ai_voiceover_editing_structure_or_raise(result)
+        self._validate_ai_voiceover_plan_duration_or_raise(result)
         self._overwrite_step_json("short_video_edit_plan", result, materialized=True)
         self._write_compat_short_video_plan_and_editing_script(result)
 
@@ -4321,11 +4361,14 @@ class PipelineRunner:
         if self._can_reuse("voiceover_script", input_hash):
             print("澶嶇敤缂撳瓨: voiceover_script")
             final_output = self._load_step_json("voiceover_script")
-            self._normalize_voiceover_scripts(final_output)
-            self._attach_voiceover_script_timings(final_output, edit_plan)
-            self._validate_voiceover_script_against_editing_structure(final_output, edit_plan)
-            self._validate_voiceover_script_duration_or_raise(final_output)
-            self._enforce_long_video_confirmation_after_voiceover(final_output)
+            self._finalize_voiceover_script_with_repair(
+                final_output,
+                edit_plan,
+                vdir=Path(self.task_dir / self._step_output("voiceover_script")).parent,
+                input_hash=input_hash,
+                model=model,
+                fallback=fallback,
+            )
             return
         version, vdir = self._version_dir("voiceover_script", "agents/voiceover_script")
         ensure_dir(vdir)
@@ -4386,11 +4429,14 @@ class PipelineRunner:
             output_files=[out],
             extra={"model": model, "summary": {"scripts": len(final_output["scripts"]), "max_workers": max_workers}},
         )
-        self._normalize_voiceover_scripts(final_output)
-        self._attach_voiceover_script_timings(final_output, edit_plan)
-        self._validate_voiceover_script_against_editing_structure(final_output, edit_plan)
-        self._validate_voiceover_script_duration_or_raise(final_output)
-        self._enforce_long_video_confirmation_after_voiceover(final_output)
+        self._finalize_voiceover_script_with_repair(
+            final_output,
+            edit_plan,
+            vdir=vdir,
+            input_hash=input_hash,
+            model=model,
+            fallback=fallback,
+        )
 
     def step_voiceover_quality_check(self) -> None:
         self._mark_skipped("voiceover_quality_check", "已删除：配音文案质量改由代码规则和时长校验处理。")
@@ -5913,11 +5959,21 @@ class PipelineRunner:
         lines.append('输出 JSON 只允许包含 clip_id，例如 {"output_videos":[{"reassembly_id":"hr_001","title":"","clip_ids":["source_001_clip_0001"]}]}')
         return "\n".join(lines)
 
+    def _effective_ai_voiceover_max_seconds(self) -> int:
+        target = int(self.options.target_duration_seconds or self.duration_settings.default_target_seconds or 30)
+        configured_max = int(self.options.max_output_video_seconds or self.duration_settings.normal_max_seconds)
+        if self.options.production_mode != "ai_voiceover":
+            return configured_max
+        if self.options.allow_long_video:
+            return min(configured_max, int(self.duration_settings.max_long_video_seconds))
+        return min(configured_max, max(target + 8, int(self.duration_settings.normal_max_seconds)))
+
     def _build_short_video_edit_plan_text(self) -> str:
         llm_cfg = self.config.raw.get("llm_input", {})
         max_clips = int(llm_cfg.get("max_llm_candidate_clips", llm_cfg.get("max_candidate_clips_for_edit_plan", 14)) or 14)
         content = self._load_optional_step_json("content_analysis", {})
         clips = self._load_candidate_clips_for_current_mode()[:max_clips]
+        effective_max = self._effective_ai_voiceover_max_seconds()
         lines = [
             "任务：请生成 AI 配音短视频选片与讲述规划。",
             "",
@@ -5925,7 +5981,11 @@ class PipelineRunner:
             f"- output_mode：{self.options.output_mode}",
             f"- max_output_videos：{self.options.max_output_videos}",
             f"- min_output_video_seconds：{self.options.min_output_video_seconds}",
-            f"- max_output_video_seconds：{self.options.max_output_video_seconds}",
+            f"- target_duration_seconds：{self.options.target_duration_seconds}",
+            f"- effective_max_output_video_seconds：{effective_max}",
+            f"- raw_max_output_video_seconds：{self.options.max_output_video_seconds}",
+            f"- allow_long_video：{self.options.allow_long_video}",
+            "- 重要：AI 配音视频优先接近 target_duration_seconds；除非明确允许长版，否则不要贴着 max_output_video_seconds 输出。",
             "",
             "新闻概览：",
             f"主题：{content.get('main_topic') or content.get('topic') or ''}",
@@ -6107,10 +6167,308 @@ class PipelineRunner:
                     changed = True
         return changed
 
+    def _sync_voiceover_narration_text_from_segments(self, voiceover_output: dict[str, Any]) -> None:
+        voice_scripts = voiceover_output.get("scripts", []) if isinstance(voiceover_output, dict) else []
+        for script in voice_scripts:
+            if not isinstance(script, dict):
+                continue
+            segments = script.get("narration_segments", [])
+            if not isinstance(segments, list):
+                continue
+            
+            clean_texts = []
+            for seg in segments:
+                if isinstance(seg, dict) and seg.get("text"):
+                    clean = clean_voiceover_text(str(seg["text"]))
+                    if clean:
+                        clean_texts.append(clean)
+            
+            if clean_texts:
+                script["narration_text"] = " ".join(clean_texts)
+
+    def _check_is_text_patch_repairable(self, check: dict[str, Any], *, repair_on_warnings: bool = False) -> bool:
+        if check.get("missing_shot_ids") or check.get("extra_shot_ids"):
+            return False
+        if check.get("char_budget_issues") or check.get("empty_text_shot_ids"):
+            return True
+        if repair_on_warnings and check.get("char_budget_warnings"):
+            return True
+        return False
+
+    def _build_voiceover_repair_text_input(
+        self,
+        *,
+        edit_script: dict[str, Any],
+        voice_script: dict[str, Any],
+        alignment_check: dict[str, Any],
+    ) -> str:
+        lines = [
+            "Task: Repair AI voiceover script to strictly fit character budgets.",
+            "",
+            f"short_video_id: {edit_script.get('short_video_id') or ''}",
+            f"topic: {edit_script.get('topic') or ''}",
+            f"news_angle: {edit_script.get('news_angle') or ''}",
+            "",
+            "must_keep_fact_points:"
+        ]
+        for fact in edit_script.get("must_keep_fact_points", []):
+            lines.append(f"- {fact}")
+        lines.append("")
+        lines.append("alignment_check:")
+        lines.append(json.dumps({
+            "missing_shot_ids": alignment_check.get("missing_shot_ids"),
+            "extra_shot_ids": alignment_check.get("extra_shot_ids"),
+            "empty_text_shot_ids": alignment_check.get("empty_text_shot_ids"),
+            "char_budget_issues": alignment_check.get("char_budget_issues"),
+        }, ensure_ascii=False, indent=2))
+        lines.append("")
+        
+        problem_segments = []
+        shots = {str(shot.get("shot_id")): shot for shot in edit_script.get("editing_structure", []) if isinstance(shot, dict)}
+        segments = voice_script.get("narration_segments", [])
+        
+        issue_map = {}
+        for issue in alignment_check.get("char_budget_issues", []) + alignment_check.get("char_budget_warnings", []):
+            issue_map[str(issue.get("shot_id"))] = issue.get("type", "unknown")
+        for empty_id in alignment_check.get("empty_text_shot_ids", []):
+            issue_map[str(empty_id)] = "empty"
+            
+        for index, seg in enumerate(segments):
+            shot_id = str(seg.get("shot_id"))
+            if shot_id not in issue_map:
+                continue
+            shot = shots.get(shot_id, {})
+            prev_text = segments[index-1].get("text", "") if index > 0 else ""
+            next_text = segments[index+1].get("text", "") if index < len(segments) - 1 else ""
+            
+            problem_segments.append({
+                "shot_id": shot_id,
+                "issue_type": issue_map[shot_id],
+                "current_chars": len(re.sub(r"\s+", "", str(seg.get("text", "")))),
+                "min_chars": self._first_number(shot.get("narration_min_chars")),
+                "target_chars": self._first_number(shot.get("narration_target_chars")),
+                "max_chars": self._first_number(shot.get("narration_max_chars")),
+                "current_text": str(seg.get("text", "")),
+                "previous_text": str(prev_text),
+                "next_text": str(next_text),
+                "section": str(shot.get("section", "")),
+                "target_duration_seconds": self._first_number(shot.get("target_duration_seconds")),
+                "visual_summary": str(shot.get("visual_summary") or shot.get("visual", "")),
+                "fact": str(shot.get("fact") or shot.get("news_fact_to_explain", "")),
+                "narration_intent": str(shot.get("narration_intent", "")),
+            })
+            
+        lines.append("problem_segments:")
+        lines.append(json.dumps(problem_segments, ensure_ascii=False, indent=2))
+        lines.append("")
+        lines.append("Output JSON format:")
+        lines.append(json.dumps({
+            "short_video_id": edit_script.get("short_video_id"),
+            "repaired_segments": [
+                {"shot_id": "example_shot_id", "new_text": "repaired text goes here"}
+            ]
+        }, ensure_ascii=False, indent=2))
+        return "\n".join(lines)
+
+    def _normalize_voiceover_repair_patch(self, parsed: Any, *, expected_sid: str) -> dict[str, Any]:
+        if not isinstance(parsed, dict):
+            return {"short_video_id": expected_sid, "repaired_segments": []}
+        
+        repaired = parsed.get("repaired_segments")
+        if not isinstance(repaired, list):
+            if isinstance(parsed, list):
+                repaired = parsed
+            else:
+                repaired = []
+                
+        segments = []
+        for seg in repaired:
+            if isinstance(seg, dict):
+                shot_id = str(seg.get("shot_id") or "")
+                new_text = clean_voiceover_text(str(seg.get("new_text") or seg.get("text") or ""))
+                if shot_id and new_text:
+                    segments.append({"shot_id": shot_id, "new_text": new_text})
+                    
+        return {
+            "short_video_id": str(parsed.get("short_video_id") or expected_sid),
+            "repaired_segments": segments
+        }
+
+    def _repair_one_voiceover_script_patch(
+        self,
+        *,
+        edit_script: dict[str, Any],
+        voice_script: dict[str, Any],
+        alignment_check: dict[str, Any],
+        model: str,
+        fallback: list[str],
+        vdir: Path,
+        round_index: int,
+    ) -> dict[str, Any]:
+        sid = str(edit_script.get("short_video_id") or "v_001")
+        input_text = self._build_voiceover_repair_text_input(
+            edit_script=edit_script,
+            voice_script=voice_script,
+            alignment_check=alignment_check,
+        )
+        rdir = vdir / sid / f"repair_round_{round_index}"
+        ensure_dir(rdir)
+        write_text(rdir / "input.txt", input_text)
+        
+        cfg = self.config.raw.get("voiceover_script", {})
+        temperature = float(cfg.get("repair_temperature", 0.1))
+        max_tokens = int(cfg.get("repair_max_tokens", 1000))
+        
+        if self.llm_text is None:
+            raise RuntimeError("missing text llm")
+            
+        result = self.llm_text.call_json(
+            model=model,
+            fallback_models=fallback,
+            prompt=prompts.VOICEOVER_REPAIR_TEXT_PROMPT,
+            input_data=input_text,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            debug_dir=rdir / "_llm_debug",
+        )
+        parsed = result.parsed if isinstance(result.parsed, dict) else {}
+        write_json(rdir / "model_output.json", parsed)
+        return self._normalize_voiceover_repair_patch(parsed, expected_sid=sid)
+
+    def _apply_voiceover_repair_patch(
+        self,
+        voice_script: dict[str, Any],
+        patch: dict[str, Any],
+    ) -> bool:
+        if str(voice_script.get("short_video_id", "")) != str(patch.get("short_video_id", "")):
+            return False
+            
+        repaired = patch.get("repaired_segments", [])
+        if not repaired:
+            return False
+            
+        patch_map = {str(seg["shot_id"]): str(seg["new_text"]) for seg in repaired if seg.get("shot_id") and seg.get("new_text")}
+        segments = voice_script.get("narration_segments", [])
+        applied = False
+        
+        for seg in segments:
+            if not isinstance(seg, dict):
+                continue
+            shot_id = str(seg.get("shot_id", ""))
+            if shot_id in patch_map:
+                seg["text"] = patch_map[shot_id]
+                applied = True
+                
+        return applied
+
+    def _finalize_voiceover_script_with_repair(
+        self,
+        final_output: dict[str, Any],
+        edit_plan: dict[str, Any],
+        *,
+        vdir: Path,
+        input_hash: str | None = None,
+        model: str,
+        fallback: list[str],
+    ) -> None:
+        self._normalize_voiceover_scripts(final_output)
+        self._sync_voiceover_narration_text_from_segments(final_output)
+        self._attach_voiceover_script_timings(final_output, edit_plan)
+        
+        alignment = self._validate_voiceover_script_against_editing_structure(
+            final_output,
+            edit_plan,
+            raise_on_error=False,
+        )
+        
+        cfg = self.config.raw.get("voiceover_script", {})
+        repair_enabled = bool(cfg.get("repair_enabled", True))
+        max_repair_rounds = int(cfg.get("max_repair_rounds", 2))
+        repair_on_warnings = bool(cfg.get("repair_on_warnings", False))
+        
+        voice_scripts = final_output.get("scripts", []) if isinstance(final_output, dict) else []
+        edit_scripts = edit_plan.get("scripts", []) if isinstance(edit_plan, dict) else []
+        edit_by_id = {str(script.get("short_video_id")): script for script in edit_scripts if isinstance(script, dict) and script.get("short_video_id")}
+        voice_by_id = {str(script.get("short_video_id") or f"v_{index + 1:03d}"): script for index, script in enumerate(voice_scripts) if isinstance(script, dict)}
+        
+        repair_summary = {
+            "enabled": repair_enabled,
+            "rounds_used": 0,
+            "status": "ok",
+            "repair_type": "none",
+            "details": []
+        }
+        
+        if not alignment.get("ok") and repair_enabled:
+            for round_index in range(1, max_repair_rounds + 1):
+                round_applied = False
+                for check in alignment.get("checks", []):
+                    if check.get("ok"):
+                        continue
+                    if not self._check_is_text_patch_repairable(check, repair_on_warnings=repair_on_warnings):
+                        continue
+
+                    sid = str(check.get("short_video_id"))
+                    edit_script = edit_by_id.get(sid)
+                    voice_script = voice_by_id.get(sid)
+                    if not edit_script or not voice_script:
+                        continue
+                        
+                    patch = self._repair_one_voiceover_script_patch(
+                        edit_script=edit_script,
+                        voice_script=voice_script,
+                        alignment_check=check,
+                        model=model,
+                        fallback=fallback,
+                        vdir=vdir,
+                        round_index=round_index,
+                    )
+                    applied = self._apply_voiceover_repair_patch(voice_script, patch)
+                    if applied:
+                        round_applied = True
+                        repair_summary["details"].append({"round": round_index, "short_video_id": sid, "patch": patch})
+
+                if not round_applied:
+                    break
+                    
+                repair_summary["rounds_used"] = round_index
+                repair_summary["status"] = "repaired"
+                repair_summary["repair_type"] = "text_patch"
+
+                self._normalize_voiceover_scripts(final_output)
+                self._sync_voiceover_narration_text_from_segments(final_output)
+                self._attach_voiceover_script_timings(final_output, edit_plan)
+                alignment = self._validate_voiceover_script_against_editing_structure(
+                    final_output,
+                    edit_plan,
+                    raise_on_error=False,
+                )
+                ensure_dir(vdir / f"repair_round_{round_index}")
+                write_json(vdir / f"repair_round_{round_index}" / "alignment_after_repair.json", alignment)
+                if alignment.get("ok"):
+                    break
+                    
+            write_json(vdir / "voiceover_repair_summary.json", repair_summary)
+            # 覆盖原 voiceover_script.json
+            write_json(vdir / "voiceover_script.json", final_output)
+
+        if not alignment.get("ok"):
+            self._validate_voiceover_script_against_editing_structure(
+                final_output,
+                edit_plan,
+                raise_on_error=True,
+            )
+
+        self._validate_voiceover_segment_text_duration_or_raise(final_output)
+        self._validate_voiceover_script_duration_or_raise(final_output)
+        self._enforce_long_video_confirmation_after_voiceover(final_output)
+
     def _validate_voiceover_script_against_editing_structure(
         self,
         voiceover_output: dict[str, Any],
         edit_plan: dict[str, Any],
+        *,
+        raise_on_error: bool = True,
     ) -> dict[str, Any]:
         voice_scripts = voiceover_output.get("scripts", []) if isinstance(voiceover_output, dict) else []
         edit_scripts = edit_plan.get("scripts", []) if isinstance(edit_plan, dict) else []
@@ -6219,10 +6577,10 @@ class PipelineRunner:
                 print("Voiceover alignment warnings:")
                 for w in char_budget_warnings:
                     print(f"- {w}")
-        result = {"ok": not hard_issues, "checks": checks}
+        result = {"ok": not hard_issues, "checks": checks, "hard_issues": hard_issues}
         if hasattr(self, "task_dir"):
             write_json(self.task_dir / "voiceover_alignment_check.json", result)
-        if hard_issues:
+        if raise_on_error and hard_issues:
             raise RuntimeError(
                 "AI voiceover script does not match editing_structure; blocked before TTS:\n"
                 + "\n".join(f"- {issue}" for issue in hard_issues)
@@ -6538,6 +6896,46 @@ class PipelineRunner:
             out = self.task_dir / self._step_output("voiceover_script")
             write_json(out, payload)
 
+    def _validate_voiceover_segment_text_duration_or_raise(self, voiceover_output: dict[str, Any]) -> None:
+        if self.options.production_mode != "ai_voiceover":
+            return
+
+        voice_cfg = self.config.raw.get("voiceover", {})
+        min_ratio = float(voice_cfg.get("pre_tts_segment_min_ratio", 0.65))
+        chars_per_second = float(voice_cfg.get("voiceover_chars_per_second", 4.8))
+
+        issues = []
+        for script in voiceover_output.get("scripts") or []:
+            if not isinstance(script, dict):
+                continue
+            sid = str(script.get("short_video_id") or "unknown")
+            for seg in script.get("narration_segments") or []:
+                if not isinstance(seg, dict):
+                    continue
+                target = float(seg.get("target_duration_seconds") or 0)
+                text = re.sub(r"\s+", "", str(seg.get("text") or ""))
+                estimated = len(text) / max(chars_per_second, 0.1)
+                if target > 0 and estimated < target * min_ratio:
+                    issues.append({
+                        "short_video_id": sid,
+                        "shot_id": seg.get("shot_id"),
+                        "target_duration_seconds": round(target, 3),
+                        "estimated_text_duration_seconds": round(estimated, 3),
+                        "chars": len(text),
+                        "min_ratio": min_ratio,
+                    })
+
+        if issues:
+            raise UserFacingPipelineError(
+                "voiceover_script_segment_duration_too_short",
+                user_message="配音文案生成失败：部分 shot 的文案明显短于画面目标时长。",
+                suggestions=[
+                    "从 voiceover_script 重跑，让模型按每个 shot 的 target 秒数补足文案。",
+                    "如果希望视频更短，请从 short_video_edit_plan 重跑，减少画面片段。",
+                ],
+                technical_detail={"issues": issues[:50]},
+            )
+
     def _validate_voiceover_script_duration_or_raise(self, voiceover_output: dict[str, Any]) -> None:
         scripts = voiceover_output.get("scripts", []) if isinstance(voiceover_output, dict) else []
         if not isinstance(scripts, list):
@@ -6827,7 +7225,9 @@ class PipelineRunner:
             "voice_id": voice_config.get("voice_id", ""),
             "voice_name": voice_config.get("voice_name", ""),
         })
-        self._build_tts_duration_reconcile(editing, voiceover, {"outputs": outputs})
+        reconcile = self._build_tts_duration_reconcile(editing, voiceover, {"outputs": outputs})
+        reconcile_ok = bool(reconcile.get("ok", True))
+        reconcile_hard_segments = self._tts_reconcile_hard_segments(reconcile)
         failed = sum(1 for item in outputs if item.get("status") == "failed")
         success = sum(1 for item in outputs if item.get("status") == "success")
         expected_tts_segments = self._expected_tts_segment_keys() if tts_is_hard_required else set()
@@ -6852,6 +7252,12 @@ class PipelineRunner:
         elif tts_is_hard_required and success == 0:
             overall_status = "failed"
             hard_error = "TTS required but no successful output"
+        elif tts_is_hard_required and not reconcile_ok:
+            overall_status = "failed"
+            hard_error = "TTS duration reconcile failed"
+        elif tts_is_hard_required and reconcile_hard_segments:
+            overall_status = "failed"
+            hard_error = "TTS duration has hard mismatch segments"
         else:
             overall_status = "success" if failed == 0 else ("failed" if tts_is_hard_required else "partial_success")
             hard_error = ""
@@ -6871,8 +7277,30 @@ class PipelineRunner:
                 error_type,
                 user_message="TTS 生成失败：没有生成可用配音音频。",
                 suggestions=["检查 voiceover_script 文案是否为空。", "检查 TTS 模型日志。"],
-                technical_detail={"success": success, "failed": failed, "total": len(outputs), "error": hard_error, "missing": missing_tts_segments},
+                technical_detail={
+                    "success": success,
+                    "failed": failed,
+                    "total": len(outputs),
+                    "error": hard_error,
+                    "missing": missing_tts_segments,
+                    "tts_duration_reconcile": reconcile,
+                },
             )
+
+    def _tts_reconcile_hard_segments(self, reconcile: dict[str, Any]) -> list[dict[str, Any]]:
+        hard_segments: list[dict[str, Any]] = []
+        for video in reconcile.get("videos") or []:
+            if not isinstance(video, dict):
+                continue
+            sid = str(video.get("short_video_id") or "")
+            for seg in video.get("segments") or []:
+                if not isinstance(seg, dict):
+                    continue
+                if seg.get("hard") or seg.get("status") in {"missing_tts", "too_short", "too_long"}:
+                    item = dict(seg)
+                    item["short_video_id"] = sid
+                    hard_segments.append(item)
+        return hard_segments
 
     def _build_tts_duration_reconcile(
         self,
@@ -6934,12 +7362,25 @@ class PipelineRunner:
                     "tts_actual_duration_seconds": round(actual, 3),
                     "text_chars": len(re.sub(r"\s+", "", str((voice_by_shot.get(shot_id) or {}).get("text") or ""))),
                 })
+            video_target_total = sum(float(seg.get("target_duration_seconds") or 0) for seg in segment_checks)
+            video_tts_total = sum(float(seg.get("tts_actual_duration_seconds") or 0) for seg in segment_checks)
+            coverage_ratio = video_tts_total / video_target_total if video_target_total > 0 else 0.0
+            hard_count = sum(1 for seg in segment_checks if seg.get("hard"))
             videos.append({
                 "short_video_id": sid,
                 "ok": all(seg.get("status") in {"ok", "slightly_short", "slightly_long"} for seg in segment_checks),
+                "target_total_duration_seconds": round(video_target_total, 3),
+                "tts_total_duration_seconds": round(video_tts_total, 3),
+                "coverage_ratio": round(coverage_ratio, 3),
+                "hard_segment_count": hard_count,
                 "segments": segment_checks,
             })
-        result = {"ok": all(video.get("ok") for video in videos), "videos": videos}
+        result = {
+            "ok": all(video.get("ok") for video in videos),
+            "target_total_duration_seconds": round(sum(v.get("target_total_duration_seconds", 0) for v in videos), 3),
+            "tts_total_duration_seconds": round(sum(v.get("tts_total_duration_seconds", 0) for v in videos), 3),
+            "videos": videos,
+        }
         if hasattr(self, "task_dir"):
             write_json(self.task_dir / "tts_duration_reconcile.json", result)
         return result
@@ -7559,9 +8000,15 @@ class PipelineRunner:
                 threshold_seconds=self.duration_settings.duration_mismatch_block_threshold_seconds,
             )
             if mismatch_reason:
+                block_ai_voiceover_mismatch = bool(
+                    self.config.raw.get("voiceover", {}).get("ai_voiceover_block_duration_mismatch", True)
+                )
                 if self.options.production_mode == "ai_voiceover":
-                    warnings.append(mismatch_reason + "；AI配音模式不再因总时长误差阻断。")
-                    repair_reasons.append("voiceover_duration_mismatch_warning_only")
+                    if block_ai_voiceover_mismatch:
+                        blocked_reasons.append(mismatch_reason)
+                    else:
+                        warnings.append(mismatch_reason + "；配置允许 AI 配音总时长误差仅警告。")
+                        repair_reasons.append("voiceover_duration_mismatch_warning_only")
                 else:
                     blocked_reasons.append(mismatch_reason)
 

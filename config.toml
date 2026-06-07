@@ -189,6 +189,14 @@ fallback_models = []
 temperature = 0.2
 max_tokens = 1200
 
+# 自动修复 voiceover_script 与 editing_structure 的局部文案问题
+repair_enabled = true
+max_repair_rounds = 2
+repair_temperature = 0.1
+repair_max_tokens = 1000
+repair_on_warnings = false
+repair_structural_mismatch = false
+
 [short_video]
 default_target_seconds = 30
 quick_news_min_seconds = 20
@@ -198,7 +206,7 @@ normal_max_seconds = 35
 context_max_seconds = 45
 complex_max_seconds = 60
 hard_max_without_confirmation = 60
-allow_long_video_default = true
+allow_long_video_default = false
 max_long_video_seconds = 90
 
 [voiceover]
@@ -223,10 +231,11 @@ tts_required_by_default = true
 ai_voiceover_disable_original_audio = true
 ai_voiceover_allow_model_original_audio = false
 allow_original_audio_evidence = false
-ai_voiceover_min_ratio = 0.50
-duration_mismatch_block_threshold_seconds = 3.0
+ai_voiceover_min_ratio = 0.80
+duration_mismatch_block_threshold_seconds = 1.0
 ai_voiceover_compact_to_tts = true
-ai_voiceover_mismatch_policy = "repair_then_warn"
+ai_voiceover_mismatch_policy = "block"
+ai_voiceover_block_duration_mismatch = true
 ai_voiceover_original_audio_max_seconds = 6
 ai_voiceover_original_audio_max_ratio = 0.15
 ai_voiceover_original_audio_single_max_seconds = 4
@@ -246,9 +255,10 @@ max_inter_sentence_gap_seconds = 0.8
 max_total_silence_ratio = 0.15
 subtitle_follow_actual_tts = true
 tts_actual_chars_per_second = 5.2
-compact_min_target_ratio = 0.58
-compact_duration_tolerance_seconds = 10.0
-compact_severe_short_ratio = 0.58
+compact_min_target_ratio = 0.65
+compact_duration_tolerance_seconds = 1.0
+compact_severe_short_ratio = 0.65
+pre_tts_segment_min_ratio = 0.65
 enable_tts_duration_repair = true
 max_tts_repair_rounds = 2
 tts_segment_ok_min_ratio = 0.75

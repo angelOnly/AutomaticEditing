@@ -208,7 +208,7 @@ class RunRequest(BaseModel):
     output_mode: str = "single"
     max_output_videos: int = 1
     min_output_video_seconds: int = 30
-    max_output_video_seconds: int = 90
+    max_output_video_seconds: int = 45
     allow_long_video: bool = bool(SHORT_VIDEO_DEFAULTS.get("allow_long_video_default", False))
     require_tts: bool = bool(VOICEOVER_DEFAULTS.get("tts_required_by_default", True))
     voice_id: str | None = None
