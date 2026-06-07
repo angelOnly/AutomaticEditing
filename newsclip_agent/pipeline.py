@@ -89,7 +89,7 @@ AGENT_INFO = {
     "short_video_planning": ("agents/short_video_planning", "short_video_plan.json", prompts.SHORT_VIDEO_EDIT_PLAN_TEXT_PROMPT, "short_video_planning_compat_v2"),
     "editing_script": ("agents/editing_script", "editing_script.json", prompts.SHORT_VIDEO_EDIT_PLAN_TEXT_PROMPT, "editing_script_compat_v2"),
     "asr_micro_segment": ("agents/asr_micro_segment", "micro_segments.json", prompts.ASR_MICRO_SEGMENT_PROMPT, "asr_micro_segment_v1"),
-    "content_analysis": ("agents/content_analysis", "content_analysis.json", prompts.CONTENT_ANALYSIS_PROMPT, "content_analysis_v1"),
+    "content_analysis": ("agents/content_analysis", "content_analysis.json", prompts.CONTENT_ANALYSIS_MICRO_SEGMENT_PROMPT, "content_analysis_micro_segment_v1"),
     "short_video_edit_plan": ("agents/short_video_edit_plan", "short_video_edit_plan.json", prompts.SHORT_VIDEO_EDIT_PLAN_TEXT_PROMPT, "short_video_edit_plan_text_v1"),
     "voiceover_script": ("agents/voiceover_script", "voiceover_script.json", prompts.VOICEOVER_SCRIPT_TEXT_PROMPT, "voiceover_script_text_v1"),
     "highlight_reassembly_plan": ("agents/highlight_reassembly", "highlight_reassembly_plan.json", prompts.HIGHLIGHT_REASSEMBLY_TEXT_PROMPT, "highlight_reassembly_text_v1"),
@@ -1257,10 +1257,114 @@ class PipelineRunner:
             "work_current_versions": child_manifest.get("current_versions", {}),
         }
 
+    def _source_analysis_child_asr_hashes(self, analysis: dict[str, Any]) -> list[dict[str, Any]]:
+        hashes: list[dict[str, Any]] = []
+        for source_result in analysis.get("sources") or []:
+            if not isinstance(source_result, dict) or source_result.get("status") != "success":
+                continue
+            summary_rel = str(source_result.get("summary") or "")
+            summary_doc = read_json(self.task_dir / summary_rel, {}) if summary_rel else {}
+            work_task_dir = str(summary_doc.get("work_task_dir") or "").strip()
+            if not work_task_dir:
+                continue
+            child_manifest = read_json(self.task_dir / work_task_dir / "manifest.json", {})
+            asr_step = (child_manifest.get("steps") or {}).get("asr") or {}
+            hashes.append({
+                "source_id": summary_doc.get("source_id") or source_result.get("source_id") or "",
+                "asr_output": asr_step.get("output", ""),
+                "asr_output_hash": asr_step.get("output_hash", ""),
+            })
+        return hashes
+
+    def _source_chunk_ids_for_time_range(
+        self,
+        *,
+        source_id: str,
+        start: float,
+        end: float,
+        chunks: list[dict[str, Any]],
+    ) -> tuple[str, list[str]]:
+        overlaps: list[tuple[float, str]] = []
+        for chunk in chunks:
+            if str(chunk.get("source_id") or "") != source_id:
+                continue
+            chunk_start = self._time_value_seconds(chunk.get("local_start_seconds") or chunk.get("start_seconds"))
+            chunk_end = self._time_value_seconds(chunk.get("local_end_seconds") or chunk.get("end_seconds"))
+            if chunk_start is None or chunk_end is None or chunk_end <= chunk_start:
+                continue
+            overlap = max(0.0, min(end, chunk_end) - max(start, chunk_start))
+            if overlap <= 0:
+                continue
+            chunk_id = str(chunk.get("chunk_id") or chunk.get("global_chunk_id") or "").strip()
+            if chunk_id:
+                overlaps.append((overlap, chunk_id))
+        overlaps.sort(key=lambda item: item[0], reverse=True)
+        source_chunk_ids = [chunk_id for _overlap, chunk_id in overlaps]
+        return (source_chunk_ids[0] if source_chunk_ids else ""), source_chunk_ids
+
+    def _load_child_source_asr_segments(
+        self,
+        *,
+        source_id: str,
+        source_index: int | str | None,
+        summary_doc: dict[str, Any],
+        chunks: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        work_task_dir = str(summary_doc.get("work_task_dir") or "").strip()
+        if not work_task_dir:
+            return []
+        child_dir = self.task_dir / work_task_dir
+        child_manifest = read_json(child_dir / "manifest.json", {})
+        asr_step = (child_manifest.get("steps") or {}).get("asr") or {}
+        asr_rel = str(asr_step.get("output") or "").strip()
+        if not asr_rel:
+            return []
+        asr_doc = read_json(child_dir / asr_rel, {})
+        raw_segments = asr_doc.get("segments") or []
+        if not isinstance(raw_segments, list):
+            return []
+
+        out: list[dict[str, Any]] = []
+        for idx, seg in enumerate(raw_segments, start=1):
+            if not isinstance(seg, dict):
+                continue
+            start = self._time_value_seconds(seg.get("start"))
+            end = self._time_value_seconds(seg.get("end"))
+            if start is None or end is None or end <= start:
+                continue
+            raw_text = str(seg.get("raw_text") or "").strip()
+            text = raw_text or str(seg.get("text") or "").strip()
+            if not text:
+                continue
+            primary_chunk_id, source_chunk_ids = self._source_chunk_ids_for_time_range(
+                source_id=source_id,
+                start=float(start),
+                end=float(end),
+                chunks=chunks,
+            )
+            out.append({
+                "asr_segment_id": f"{source_id}_asr_{idx:06d}",
+                "source_raw_asr_segment_id": seg.get("asr_segment_id") or seg.get("id") or "",
+                "source_id": source_id,
+                "source_index": source_index,
+                "start_seconds": round(float(start), 3),
+                "end_seconds": round(float(end), 3),
+                "duration_seconds": round(float(end - start), 3),
+                "text": text,
+                "raw_text": raw_text,
+                "normalized_text": re.sub(r"\s+", " ", text).strip(),
+                "primary_chunk_id": primary_chunk_id,
+                "source_chunk_ids": source_chunk_ids,
+                "source_chunk_id_hint": seg.get("chunk_id", ""),
+                "removed_tokens": seg.get("removed_tokens", []),
+            })
+        return out
+
     def step_source_aggregate(self) -> None:
         analysis = self._load_step_json("source_analysis")
         input_hash = stable_hash({
             "source_analysis": self._step_content_hash("source_analysis"),
+            "child_asr_outputs": self._source_analysis_child_asr_hashes(analysis),
             "limits": self.config.raw.get("multi_source_analysis", {}),
         })
         if self._can_reuse("source_aggregate", input_hash):
@@ -1271,6 +1375,7 @@ class PipelineRunner:
         ensure_dir(vdir)
         summaries: list[dict[str, Any]] = []
         chunks: list[dict[str, Any]] = []
+        summary_docs: list[dict[str, Any]] = []
         source_items_by_id = {str(item.get("source_id") or ""): item for item in self._iter_source_items()}
 
         for source_result in analysis.get("sources") or []:
@@ -1278,6 +1383,7 @@ class PipelineRunner:
                 continue
             summary_rel = str(source_result.get("summary") or "")
             summary_doc = read_json(self.task_dir / summary_rel, {}) if summary_rel else {}
+            summary_docs.append(summary_doc)
             source_id = str(summary_doc.get("source_id") or source_result.get("source_id") or "")
             source_item = source_items_by_id.get(source_id, {})
             source_summary = {
@@ -1324,7 +1430,33 @@ class PipelineRunner:
             float(item.get("local_start_seconds") or 0),
             str(item.get("chunk_id") or ""),
         ))
+        raw_sources: list[dict[str, Any]] = []
+        raw_segments_all: list[dict[str, Any]] = []
+        for summary_doc in summary_docs:
+            source_id = str(summary_doc.get("source_id") or "").strip()
+            if not source_id:
+                continue
+            source_index = summary_doc.get("source_index")
+            asr_segments = self._load_child_source_asr_segments(
+                source_id=source_id,
+                source_index=source_index,
+                summary_doc=summary_doc,
+                chunks=chunks,
+            )
+            raw_segments_all.extend(asr_segments)
+            raw_sources.append({
+                "source_id": source_id,
+                "source_index": source_index,
+                "duration_seconds": summary_doc.get("duration_seconds"),
+                "asr_segment_count": len(asr_segments),
+                "asr_segments": asr_segments,
+            })
         total_source_duration = sum(float(item.get("duration_seconds") or 0) for item in summaries)
+        raw_asr_index = {
+            "version": "source_raw_asr_index_v1",
+            "raw_asr_segment_count": len(raw_segments_all),
+            "sources": raw_sources,
+        }
         aggregate = {
             "version": "source_aggregate_local_time_v1",
             "source_count": len(self._iter_source_items()),
@@ -1337,10 +1469,20 @@ class PipelineRunner:
                 "total_source_duration_seconds": round(total_source_duration, 3),
                 "chunks": chunks,
             },
+            "raw_asr_index": raw_asr_index,
         }
         out = write_json(vdir / "source_aggregate.json", aggregate)
-        self._write_status(vdir, self._base_status("source_aggregate", version, input_hash, [out]))
-        self._record_step(step="source_aggregate", version=version, status="success", output=relpath(out, self.task_dir), input_hash=input_hash, output_files=[out], extra={"summary": {"chunks": len(chunks), "sources": len(summaries)}})
+        raw_asr_out = write_json(vdir / "source_raw_asr_index.json", raw_asr_index)
+        self._write_status(vdir, self._base_status("source_aggregate", version, input_hash, [out, raw_asr_out]))
+        self._record_step(
+            step="source_aggregate",
+            version=version,
+            status="success",
+            output=relpath(out, self.task_dir),
+            input_hash=input_hash,
+            output_files=[out, raw_asr_out],
+            extra={"summary": {"chunks": len(chunks), "sources": len(summaries), "raw_asr_segments": len(raw_segments_all)}},
+        )
         print("完成: source_aggregate")
 
     def _load_current_timeline_digest(self) -> dict[str, Any]:
@@ -2456,7 +2598,6 @@ class PipelineRunner:
             return
 
         input_hash = stable_hash({
-            "timeline_digest": self._step_content_hash("timeline_digest") if "timeline_digest" in self.manifest.get("steps", {}) else None,
             "source_aggregate": self._step_content_hash("source_aggregate") if "source_aggregate" in self.manifest.get("steps", {}) else None,
             "asr_micro_segment_cfg": cfg,
             "prompt_version": 1,
@@ -2469,6 +2610,12 @@ class PipelineRunner:
         ensure_dir(vdir)
 
         sentences = self._build_asr_sentence_units()
+        if not sentences and cfg.get("fail_on_empty", True):
+            raise UserFacingPipelineError(
+                "asr_micro_segment_no_raw_asr",
+                user_message="ASR 微分段失败：source_raw_asr_index 为空，无法从真实 ASR 时间生成 micro_segment。",
+                suggestions=["回查 source_aggregate/v*/source_raw_asr_index.json。", "确认每个 source_analysis 子任务已经生成 asr_segments.json。"],
+            )
         if cfg.get("include_visual_summary", True):
             sentences = self._attach_visual_to_asr_sentences(sentences)
             
@@ -2501,6 +2648,12 @@ class PipelineRunner:
         groups = self._dedupe_and_validate_sentence_groups(groups, sentences)
         segments = self._materialize_micro_segments_from_sentence_groups(groups, sentences)
         segments = self._enforce_micro_segment_limits(segments, cfg, sentences)
+        if not segments and cfg.get("fail_on_empty", True):
+            raise UserFacingPipelineError(
+                "asr_micro_segment_empty",
+                user_message="ASR 微分段失败：没有生成可用 micro_segment。",
+                suggestions=["回查 agents/asr_micro_segment/v*/asr_sentences.json。", "检查 ASR 文本是否为空或时间是否无效。"],
+            )
 
         output = {"segments": segments}
         out = write_json(vdir / "micro_segments.json", output)
@@ -2510,6 +2663,56 @@ class PipelineRunner:
         print("完成: asr_micro_segment")
 
     def _build_asr_sentence_units(self) -> list[dict[str, Any]]:
+        if not self._is_virtual_source_manifest():
+            compat = self.config.raw.get("compat", {})
+            if not compat.get("allow_asr_micro_segment_from_timeline_digest", False):
+                return []
+            return self._build_asr_sentence_units_legacy_from_timeline_digest()
+
+        aggregate = self._load_optional_step_json("source_aggregate", {})
+        raw_index = aggregate.get("raw_asr_index") if isinstance(aggregate, dict) else {}
+        raw_sources = raw_index.get("sources") if isinstance(raw_index, dict) else []
+        if not isinstance(raw_sources, list):
+            raw_sources = []
+
+        sentences: list[dict[str, Any]] = []
+        for source in raw_sources:
+            if not isinstance(source, dict):
+                continue
+            for seg in source.get("asr_segments") or []:
+                if not isinstance(seg, dict):
+                    continue
+                start = self._time_value_seconds(seg.get("start_seconds"))
+                end = self._time_value_seconds(seg.get("end_seconds"))
+                if start is None or end is None or end <= start:
+                    continue
+                text = str(seg.get("normalized_text") or seg.get("text") or "").strip()
+                if not text:
+                    continue
+                sentences.append({
+                    "sentence_id": f"s{len(sentences) + 1:04d}",
+                    "asr_segment_id": seg.get("asr_segment_id", ""),
+                    "source_raw_asr_segment_id": seg.get("source_raw_asr_segment_id", ""),
+                    "source_id": seg.get("source_id") or source.get("source_id") or "source_1",
+                    "source_index": seg.get("source_index", source.get("source_index", 0)),
+                    "start_seconds": round(float(start), 3),
+                    "end_seconds": round(float(end), 3),
+                    "text": text,
+                    "raw_text": seg.get("raw_text", ""),
+                    "source_chunk_ids": seg.get("source_chunk_ids", []),
+                    "primary_chunk_id": seg.get("primary_chunk_id", ""),
+                })
+
+        sentences.sort(key=lambda item: (
+            str(item.get("source_id") or ""),
+            float(item.get("start_seconds") or 0),
+            float(item.get("end_seconds") or 0),
+        ))
+        for index, sentence in enumerate(sentences, start=1):
+            sentence["sentence_id"] = f"s{index:04d}"
+        return sentences
+
+    def _build_asr_sentence_units_legacy_from_timeline_digest(self) -> list[dict[str, Any]]:
         digest = self._load_current_timeline_digest()
         timeline = digest.get("chunks", [])
         cfg = self.config.raw.get("asr_micro_segment", {})
@@ -2658,16 +2861,31 @@ class PipelineRunner:
             
             asr_text = "".join(s["text"] for s in s_list)
             visuals = []
+            asr_segment_ids = []
+            source_chunk_ids = []
             for s in s_list:
                 v = s.get("visual_summary")
                 if v and v not in visuals:
                     visuals.append(v)
+                asr_id = str(s.get("asr_segment_id") or "").strip()
+                if asr_id and asr_id not in asr_segment_ids:
+                    asr_segment_ids.append(asr_id)
+                for chunk_id in s.get("source_chunk_ids") or []:
+                    chunk_id = str(chunk_id).strip()
+                    if chunk_id and chunk_id not in source_chunk_ids:
+                        source_chunk_ids.append(chunk_id)
+            micro_segment_id = f"{source_id}_ms_{i+1:04d}"
                     
             segments.append({
-                "segment_id": f"{source_id}_m{i+1:03d}",
+                "micro_segment_id": micro_segment_id,
+                "segment_id": micro_segment_id,
                 "source_id": source_id,
                 "source_index": source_index,
                 "sentence_ids": sids,
+                "asr_segment_ids": asr_segment_ids,
+                "source_chunk_ids": source_chunk_ids,
+                "source_start_seconds": round(start, 3),
+                "source_end_seconds": round(end, 3),
                 "start_seconds": round(start, 3),
                 "end_seconds": round(end, 3),
                 "duration_seconds": round(end - start, 3),
@@ -2675,6 +2893,7 @@ class PipelineRunner:
                 "source_end": seconds_to_timecode(end, ms=True),
                 "asr_text": asr_text,
                 "summary": g.get("summary", ""),
+                "visual_context": " ".join(visuals),
                 "visual_summary": "，".join(visuals),
                 "segment_type": g.get("segment_type", "fact"),
                 "keep_candidate": g.get("keep_candidate", 1)
@@ -2724,11 +2943,26 @@ class PipelineRunner:
         for i, part_sids in enumerate(parts):
             sub_seg = dict(segment)
             sub_seg["segment_id"] = f"{segment['segment_id']}_{i+1}"
+            sub_seg["micro_segment_id"] = sub_seg["segment_id"]
             sub_seg["sentence_ids"] = part_sids
             
             s_list = [smap[sid] for sid in part_sids]
             start = s_list[0]["start_seconds"]
             end = s_list[-1]["end_seconds"]
+            asr_segment_ids = []
+            source_chunk_ids = []
+            for s in s_list:
+                asr_id = str(s.get("asr_segment_id") or "").strip()
+                if asr_id and asr_id not in asr_segment_ids:
+                    asr_segment_ids.append(asr_id)
+                for chunk_id in s.get("source_chunk_ids") or []:
+                    chunk_id = str(chunk_id).strip()
+                    if chunk_id and chunk_id not in source_chunk_ids:
+                        source_chunk_ids.append(chunk_id)
+            sub_seg["asr_segment_ids"] = asr_segment_ids
+            sub_seg["source_chunk_ids"] = source_chunk_ids
+            sub_seg["source_start_seconds"] = round(start, 3)
+            sub_seg["source_end_seconds"] = round(end, 3)
             sub_seg["start_seconds"] = round(start, 3)
             sub_seg["end_seconds"] = round(end, 3)
             sub_seg["duration_seconds"] = round(end - start, 3)
@@ -2751,10 +2985,13 @@ class PipelineRunner:
             if current["duration_seconds"] < min_seg and current["source_id"] == nxt["source_id"]:
                 # merge into nxt
                 nxt["start_seconds"] = current["start_seconds"]
+                nxt["source_start_seconds"] = current.get("source_start_seconds", current["start_seconds"])
                 nxt["source_start"] = current["source_start"]
                 nxt["duration_seconds"] = round(nxt["end_seconds"] - nxt["start_seconds"], 3)
                 nxt["asr_text"] = current["asr_text"] + nxt["asr_text"]
                 nxt["sentence_ids"] = current["sentence_ids"] + nxt["sentence_ids"]
+                nxt["asr_segment_ids"] = list(dict.fromkeys((current.get("asr_segment_ids") or []) + (nxt.get("asr_segment_ids") or [])))
+                nxt["source_chunk_ids"] = list(dict.fromkeys((current.get("source_chunk_ids") or []) + (nxt.get("source_chunk_ids") or [])))
                 current = nxt
             else:
                 merged.append(current)
@@ -2766,10 +3003,13 @@ class PipelineRunner:
             last = merged.pop()
             prev = merged[-1]
             prev["end_seconds"] = last["end_seconds"]
+            prev["source_end_seconds"] = last.get("source_end_seconds", last["end_seconds"])
             prev["source_end"] = last["source_end"]
             prev["duration_seconds"] = round(prev["end_seconds"] - prev["start_seconds"], 3)
             prev["asr_text"] = prev["asr_text"] + last["asr_text"]
             prev["sentence_ids"] = prev["sentence_ids"] + last["sentence_ids"]
+            prev["asr_segment_ids"] = list(dict.fromkeys((prev.get("asr_segment_ids") or []) + (last.get("asr_segment_ids") or [])))
+            prev["source_chunk_ids"] = list(dict.fromkeys((prev.get("source_chunk_ids") or []) + (last.get("source_chunk_ids") or [])))
             
         return merged
 
@@ -2788,7 +3028,8 @@ class PipelineRunner:
         ]
         
         for seg in micro_segments[:max_segments]:
-            lines.append(f"[{seg['segment_id']}]")
+            msid = seg.get("micro_segment_id") or seg.get("segment_id")
+            lines.append(f"[{msid}]")
             lines.append(f"source={seg['source_id']}")
             lines.append(f"time={seg['source_start']}-{seg['source_end']}")
             lines.append(f"duration={seg['duration_seconds']}")
@@ -2800,6 +3041,73 @@ class PipelineRunner:
             lines.append("")
             
         return "\n".join(lines).strip()
+
+    def _normalize_content_analysis_selected_segments(self, result: Any) -> dict[str, Any]:
+        raw_items: Any
+        if isinstance(result, list):
+            raw_items = result
+            base_result: dict[str, Any] = {}
+        elif isinstance(result, dict):
+            raw_items = result.get("selected_segments")
+            if raw_items is None:
+                raw_items = result.get("segments", [])
+            base_result = dict(result)
+        else:
+            raw_items = []
+            base_result = {}
+        if isinstance(raw_items, dict):
+            raw_items = raw_items.get("selected_segments", [])
+        if not isinstance(raw_items, list):
+            raw_items = []
+
+        micro_segments = self._load_step_json("asr_micro_segment").get("segments", [])
+        seg_map = {
+            str(s.get("micro_segment_id") or s.get("segment_id") or ""): s
+            for s in micro_segments
+            if isinstance(s, dict)
+        }
+        selected: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for raw in raw_items:
+            if isinstance(raw, str):
+                micro_segment_id = raw.strip()
+                summary = ""
+                role = ""
+            elif isinstance(raw, dict):
+                micro_segment_id = str(
+                    raw.get("micro_segment_id")
+                    or raw.get("segment_id")
+                    or raw.get("id")
+                    or ""
+                ).strip()
+                summary = str(raw.get("summary") or "").strip()
+                role = str(raw.get("role") or raw.get("segment_type") or "fact").strip()
+            else:
+                continue
+            if not micro_segment_id or micro_segment_id in seen or micro_segment_id not in seg_map:
+                continue
+            seg = seg_map[micro_segment_id]
+            selected.append({
+                "micro_segment_id": micro_segment_id,
+                "summary": summary or str(seg.get("summary") or seg.get("asr_text") or "").strip(),
+                "role": role or "fact",
+            })
+            seen.add(micro_segment_id)
+
+        return {
+            "version": "ai_voiceover_content_analysis_v2",
+            "input_unit": "micro_segment",
+            "selected_segments": selected,
+            "materialized_by_code": True,
+            "raw_model_plan": result,
+            **({
+                "model_fields": {
+                    key: value
+                    for key, value in base_result.items()
+                    if key not in {"selected_segments", "segments", "candidate_clips", "candidate_segments"}
+                }
+            } if base_result else {}),
+        }
 
     def _materialize_content_analysis_candidates_from_segments(self, result: Any) -> dict[str, Any]:
         if isinstance(result, list):
@@ -2858,28 +3166,170 @@ class PipelineRunner:
     def step_content_analysis(self) -> None:
         cfg = self.config.raw.get("asr_micro_segment", {})
         use_micro_segments = cfg.get("enabled", True)
-        micro_segments_file = self.task_dir / "agents" / "asr_micro_segment"
-        
-        if use_micro_segments:
-            # Check if micro_segments step actually succeeded
-            if self.manifest.get("steps", {}).get("asr_micro_segment", {}).get("status") == "success":
-                text_input = self._build_content_analysis_micro_segment_text()
-            else:
-                use_micro_segments = False
-                text_input = self._build_content_analysis_brief_text()
-        else:
-            text_input = self._build_content_analysis_brief_text()
-            
+        if not use_micro_segments or self.manifest.get("steps", {}).get("asr_micro_segment", {}).get("status") != "success":
+            raise UserFacingPipelineError(
+                "content_analysis_requires_micro_segments",
+                user_message="内容分析失败：AI 配音主链路必须先生成 micro_segments，不能回退到 chunk 分析。",
+                suggestions=["回查 agents/asr_micro_segment/v*/micro_segments.json。", "从 asr_micro_segment 重新运行。"],
+            )
+        text_input = self._build_content_analysis_micro_segment_text()
         result = self._run_text_agent("content_analysis", text_input)
-        
-        if use_micro_segments and ("candidate_segments" in result or "candidate_clips" not in result):
-            # Try to materialize from micro segments
-            result = self._materialize_content_analysis_candidates_from_segments(result)
-        else:
-            result = self._materialize_candidate_clips_from_chunks(result, source_step="content_analysis")
-            
+        result = self._normalize_content_analysis_selected_segments(result)
+        if not result.get("selected_segments"):
+            raise UserFacingPipelineError(
+                "content_analysis_selected_segments_empty",
+                user_message="内容分析失败：模型没有选出任何可用于 AI 配音的 micro_segment。",
+                suggestions=["回查 agents/content_analysis/v*/model_output.json。", "检查 asr_micro_segment 的 ASR 文本和画面摘要是否有效。"],
+                technical_detail={"raw_model_plan": result.get("raw_model_plan")},
+            )
         self._overwrite_step_json("content_analysis", result, materialized=True)
         self._write_compat_content_analysis(result)
+
+    def step_ai_voiceover_candidate_materialize(self) -> None:
+        content = self._load_step_json("content_analysis")
+        micro_doc = self._load_step_json("asr_micro_segment")
+        cfg = self.config.raw.get("ai_voiceover_candidate", {})
+        input_hash = stable_hash({
+            "content_analysis": self._step_content_hash("content_analysis"),
+            "asr_micro_segment": self._step_content_hash("asr_micro_segment"),
+            "cfg": cfg,
+        })
+        if self._can_reuse("ai_voiceover_candidate_materialize", input_hash):
+            print("reuse cache: ai_voiceover_candidate_materialize")
+            return
+
+        version, vdir = self._version_dir("ai_voiceover_candidate_materialize", "ai_voiceover_candidates")
+        ensure_dir(vdir)
+        padding_before = float(cfg.get("padding_before_seconds", 0.5) or 0.0)
+        padding_after = float(cfg.get("padding_after_seconds", 0.5) or 0.0)
+        min_clip_seconds = float(cfg.get("min_clip_seconds", 3.0) or 0.0)
+        max_clip_seconds = float(cfg.get("max_clip_seconds", 30.0) or 0.0)
+        fail_on_empty = bool(cfg.get("fail_on_empty", True))
+
+        micro_segments = [
+            seg for seg in micro_doc.get("segments", [])
+            if isinstance(seg, dict)
+        ]
+        seg_map = {
+            str(seg.get("micro_segment_id") or seg.get("segment_id") or ""): seg
+            for seg in micro_segments
+        }
+        source_bounds = {
+            str(item.get("source_id") or ""): float(item.get("local_end") or item.get("end") or item.get("duration_seconds") or 0)
+            for item in self._source_boundaries()
+            if isinstance(item, dict)
+        }
+
+        candidate_clips: list[dict[str, Any]] = []
+        missing_segment_ids: list[str] = []
+        for selected in content.get("selected_segments") or []:
+            if not isinstance(selected, dict):
+                continue
+            micro_segment_id = str(
+                selected.get("micro_segment_id")
+                or selected.get("segment_id")
+                or selected.get("id")
+                or ""
+            ).strip()
+            seg = seg_map.get(micro_segment_id)
+            if not seg:
+                if micro_segment_id:
+                    missing_segment_ids.append(micro_segment_id)
+                continue
+            start = self._time_value_seconds(seg.get("source_start_seconds") or seg.get("start_seconds"))
+            end = self._time_value_seconds(seg.get("source_end_seconds") or seg.get("end_seconds"))
+            if start is None or end is None or end <= start:
+                continue
+            source_id = str(seg.get("source_id") or "").strip()
+            source_duration = source_bounds.get(source_id, 0.0)
+            padded_start = max(0.0, float(start) - padding_before)
+            padded_end = float(end) + padding_after
+            if source_duration > 0:
+                padded_end = min(source_duration, padded_end)
+            if max_clip_seconds > 0 and padded_end - padded_start > max_clip_seconds:
+                padded_end = padded_start + max_clip_seconds
+            duration = round(max(0.0, padded_end - padded_start), 3)
+            if min_clip_seconds > 0 and duration < min_clip_seconds:
+                extra = min_clip_seconds - duration
+                padded_end += extra
+                if source_duration > 0 and padded_end > source_duration:
+                    padded_start = max(0.0, padded_start - (padded_end - source_duration))
+                    padded_end = source_duration
+                duration = round(max(0.0, padded_end - padded_start), 3)
+            if duration <= 0:
+                continue
+            clip_id = f"av_clip_{len(candidate_clips) + 1:04d}"
+            candidate_clips.append({
+                "clip_id": clip_id,
+                "candidate_type": "ai_voiceover",
+                "derived_from": "micro_segment",
+                "source_id": source_id,
+                "source_index": seg.get("source_index"),
+                "source_start_seconds": round(padded_start, 3),
+                "source_end_seconds": round(padded_end, 3),
+                "source_start": seconds_to_timecode(padded_start, ms=True),
+                "source_end": seconds_to_timecode(padded_end, ms=True),
+                "local_start_seconds": round(padded_start, 3),
+                "local_end_seconds": round(padded_end, 3),
+                "local_start": seconds_to_timecode(padded_start, ms=True),
+                "local_end": seconds_to_timecode(padded_end, ms=True),
+                "duration_seconds": duration,
+                "micro_segment_ids": [micro_segment_id],
+                "micro_segment_id": micro_segment_id,
+                "asr_segment_ids": seg.get("asr_segment_ids", []),
+                "source_chunk_ids": seg.get("source_chunk_ids", []),
+                "asr_text": seg.get("asr_text", ""),
+                "speech": seg.get("asr_text", ""),
+                "visual_context": seg.get("visual_context") or seg.get("visual_summary", ""),
+                "visual": seg.get("visual_context") or seg.get("visual_summary", ""),
+                "summary": selected.get("summary") or seg.get("summary") or seg.get("asr_text", ""),
+                "role": selected.get("role") or seg.get("segment_type") or "fact",
+                "padding_before_seconds": padding_before,
+                "padding_after_seconds": padding_after,
+            })
+
+        output = {
+            "version": "ai_voiceover_candidate_clips_v1",
+            "candidate_type": "ai_voiceover",
+            "source": "asr_micro_segment",
+            "candidate_clips": candidate_clips,
+        }
+        debug = {
+            "selected_segment_count": len(content.get("selected_segments") or []),
+            "micro_segment_count": len(micro_segments),
+            "candidate_clip_count": len(candidate_clips),
+            "missing_segment_ids": missing_segment_ids,
+            "config": {
+                "padding_before_seconds": padding_before,
+                "padding_after_seconds": padding_after,
+                "min_clip_seconds": min_clip_seconds,
+                "max_clip_seconds": max_clip_seconds,
+            },
+        }
+        out = write_json(vdir / "candidate_clips.json", output)
+        debug_out = write_json(vdir / "materialize_debug.json", debug)
+        status = "failed" if fail_on_empty and not candidate_clips else "success"
+        status_doc = self._base_status("ai_voiceover_candidate_materialize", version, input_hash, [out, debug_out])
+        status_doc["status"] = status
+        if status == "failed":
+            status_doc["technical_error"] = debug
+        self._write_status(vdir, status_doc)
+        self._record_step(
+            step="ai_voiceover_candidate_materialize",
+            version=version,
+            status=status,
+            output=relpath(out, self.task_dir),
+            input_hash=input_hash,
+            output_files=[out, debug_out],
+            extra={"summary": {"candidate_clips": len(candidate_clips)}},
+        )
+        if fail_on_empty and not candidate_clips:
+            raise UserFacingPipelineError(
+                "ai_voiceover_candidate_clips_empty",
+                user_message="AI 配音候选片段为空：content_analysis 没有形成可物化的 micro_segment。",
+                suggestions=["回查 agents/content_analysis/v*/content_analysis.json。", "回查 agents/asr_micro_segment/v*/micro_segments.json。"],
+                technical_detail=debug,
+            )
 
     def step_video_understanding(self) -> None:
         text_input = self._build_video_understanding_brief_text()
@@ -2974,6 +3424,8 @@ class PipelineRunner:
 
         issues: list[str] = []
         scripts = edit_plan.get("scripts", []) if isinstance(edit_plan, dict) else []
+        if not isinstance(scripts, list) or not scripts:
+            issues.append("short_video_edit_plan.scripts is empty")
 
         for script in scripts:
             sid = str(script.get("short_video_id") or "unknown")
@@ -3014,6 +3466,12 @@ class PipelineRunner:
             )
 
     def step_short_video_edit_plan(self) -> None:
+        if self.options.production_mode == "ai_voiceover" and not self._load_candidate_clips_for_current_mode():
+            raise UserFacingPipelineError(
+                "short_video_edit_plan_candidate_clips_empty",
+                user_message="选片规划失败：AI 配音候选片段为空。",
+                suggestions=["回查 ai_voiceover_candidates/v*/candidate_clips.json。", "从 content_analysis 重新运行。"],
+            )
         result = self._run_text_agent("short_video_edit_plan", self._build_short_video_edit_plan_text())
         result = self._materialize_short_video_edit_plan(result)
         self._validate_ai_voiceover_editing_structure_or_raise(result)
@@ -3026,6 +3484,12 @@ class PipelineRunner:
     def step_voiceover_script(self) -> None:
         edit_plan = self._load_step_json("short_video_edit_plan")
         scripts = [x for x in edit_plan.get("scripts", []) if isinstance(x, dict)]
+        if not scripts:
+            raise UserFacingPipelineError(
+                "voiceover_script_no_edit_plan_scripts",
+                user_message="配音文案生成失败：short_video_edit_plan.scripts 为空。",
+                suggestions=["回查 agents/short_video_edit_plan/v*/short_video_edit_plan.json。"],
+            )
         cfg = self.config.raw.get("voiceover_script", {})
         max_workers = max(1, int(cfg.get("max_workers", 2) or 2))
         model = str(cfg.get("model_name") or self._text_model_name())
@@ -3069,10 +3533,15 @@ class PipelineRunner:
                 if not items and parsed.get("short_video_id"):
                     items = [parsed]
                 if not items:
-                    items = [self._fallback_voiceover_script(script, short_video_id)]
+                    raise UserFacingPipelineError(
+                        "voiceover_script_model_empty",
+                        user_message="配音文案生成失败：模型没有返回可用 scripts。",
+                        suggestions=["回查 agents/voiceover_script/v*/_llm_debug。", "检查 voiceover_script 提示词输出格式。"],
+                        technical_detail={"short_video_id": short_video_id, "parsed": parsed},
+                    )
             except Exception as exc:
                 write_json(vdir / "_errors" / f"{short_video_id}.json", {"short_video_id": short_video_id, "error": str(exc), "created_at": now_iso()})
-                items = [self._fallback_voiceover_script(script, short_video_id)]
+                raise
             return index, items
 
         results: list[tuple[int, list[dict[str, Any]]]] = []
@@ -3082,6 +3551,12 @@ class PipelineRunner:
                 results.append(future.result())
         results.sort(key=lambda x: x[0])
         final_output = {"scripts": [item for _index, items in results for item in items]}
+        if not final_output["scripts"]:
+            raise UserFacingPipelineError(
+                "voiceover_script_empty",
+                user_message="配音文案生成失败：没有生成任何可用文案。",
+                suggestions=["回查 agents/voiceover_script/v*/_errors。", "回查 short_video_edit_plan 的 editing_structure。"],
+            )
         out = write_json(vdir / "voiceover_script.json", final_output)
         self._write_status(vdir, self._base_status("voiceover_script", version, input_hash, [out]) | {"model": model})
         self._record_step(
@@ -3770,8 +4245,6 @@ class PipelineRunner:
             raw_videos = []
         content = self._load_optional_step_json("content_analysis", {})
         clips_by_id = self._candidate_clips_by_id()
-        if not raw_videos and clips_by_id:
-            raw_videos = [{"clip_ids": list(clips_by_id)[:8], "讲述重点": content.get("main_topic", ""), "必须讲到": content.get("key_facts", [])}]
 
         scripts: list[dict[str, Any]] = []
         used_clip_ids: set[str] = set()
@@ -4464,7 +4937,7 @@ class PipelineRunner:
     def _candidate_source_hash(self) -> str:
         if self.options.production_mode == "highlight_reassembly":
             return self._step_content_hash("candidate_filter") or self._step_content_hash("asr_event_candidate")
-        return self._step_content_hash("content_analysis")
+        return self._step_content_hash("ai_voiceover_candidate_materialize")
 
     def _load_candidate_clips_for_current_mode(self) -> list[dict[str, Any]]:
         if self.options.production_mode == "highlight_reassembly":
@@ -4474,14 +4947,11 @@ class PipelineRunner:
             pool = self._load_candidate_clip_pool(filtered=False)
             if pool:
                 return pool
-        source_step = "highlight_detection" if self.options.production_mode == "highlight_reassembly" else "content_analysis"
+        source_step = "highlight_detection" if self.options.production_mode == "highlight_reassembly" else "ai_voiceover_candidate_materialize"
         doc = self._load_optional_step_json(source_step, {})
         clips = doc.get("candidate_clips", [])
         if isinstance(clips, dict):
             clips = clips.get("candidate_clips", [])
-        if not isinstance(clips, list) and source_step != "highlight_detection":
-            doc = self._load_optional_step_json("highlight_detection", {})
-            clips = doc.get("candidate_clips", [])
         return [clip for clip in clips if isinstance(clip, dict)]
 
     def _load_video_topic_or_brief(self) -> str:
@@ -4636,7 +5106,7 @@ class PipelineRunner:
             if nearby:
                 lines.append("相邻上下文：" + json.dumps(nearby, ensure_ascii=False, separators=(",", ":")))
             lines.append("")
-        lines.append('输出 JSON：{"videos":[{"short_video_id":"v_001","title":"","clip_ids":["source_001_clip_0001"]}]}。不要输出时间戳。')
+        lines.append('输出 JSON：只返回数组，例如 [{"clip_ids":["source_001_clip_0001"]}]。不要输出时间戳，不要输出额外字段。')
         return "\n".join(lines)
 
     def _build_merge_decision_text(self, edit_plan: dict[str, Any]) -> str:
@@ -5354,6 +5824,13 @@ class PipelineRunner:
         voiceover = self._load_step_json("voiceover_script")
         editing = self._load_optional_step_json("editing_script", {"scripts": []})
         scripts = voiceover.get("scripts", []) if isinstance(voiceover, dict) else []
+        tts_is_hard_required = self.options.require_tts and self.options.audio_policy in {"ai_voiceover", "mixed"}
+        if tts_is_hard_required and not scripts:
+            raise UserFacingPipelineError(
+                "tts_no_voiceover_scripts",
+                user_message="TTS 生成失败：AI 配音文案为空。",
+                suggestions=["回查 agents/voiceover_script/v*/voiceover_script.json。", "回查 agents/short_video_edit_plan/v*/short_video_edit_plan.json。"],
+            )
         editing_by_id = {
             item.get("short_video_id"): item
             for item in editing.get("scripts", [])
@@ -5512,8 +5989,15 @@ class PipelineRunner:
         self._build_tts_duration_reconcile(editing, voiceover, {"outputs": outputs})
         failed = sum(1 for item in outputs if item.get("status") == "failed")
         success = sum(1 for item in outputs if item.get("status") == "success")
-        tts_is_hard_required = self.options.require_tts and self.options.audio_policy in {"ai_voiceover", "mixed"}
-        overall_status = "success" if failed == 0 else ("failed" if tts_is_hard_required else "partial_success")
+        if tts_is_hard_required and not outputs:
+            overall_status = "failed"
+            hard_error = "TTS required but outputs is empty"
+        elif tts_is_hard_required and success == 0:
+            overall_status = "failed"
+            hard_error = "TTS required but no successful output"
+        else:
+            overall_status = "success" if failed == 0 else ("failed" if tts_is_hard_required else "partial_success")
+            hard_error = ""
         self._record_step(
             step="tts",
             version=version,
@@ -5525,7 +6009,12 @@ class PipelineRunner:
         )
         print(f"完成: tts ({overall_status})")
         if overall_status == "failed":
-            raise RuntimeError("TTS 失败且 require_tts=true，已阻断后续 cut_plan/render")
+            raise UserFacingPipelineError(
+                "tts_failed_or_empty",
+                user_message="TTS 生成失败：没有生成可用配音音频。",
+                suggestions=["检查 voiceover_script 文案是否为空。", "检查 TTS 模型日志。"],
+                technical_detail={"success": success, "failed": failed, "total": len(outputs), "error": hard_error},
+            )
 
     def _build_tts_duration_reconcile(
         self,
@@ -5903,11 +6392,75 @@ class PipelineRunner:
             cursor += target_duration
         return clips, invalid
 
+    def _validate_ai_voiceover_inputs_before_cut_plan(
+        self,
+        editing: dict[str, Any],
+        voiceover: dict[str, Any],
+        tts: dict[str, Any],
+    ) -> None:
+        edit_scripts = editing.get("scripts") if isinstance(editing, dict) else []
+        voice_scripts = voiceover.get("scripts") if isinstance(voiceover, dict) else []
+        tts_outputs = tts.get("outputs") if isinstance(tts, dict) else []
+
+        issues: list[str] = []
+        if not isinstance(edit_scripts, list) or not edit_scripts:
+            issues.append("editing_script.scripts is empty")
+        if not isinstance(voice_scripts, list) or not voice_scripts:
+            issues.append("voiceover_script.scripts is empty")
+        if self.options.require_tts and self.options.audio_policy in {"ai_voiceover", "mixed"}:
+            if not isinstance(tts_outputs, list) or not tts_outputs:
+                issues.append("tts.outputs is empty")
+
+        for script in edit_scripts or []:
+            if not isinstance(script, dict):
+                continue
+            sid = str(script.get("short_video_id") or "")
+            shots = script.get("editing_structure") or []
+            if not isinstance(shots, list) or not shots:
+                issues.append(f"{sid}: editing_structure is empty")
+                continue
+            for shot in shots:
+                if not isinstance(shot, dict):
+                    continue
+                shot_id = shot.get("shot_id", "")
+                if not shot.get("source_id"):
+                    issues.append(f"{sid}/{shot_id}: missing source_id")
+                start = self._time_value_seconds(shot.get("source_start_seconds") or shot.get("source_start"))
+                end = self._time_value_seconds(shot.get("source_end_seconds") or shot.get("source_end"))
+                if start is None or end is None or end <= start:
+                    issues.append(f"{sid}/{shot_id}: invalid source time")
+
+        for voice_script in voice_scripts or []:
+            if not isinstance(voice_script, dict):
+                continue
+            sid = str(voice_script.get("short_video_id") or "")
+            segments = voice_script.get("narration_segments") or []
+            if not isinstance(segments, list) or not segments:
+                issues.append(f"{sid}: narration_segments is empty")
+                continue
+            for segment in segments:
+                if not isinstance(segment, dict):
+                    continue
+                if not str(segment.get("shot_id") or "").strip():
+                    issues.append(f"{sid}: narration segment missing shot_id")
+                if not str(segment.get("text") or "").strip():
+                    issues.append(f"{sid}/{segment.get('shot_id', '')}: narration text is empty")
+
+        if issues:
+            raise UserFacingPipelineError(
+                "cut_plan_ai_voiceover_input_invalid",
+                user_message="生成剪辑计划失败：AI 配音上游结构不完整。",
+                suggestions=["回查 ai_voiceover_candidates、short_video_edit_plan、voiceover_script、tts。"],
+                technical_detail={"issues": issues[:100]},
+            )
+
     def step_cut_plan(self) -> None:
         editing = self._load_step_json("editing_script")
         voiceover_script = self._load_step_json("voiceover_script")
         tts = self._load_optional_step_json("tts", {"outputs": []})
         subtitles = self._load_optional_step_json("subtitles", {"outputs": []})
+        if self.options.production_mode == "ai_voiceover":
+            self._validate_ai_voiceover_inputs_before_cut_plan(editing, voiceover_script, tts)
         input_hash = stable_hash({
             "editing": self._step_content_hash("editing_script"),
             "tts": self._step_content_hash("tts"),
@@ -6705,6 +7258,8 @@ class PipelineRunner:
         }
         if not ok:
             output["diagnostic_error"] = self._reassembly_error("quality_gate_failed", issues=issues)
+            if self.options.production_mode == "ai_voiceover":
+                output["diagnostic_error"]["suggestion"] = "回查 ai_voiceover_candidates、short_video_edit_plan、voiceover_script、cut_plan"
         out = write_json(vdir / "news_quality_gate.json", output)
         status = "success" if ok else "failed"
         status_doc = self._base_status("news_quality_gate", version, input_hash, [out])
@@ -6715,10 +7270,13 @@ class PipelineRunner:
         self._record_step(step="news_quality_gate", version=version, status=status, output=relpath(out, self.task_dir), input_hash=input_hash, output_files=[out])
         print(f"completed: news_quality_gate ({status})")
         if not ok:
+            suggestions = ["回查 reassembly_cut_plan 或 candidate_clip_pool_filtered。"]
+            if self.options.production_mode == "ai_voiceover":
+                suggestions = ["回查 ai_voiceover_candidates、short_video_edit_plan、voiceover_script、cut_plan。"]
             raise UserFacingPipelineError(
                 "quality_gate_failed",
                 user_message="本地质量检查未通过：剪辑计划存在缺字段或无效时间。",
-                suggestions=["回查 reassembly_cut_plan 或 candidate_clip_pool_filtered。"],
+                suggestions=suggestions,
                 technical_detail=output["diagnostic_error"],
             )
 

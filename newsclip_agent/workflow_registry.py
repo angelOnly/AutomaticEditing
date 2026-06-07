@@ -82,6 +82,7 @@ WORKFLOWS: dict[tuple[str, bool], list[str]] = {
         "source_aggregate",
         "asr_micro_segment",
         "content_analysis",
+        "ai_voiceover_candidate_materialize",
         "short_video_edit_plan",
         "voiceover_script",
         "voiceover_quality_gate",
@@ -126,7 +127,8 @@ DEPENDENCIES: dict[str, list[str]] = {
     "asr_micro_segment": ["timeline_digest", "source_aggregate"],
 
     "content_analysis": ["asr_micro_segment", "timeline_digest", "source_aggregate"],
-    "short_video_edit_plan": ["content_analysis"],
+    "ai_voiceover_candidate_materialize": ["content_analysis", "asr_micro_segment"],
+    "short_video_edit_plan": ["ai_voiceover_candidate_materialize"],
     "voiceover_script": ["short_video_edit_plan"],
     "voiceover_quality_gate": ["voiceover_script", "short_video_edit_plan"],
     "tts": ["voiceover_script", "voiceover_quality_gate"],

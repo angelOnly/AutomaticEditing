@@ -35,7 +35,7 @@ def test_child_pipeline_skips_all_reused_common_steps() -> None:
 
     selected = runner._resolve_selected_steps()
 
-    assert selected[0] == "content_analysis"
+    assert selected[0] == "asr_micro_segment"
     assert "source_prepare" not in selected
     assert "source_analysis" not in selected
     assert "source_aggregate" not in selected
