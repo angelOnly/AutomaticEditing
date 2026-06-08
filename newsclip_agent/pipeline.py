@@ -7697,45 +7697,46 @@ class PipelineRunner:
             "voice_name": voice_config.get("voice_name", ""),
         })
         reconcile = self._build_tts_duration_reconcile(editing, voiceover, {"outputs": outputs})
-        reconcile_ok = bool(reconcile.get("ok", True))
-        reconcile_hard_segments = self._tts_reconcile_hard_segments(reconcile)
-        reconcile_hard_videos = self._tts_reconcile_hard_videos(reconcile)
-        failed = sum(1 for item in outputs if item.get("status") == "failed")
-        success = sum(1 for item in outputs if item.get("status") == "success")
         expected_tts_segments = self._expected_tts_segment_keys() if tts_is_hard_required else set()
-        actual_tts_segments: set[tuple[str, str]] = set()
-        for output_item in outputs:
-            if not isinstance(output_item, dict):
-                continue
-            vid = str(output_item.get("short_video_id") or "").strip()
-            for seg in output_item.get("segments") or []:
-                if not isinstance(seg, dict) or seg.get("status") != "success":
-                    continue
-                shot_id = str(seg.get("shot_id") or "").strip()
-                if vid and shot_id:
-                    actual_tts_segments.add((vid, shot_id))
-        missing_tts_segments = sorted(expected_tts_segments - actual_tts_segments)
-        if tts_is_hard_required and not outputs:
+        fatal_errors = self._collect_tts_fatal_errors({"outputs": outputs}, expected_tts_segments)
+        
+        success = sum(1 for item in outputs if item.get("status") == "success")
+        failed = sum(1 for item in outputs if item.get("status") == "failed")
+        
+        if tts_is_hard_required and fatal_errors:
             overall_status = "failed"
-            hard_error = "TTS required but outputs is empty"
-        elif tts_is_hard_required and missing_tts_segments:
-            overall_status = "failed"
-            hard_error = "TTS required but some narration_segments have no successful audio"
-        elif tts_is_hard_required and success == 0:
-            overall_status = "failed"
-            hard_error = "TTS required but no successful output"
-        elif tts_is_hard_required and not reconcile_ok:
-            overall_status = "failed"
-            hard_error = "TTS duration reconcile failed"
-        elif tts_is_hard_required and reconcile_hard_videos:
-            overall_status = "failed"
-            hard_error = "TTS duration has hard mismatch videos"
-        elif tts_is_hard_required and reconcile_hard_segments:
-            overall_status = "failed"
-            hard_error = "TTS duration has hard mismatch segments"
+            hard_error = "TTS fatal failure"
         else:
-            overall_status = "success" if failed == 0 else ("failed" if tts_is_hard_required else "partial_success")
-            hard_error = ""
+            if not reconcile.get("ok", True):
+                decision = self._decide_post_tts_duration_action(
+                    editing_script=editing,
+                    voiceover_script=voiceover,
+                    tts_outputs={"outputs": outputs},
+                    reconcile=reconcile,
+                    fatal_errors=fatal_errors,
+                )
+                write_json(base_dir / "auto_duration_decision.json", decision)
+                
+                if decision.get("decision") == "shrink_video":
+                    adjusted = self._build_adjusted_editing_script_from_tts(
+                        editing_script=editing,
+                        tts_outputs={"outputs": outputs},
+                        reconcile=reconcile,
+                        decision=decision,
+                    )
+                    write_json(base_dir / "adjusted_editing_script.json", adjusted)
+                    overall_status = "success"
+                    hard_error = ""
+                elif decision.get("decision") == "continue":
+                    overall_status = "success"
+                    hard_error = ""
+                else:
+                    overall_status = "action_required"
+                    hard_error = decision.get("reason", "Action required for duration mismatch")
+            else:
+                overall_status = "success" if failed == 0 else ("failed" if tts_is_hard_required else "partial_success")
+                hard_error = ""
+                
         self._record_step(
             step="tts",
             version=version,
@@ -7743,23 +7744,23 @@ class PipelineRunner:
             output=relpath(out_index, self.task_dir),
             input_hash=input_hash,
             output_files=[out_index],
-            extra={"summary": {"success": success, "failed": failed, "total": len(outputs), "missing_segments": len(missing_tts_segments)}},
+            extra={"summary": {"success": success, "failed": failed, "total": len(outputs), "duration_adjusted": overall_status == "success" and not reconcile.get("ok", True)}},
         )
         print(f"完成: tts ({overall_status})")
+        
         if overall_status == "failed":
-            if missing_tts_segments:
-                error_type = "tts_missing_segments"
-                user_message = "TTS 生成失败：部分 narration_segments 没有成功生成音频。"
-            elif not outputs:
-                error_type = "tts_outputs_empty"
-                user_message = "TTS 生成失败：没有生成任何配音输出。"
-            elif reconcile_hard_videos or reconcile_hard_segments or not reconcile_ok:
-                error_type = "tts_duration_mismatch"
-                user_message = "TTS 已生成音频，但配音时长与目标时长严重不匹配。"
-            else:
-                error_type = "tts_failed_or_empty"
-                user_message = "TTS 生成失败：没有生成可用配音音频。"
-
+            error_type = "tts_failed"
+            user_message = "TTS 生成失败：无法生成可用配音音频或音频严重不匹配。"
+            for err in fatal_errors:
+                if err.get("type") == "missing_required_tts_segment":
+                    error_type = "tts_missing_segments"
+                    user_message = "TTS 生成失败：部分 required narration_segments 没有成功生成音频。"
+                    break
+                elif err.get("type") == "empty_tts_outputs":
+                    error_type = "tts_outputs_empty"
+                    user_message = "TTS 生成失败：没有生成任何配音输出。"
+                    break
+                    
             raise UserFacingPipelineError(
                 error_type,
                 user_message=user_message,
@@ -7774,10 +7775,203 @@ class PipelineRunner:
                     "failed": failed,
                     "total": len(outputs),
                     "error": hard_error,
-                    "missing": missing_tts_segments,
+                    "fatal_errors": fatal_errors,
                     "tts_duration_reconcile": reconcile,
                 },
             )
+        elif overall_status == "action_required":
+            self.manifest["action_required"] = {
+                "type": "duration_mismatch_action_required",
+                "message": hard_error,
+                "reconcile_path": relpath(base_dir / "tts_duration_reconcile.json", self.task_dir),
+            }
+            self._save_manifest()
+
+    def _collect_tts_fatal_errors(
+        self,
+        tts_outputs: dict[str, Any],
+        required_segment_keys: set[tuple[str, str]] | None = None,
+    ) -> list[dict[str, Any]]:
+        errors = []
+        outputs = tts_outputs.get("outputs", [])
+        if not outputs:
+            errors.append({"type": "empty_tts_outputs"})
+            return errors
+        
+        actual_segments = set()
+        for item in outputs:
+            vid = str(item.get("short_video_id") or "").strip()
+            audio_path = item.get("file")
+            duration = float(item.get("actual_duration_seconds") or 0)
+            
+            if not audio_path:
+                errors.append({"type": "missing_audio_path", "short_video_id": vid})
+            elif not (self.task_dir / audio_path).exists() and not Path(audio_path).is_absolute():
+                errors.append({"type": "audio_file_not_exists", "audio_path": audio_path})
+            elif duration <= 0:
+                errors.append({"type": "invalid_audio_duration", "audio_path": audio_path, "duration": duration})
+            
+            for seg in item.get("segments", []):
+                if seg.get("status") == "success":
+                    shot_id = str(seg.get("shot_id") or "").strip()
+                    if vid and shot_id:
+                        actual_segments.add((vid, shot_id))
+                        
+        if required_segment_keys is not None:
+            missing = required_segment_keys - actual_segments
+            for vid, shot_id in missing:
+                errors.append({"type": "missing_required_tts_segment", "short_video_id": vid, "shot_id": shot_id})
+                
+        return errors
+
+    def _decide_post_tts_duration_action(self, editing_script: dict[str, Any], voiceover_script: dict[str, Any], tts_outputs: dict[str, Any], reconcile: dict[str, Any], fatal_errors: list[dict[str, Any]]) -> dict[str, Any]:
+        ratio = float(reconcile.get("coverage_ratio", 1.0))
+        target_total = float(reconcile.get("target_total_duration_seconds", 0))
+        tts_total = float(reconcile.get("tts_total_duration_seconds", 0))
+
+        if fatal_errors:
+            return {
+                "schema_version": "auto_duration_decision_v1",
+                "decision": "action_required",
+                "reason": "TTS has fatal errors, cannot adjust video duration.",
+                "fatal_errors": fatal_errors,
+                "rebuild_cut_plan": False,
+                "rerun_tts": False,
+                "repair_voiceover": False,
+            }
+
+        voice_cfg = self.config.raw.get("voiceover", {}) if hasattr(self, "config") else {}
+        ok_min_ratio = float(voice_cfg.get("post_tts_ok_min_ratio", 0.90))
+
+        if ratio >= ok_min_ratio:
+            return {
+                "schema_version": "auto_duration_decision_v1",
+                "decision": "continue",
+                "reason": "TTS duration is close enough to planned video duration.",
+                "rebuild_cut_plan": False,
+                "rerun_tts": False,
+                "repair_voiceover": False,
+            }
+
+        if tts_total > 0 and target_total > 0:
+            return {
+                "schema_version": "auto_duration_decision_v1",
+                "decision": "shrink_video",
+                "reason": "TTS is shorter than planned video; shrink video in AI voiceover mode.",
+                "target_video_seconds_before": target_total,
+                "tts_seconds": tts_total,
+                "coverage_ratio": ratio,
+                "rebuild_cut_plan": True,
+                "rerun_tts": False,
+                "repair_voiceover": False,
+                "use_adjusted_editing_script": True,
+            }
+
+        return {
+            "schema_version": "auto_duration_decision_v1",
+            "decision": "action_required",
+            "reason": "Duration mismatch exists but editing script cannot be safely adjusted.",
+            "rebuild_cut_plan": False,
+            "rerun_tts": False,
+            "repair_voiceover": False,
+        }
+
+    def _build_adjusted_editing_script_from_tts(self, editing_script: dict[str, Any], tts_outputs: dict[str, Any], reconcile: dict[str, Any], decision: dict[str, Any]) -> dict[str, Any]:
+        adjusted = copy.deepcopy(editing_script)
+        
+        tts_by_shot_id = {}
+        for item in tts_outputs.get("outputs", []):
+            for seg in item.get("segments", []):
+                shot_id = seg.get("shot_id")
+                if shot_id:
+                    tts_by_shot_id[str(shot_id)] = seg
+                    
+        voice_cfg = self.config.raw.get("voiceover", {}) if hasattr(self, "config") else {}
+        tail_padding = float(voice_cfg.get("tts_visual_tail_padding_seconds", 1.0))
+        warnings = []
+        
+        for video in adjusted.get("scripts", []):
+            if not isinstance(video, dict):
+                continue
+            for shot in video.get("editing_structure", []):
+                if not isinstance(shot, dict):
+                    continue
+                shot_id = str(shot.get("shot_id", ""))
+                original_duration = float(shot.get("duration_seconds", shot.get("target_duration_seconds", 0)))
+                source_start = shot.get("source_start_seconds")
+                local_start = shot.get("local_start_seconds")
+                
+                tts_seg = tts_by_shot_id.get(shot_id)
+                if not tts_seg:
+                    warnings.append({
+                        "type": "missing_tts_segment_for_shot",
+                        "shot_id": shot_id,
+                        "action": "keep_original_duration"
+                    })
+                    continue
+                    
+                tts_duration = float(tts_seg.get("actual_duration_seconds", 0))
+                if tts_duration <= 0:
+                    warnings.append({
+                        "type": "invalid_tts_duration_for_shot",
+                        "shot_id": shot_id,
+                        "action": "keep_original_duration"
+                    })
+                    continue
+                    
+                min_d = float(shot.get("min_duration_seconds", max(3.0, original_duration * 0.60)))
+                max_d = float(shot.get("max_duration_seconds", original_duration))
+                max_d = min(max_d, original_duration)
+                
+                raw_new = tts_duration + tail_padding
+                new_duration = max(min_d, min(raw_new, max_d))
+                
+                if new_duration <= 0 or new_duration > original_duration:
+                    warnings.append({
+                        "type": "adjusted_duration_invalid",
+                        "shot_id": shot_id,
+                        "raw_new_duration": raw_new,
+                        "action": "keep_original_duration"
+                    })
+                    continue
+                    
+                shot["original_duration_seconds"] = original_duration
+                shot["original_target_duration_seconds"] = shot.get("target_duration_seconds")
+                shot["original_source_end_seconds"] = shot.get("source_end_seconds")
+                
+                new_duration_round = round(new_duration, 3)
+                shot["duration_seconds"] = new_duration_round
+                shot["target_duration_seconds"] = new_duration_round
+                
+                if source_start is not None:
+                    source_end = float(source_start) + new_duration
+                    shot["source_end_seconds"] = round(source_end, 3)
+                    shot["source_end"] = seconds_to_timecode(source_end)
+                    
+                if local_start is not None:
+                    local_end = float(local_start) + new_duration
+                    shot["local_end_seconds"] = round(local_end, 3)
+                    shot["local_end"] = seconds_to_timecode(local_end)
+                    
+                if "target_end_seconds" in shot:
+                    target_start = float(shot.get("target_start_seconds", 0))
+                    shot["target_end_seconds"] = round(target_start + new_duration, 3)
+                    
+                shot["tts_actual_duration_seconds"] = round(tts_duration, 3)
+                shot["tts_tail_padding_seconds"] = tail_padding
+                shot["duration_adjusted"] = True
+                shot["adjust_action"] = "trim_tail_to_tts"
+                shot["adjust_reason"] = "tts_segment_shorter_than_planned"
+
+        adjusted.setdefault("meta", {})["schema_version"] = "adjusted_editing_script_v1"
+        adjusted["meta"]["duration_adjusted"] = True
+        adjusted["meta"]["adjust_reason"] = "tts_duration_mismatch_shrink_video"
+        adjusted["meta"]["prevent_double_compact"] = True
+        adjusted["meta"]["effective_editing_source"] = "adjusted_editing_script"
+        adjusted["meta"]["auto_duration_decision_path"] = decision.get("path", "")
+        adjusted["meta"]["warnings"] = warnings
+
+        return adjusted
 
     def _tts_reconcile_hard_segments(self, reconcile: dict[str, Any]) -> list[dict[str, Any]]:
         hard_segments: list[dict[str, Any]] = []
@@ -7856,6 +8050,8 @@ class PipelineRunner:
                     "shot_id": shot_id,
                     "status": status,
                     "hard": hard,
+                    "fatal": status == "missing_tts",
+                    "hard_type": "adjustable_duration_mismatch" if status in {"too_short", "too_long"} and actual > 0 else "missing" if status == "missing_tts" else "",
                     "target_duration_seconds": round(target, 3),
                     "min_duration_seconds": round(min_d, 3),
                     "max_duration_seconds": round(max_d, 3),
@@ -7895,7 +8091,9 @@ class PipelineRunner:
                 "total_check": {
                     "ratio": round(coverage_ratio, 3),
                     "status": total_status,
-                    "hard": total_hard
+                    "hard": total_hard,
+                    "fatal": False,
+                    "hard_type": "adjustable_duration_mismatch" if total_hard else ""
                 },
                 "hard_segment_count": hard_count,
                 "segments": segment_checks,
@@ -8358,8 +8556,141 @@ class PipelineRunner:
                 technical_detail={"errors": errors},
             )
 
+    def _load_effective_editing_for_cut_plan(self) -> tuple[dict[str, Any], dict[str, Any]]:
+        original = self._load_step_json("editing_script")
+        voice_cfg = self.config.raw.get("voiceover", {}) if hasattr(self, "config") else {}
+        if not voice_cfg.get("use_adjusted_editing_script_for_cut_plan", True):
+            return original, {
+                "editing_source": "original_editing_script",
+                "reason": "use_adjusted_editing_script_for_cut_plan_disabled"
+            }
+            
+        tts_entry = self.manifest.get("steps", {}).get("tts")
+        if not tts_entry or tts_entry.get("status") not in {"success", "partial_success"}:
+            return original, {"editing_source": "original_editing_script", "reason": "tts_not_success"}
+            
+        tts_output = tts_entry.get("output")
+        if not tts_output:
+            return original, {"editing_source": "original_editing_script", "reason": "tts_output_missing"}
+            
+        tts_dir = (self.task_dir / tts_output).parent
+        decision_path = tts_dir / "auto_duration_decision.json"
+        adjusted_path = tts_dir / "adjusted_editing_script.json"
+        
+        decision = read_json(decision_path, None)
+        adjusted = read_json(adjusted_path, None)
+        
+        if decision and adjusted and decision.get("rebuild_cut_plan"):
+            if adjusted.get("meta", {}).get("duration_adjusted"):
+                return adjusted, {
+                    "editing_source": "adjusted_editing_script",
+                    "auto_duration_decision": decision,
+                    "adjusted_editing_script_path": relpath(adjusted_path, self.task_dir),
+                    "prevent_double_compact": True
+                }
+                
+        return original, {
+            "editing_source": "original_editing_script",
+            "reason": "no_adjusted_editing_script"
+        }
+
+    def _build_final_duration_check(self, output_videos: list[dict[str, Any]], effective_meta: dict[str, Any]) -> dict[str, Any]:
+        videos_check = []
+        all_ok = True
+        for video in output_videos:
+            tts_total = float(video.get("voiceover_duration_seconds") or 0)
+            cut_plan_total = float(video.get("video_duration_seconds") or 0)
+            ratio = cut_plan_total / tts_total if tts_total > 0 else 0
+            status = "pass"
+            
+            checks = {
+                "has_tts_audio": tts_total > 0,
+                "has_valid_cut_plan": cut_plan_total > 0,
+                "no_negative_duration": all(float(c.get("duration_seconds") or 0) >= 0 for c in video.get("clips", [])),
+            }
+            if tts_total > 0 and cut_plan_total > 0:
+                if ratio > 1.30:
+                    status = "failed"
+                    all_ok = False
+                elif ratio > 1.20:
+                    status = "warning"
+                    
+            videos_check.append({
+                "short_video_id": video.get("short_video_id"),
+                "status": status,
+                "tts_total_duration_seconds": tts_total,
+                "cut_plan_total_duration_seconds": cut_plan_total,
+                "video_tts_ratio": round(ratio, 3),
+                "checks": checks,
+                "warnings": video.get("warnings", []),
+            })
+            
+        return {
+            "schema_version": "final_duration_check_v1",
+            "ok": all_ok,
+            "status": "pass" if all_ok else "failed",
+            "effective_editing_source": effective_meta.get("editing_source", ""),
+            "videos": videos_check,
+        }
+
+    def _trim_ai_voiceover_clips_to_tts_duration(
+        self,
+        clips: list[dict[str, Any]],
+        *,
+        voiceover_duration: float,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        if (
+            self.options.production_mode != "ai_voiceover"
+            or not self.duration_settings.ai_voiceover_trim_video_to_tts
+            or voiceover_duration <= 0
+        ):
+            return clips, {"trimmed": False, "reason": "disabled_or_no_voiceover"}
+
+        tolerance = float(self.duration_settings.ai_voiceover_trim_tail_tolerance_seconds or 0.8)
+        max_duration = voiceover_duration + tolerance
+
+        trimmed: list[dict[str, Any]] = []
+        cursor = 0.0
+        cut_tail_seconds = 0.0
+
+        for clip in clips:
+            duration = float(clip.get("duration_seconds") or 0)
+            if duration <= 0:
+                continue
+
+            if cursor >= max_duration:
+                cut_tail_seconds += duration
+                continue
+
+            remain = max_duration - cursor
+            new_clip = dict(clip)
+
+            if duration > remain:
+                source_start = timecode_to_seconds(new_clip.get("source_start"))
+                new_duration = max(0.1, remain)
+                new_clip["source_end"] = seconds_to_timecode(source_start + new_duration, ms=True)
+                new_clip["duration_seconds"] = round(new_duration, 3)
+                new_clip["target_end_seconds"] = round(cursor + new_duration, 3)
+                cut_tail_seconds += duration - new_duration
+                duration = new_duration
+            else:
+                new_clip["target_end_seconds"] = round(cursor + duration, 3)
+
+            new_clip["target_start"] = seconds_to_timecode(cursor, ms=True)
+            new_clip["target_start_seconds"] = round(cursor, 3)
+            trimmed.append(new_clip)
+            cursor += duration
+
+        return trimmed, {
+            "trimmed": bool(cut_tail_seconds > 0.001),
+            "voiceover_duration_seconds": round(voiceover_duration, 3),
+            "max_video_duration_seconds": round(max_duration, 3),
+            "final_video_duration_seconds": round(cursor, 3),
+            "cut_tail_seconds": round(cut_tail_seconds, 3),
+        }
+
     def step_cut_plan(self) -> None:
-        editing = self._load_step_json("editing_script")
+        editing, effective_meta = self._load_effective_editing_for_cut_plan()
         voiceover_script = self._load_step_json("voiceover_script")
         tts = self._load_optional_step_json("tts", {"outputs": []})
         subtitles = self._load_optional_step_json("subtitles", {"outputs": []})
@@ -8367,6 +8698,8 @@ class PipelineRunner:
             self._validate_ai_voiceover_inputs_before_cut_plan(editing, voiceover_script, tts)
         input_hash = stable_hash({
             "editing": self._step_content_hash("editing_script"),
+            "effective_editing_source": effective_meta.get("editing_source"),
+            "effective_editing_hash": stable_hash(editing),
             "tts": self._step_content_hash("tts"),
             "subtitles": self._step_content_hash("subtitles"),
             "aspect": self.options.aspect_ratio,
@@ -8380,6 +8713,7 @@ class PipelineRunner:
             "ai_voiceover_compact_to_tts": self.duration_settings.ai_voiceover_compact_to_tts,
             "ai_voiceover_mismatch_policy": self.duration_settings.ai_voiceover_mismatch_policy,
             "ai_voiceover_min_ratio": self.duration_settings.ai_voiceover_min_ratio,
+            "skip_compact_to_tts": effective_meta.get("prevent_double_compact", False),
         })
         if self._can_reuse("cut_plan", input_hash):
             print("复用缓存: cut_plan")
@@ -8474,8 +8808,10 @@ class PipelineRunner:
             video_duration = round(target, 3)
             original_visual_duration = video_duration
             tts_segments = tts_item.get("segments", []) if isinstance(tts_item.get("segments"), list) else []
+            skip_compact_to_tts = effective_meta.get("prevent_double_compact", False)
             if (
                 self.duration_settings.ai_voiceover_compact_to_tts
+                and not skip_compact_to_tts
                 and tts_success
                 and tts_item.get("timeline_mode") == "compact_segmented"
                 and tts_segments
@@ -8495,6 +8831,30 @@ class PipelineRunner:
                         warnings.append(
                             f"auto_compacted_to_tts: visual {original_visual_duration:.1f}s -> {video_duration:.1f}s"
                         )
+            trim_to_tts_info = {"trimmed": False}
+            if (
+                self.options.production_mode == "ai_voiceover"
+                and tts_success
+                and self.duration_settings.ai_voiceover_trim_video_to_tts
+            ):
+                clips, trim_to_tts_info = self._trim_ai_voiceover_clips_to_tts_duration(
+                    clips,
+                    voiceover_duration=voiceover_duration,
+                )
+                if trim_to_tts_info.get("trimmed"):
+                    repair_reasons.append("trimmed_video_to_tts_duration")
+                    warnings.append(
+                        f"trimmed_video_to_tts_duration: "
+                        f"video -> {trim_to_tts_info.get('final_video_duration_seconds')}s, "
+                        f"tts={trim_to_tts_info.get('voiceover_duration_seconds')}s"
+                    )
+
+                video_duration = round(
+                    sum(float(clip.get("duration_seconds") or 0) for clip in clips),
+                    3,
+                )
+                target = video_duration
+
             target_duration = float(validation["target_duration_seconds"] or 0)
             min_compact_duration = target_duration * self.duration_settings.compact_min_target_ratio
             if (
@@ -8618,6 +8978,7 @@ class PipelineRunner:
                     and tts_segments
                     and abs(original_visual_duration - video_duration) > 0.001
                 ),
+                "trim_to_tts": trim_to_tts_info,
                 "original_visual_duration_seconds": round(original_visual_duration, 3),
                 "compacted_visual_duration_seconds": video_duration,
                 "cut_plan_debug": cut_plan_debug,
@@ -8635,6 +8996,22 @@ class PipelineRunner:
                 "cover": {"main_text": script.get("cover_text", ""), "sub_text": script.get("title", "")},
             })
         plan = {"project_id": self.task_id, "source_video": self.manifest["source_video"], "output_videos": output_videos}
+        
+        final_duration_check = self._build_final_duration_check(output_videos, effective_meta)
+        write_json(vdir / "final_duration_check.json", final_duration_check)
+        if not final_duration_check.get("ok"):
+            self.manifest["action_required"] = {
+                "type": "final_duration_check_failed",
+                "message": "Cut plan generated but failed final duration check (e.g. video excessively long relative to TTS).",
+                "path": relpath(vdir / "final_duration_check.json", self.task_dir),
+            }
+            self._save_manifest()
+            raise UserFacingPipelineError(
+                "final_duration_check_failed",
+                user_message="最终检查失败：成片剪辑时长与 AI 配音时长差距过大。",
+                suggestions=["查看 final_duration_check.json 分析原因", "检查 adjusted_editing_script 是否正确生成并生效"],
+            )
+            
         for video in output_videos:
             audio_check = validate_audio_policy(
                 video,
@@ -8738,6 +9115,11 @@ class PipelineRunner:
             shot_id = str(clip.get("shot_id") or clip.get("source_shot_id") or "")
             segment = active_by_shot_id.get(shot_id)
             if not segment:
+                if (
+                    self.options.production_mode == "ai_voiceover"
+                    and self.duration_settings.ai_voiceover_drop_unmatched_clips
+                ):
+                    continue
                 duration = float(clip.get("duration_seconds") or 0)
                 if duration <= 0:
                     continue
@@ -9470,6 +9852,29 @@ class PipelineRunner:
         if status == "failed":
             raise RuntimeError("render has no available videos; all candidates were blocked by cut_plan")
 
+    def _trim_rendered_video_to_duration(
+        self,
+        input_path: Path,
+        output_path: Path,
+        duration_seconds: float,
+    ) -> None:
+        run_cmd([
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(input_path),
+            "-t",
+            f"{duration_seconds:.3f}",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            str(output_path),
+        ])
+
     def _render_one(self, video: dict[str, Any], output_path: Path) -> None:
         temp_dir = ensure_dir(output_path.parent / "_clips")
         clip_files = []
@@ -9583,13 +9988,37 @@ class PipelineRunner:
                 str(mixed),
             ])
             current = mixed
+        final_current = current
+
+        if voiceover_enabled and self.duration_settings.ai_voiceover_render_trim_to_tts:
+            voiceover_duration = float(voice.get("actual_duration_seconds") or 0)
+            if voiceover_duration > 0:
+                tolerance = float(self.duration_settings.ai_voiceover_trim_tail_tolerance_seconds or 0.8)
+                trim_duration = voiceover_duration + tolerance
+                trimmed_video = temp_dir / f"{video['short_video_id']}_trimmed_to_tts.mp4"
+                self._trim_rendered_video_to_duration(current, trimmed_video, trim_duration)
+                final_current = trimmed_video
+
         subtitle = video.get("subtitles", {})
         if subtitle.get("burn_in") and subtitle.get("file"):
             sub = str(self.task_dir / subtitle["file"]).replace("\\", "/").replace(":", "\\:")
             style = self._subtitle_force_style()
-            run_cmd(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(current), "-vf", f"subtitles='{sub}':force_style='{style}'", "-c:a", "copy", str(output_path)])
+            run_cmd([
+                "ffmpeg",
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                str(final_current),
+                "-vf",
+                f"subtitles='{sub}':force_style='{style}'",
+                "-c:a",
+                "copy",
+                str(output_path),
+            ])
         else:
-            shutil.copy2(current, output_path)
+            shutil.copy2(final_current, output_path)
 
     def _video_filter(self, video: dict[str, Any]) -> str:
         if video.get("aspect_ratio") == "9:16":

@@ -284,6 +284,10 @@ tts_script_ok_max_ratio = 1.15
 tts_script_hard_max_ratio = 1.40
 voiceover_cover_min_ratio = 0.90
 subtitle_cover_min_ratio = 0.90
+ai_voiceover_trim_video_to_tts = true
+ai_voiceover_trim_tail_tolerance_seconds = 0.8
+ai_voiceover_render_trim_to_tts = true
+ai_voiceover_drop_unmatched_clips = true
 
 [ai_voiceover]
 candidate_chunk_max_gap_seconds = 3.0
