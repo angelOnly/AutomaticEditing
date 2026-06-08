@@ -153,6 +153,7 @@ class RunOptions:
     only_analysis: bool = False
     common_only: bool = False
     target_duration_seconds: int | None = None
+    target_duration_mode: str = "soft"
     output_mode: str = "single"
     max_output_videos: int = 1
     min_output_video_seconds: int = 30
@@ -4248,11 +4249,25 @@ class PipelineRunner:
                 },
             )
 
+    def _soft_target_warning(self, script: dict[str, Any]) -> None:
+        visual_seconds = float(script.get("visual_total_seconds") or 0.0)
+        target_seconds = float(script.get("target_duration_seconds") or 0.0)
+        mode = str(script.get("target_duration_mode") or "soft")
+        sid = str(script.get("short_video_id") or "unknown")
+
+        if mode == "soft" and target_seconds > 0:
+            if visual_seconds > target_seconds * 1.5:
+                print(
+                    f"[Soft Target] Video {sid} visual duration {visual_seconds:.1f}s is significantly longer than "
+                    f"soft target {target_seconds:.1f}s, but within max limits."
+                )
+
     def _validate_ai_voiceover_plan_duration_or_raise(self, edit_plan: dict[str, Any]) -> None:
         if self.options.production_mode != "ai_voiceover":
             return
 
-        effective_max = self._effective_ai_voiceover_max_seconds()
+        configured_hard_max = self._configured_ai_voiceover_max_seconds()
+        effective_max = configured_hard_max
         allow_long = bool(self.options.allow_long_video)
         issues: list[str] = []
 
@@ -4262,13 +4277,15 @@ class PipelineRunner:
             sid = str(script.get("short_video_id") or "unknown")
             visual_seconds = editing_structure_duration(script.get("editing_structure") or [])
 
+            self._soft_target_warning(script)
+
             if visual_seconds <= 0:
                 issues.append(f"{sid}: visual duration is 0")
                 continue
 
             if visual_seconds > effective_max + 0.01:
                 issues.append(
-                    f"{sid}: visual duration {visual_seconds:.1f}s exceeds effective max {effective_max:.1f}s"
+                    f"{sid}: visual duration {visual_seconds:.1f}s exceeds AI voiceover hard max {effective_max:.1f}s"
                 )
 
             if visual_seconds > self.duration_settings.hard_max_without_confirmation and not allow_long:
@@ -4281,8 +4298,8 @@ class PipelineRunner:
                 "ai_voiceover_plan_duration_invalid",
                 user_message="AI 配音选片规划失败：规划画面时长超过当前任务允许范围。",
                 suggestions=[
-                    "去掉 --allow-long-video 或调小 --max-output-video-seconds 后，从 short_video_edit_plan 重跑。",
-                    "如果确实要长版，请确认长版并要求 voiceover_script 生成足够长文案。",
+                    "如果内容确实需要长版，请把 max_output_video_seconds 调大到 180，并允许 long video。",
+                    "如果只想要短版，请从 short_video_edit_plan 重跑，并要求模型减少 clip_ids 或缩短候选片段。",
                 ],
                 technical_detail={"issues": issues[:50], "effective_max_output_video_seconds": effective_max},
             )
@@ -5185,18 +5202,33 @@ class PipelineRunner:
                     "must_say_facts": must_keep if shot_index == 1 else [],
                 })
             visual_total = editing_structure_duration(editing_structure)
-            target_duration = round(self._resolve_voiceover_target_duration(visual_total, video), 3)
-            editing_structure = self._assign_shot_duration_budget(editing_structure, target_duration)
+            requested_target = float(getattr(self.options, "target_duration_seconds", 30) or 30)
+            max_allowed = float(getattr(self.options, "max_output_video_seconds", 180) or 180)
+
+            effective_target = self._resolve_ai_voiceover_effective_target_seconds(
+                visual_total_seconds=visual_total,
+                requested_target_seconds=requested_target,
+                max_allowed_seconds=max_allowed,
+            )
+
+            editing_structure = self._assign_shot_duration_budget(editing_structure, effective_target)
             editing_structure = self._attach_voiceover_char_budget(editing_structure)
-            max_allowed = max(target_duration, float(self.options.max_output_video_seconds or target_duration))
+            editing_structure = [
+                self._normalize_voiceover_budget_fields(shot)
+                for shot in editing_structure
+                if isinstance(shot, dict)
+            ]
             scripts.append({
                 "short_video_id": short_video_id,
                 "topic": topic,
                 "news_angle": news_angle,
                 "video_type": "解说型",
-                "target_duration_seconds": target_duration,
+                "requested_target_duration_seconds": round(requested_target, 3),
+                "target_duration_seconds": round(effective_target, 3),
+                "effective_target_duration_seconds": round(effective_target, 3),
                 "max_allowed_seconds": round(max_allowed, 3),
-                "visual_total_seconds": round(editing_structure_duration(editing_structure), 3),
+                "visual_total_seconds": round(visual_total, 3),
+                "target_duration_mode": str(getattr(self.options, "target_duration_mode", "soft") or "soft"),
                 "source_clip_ids": source_clip_ids,
                 "must_keep_fact_points": must_keep,
                 "voiceover_brief": news_angle,
@@ -5284,6 +5316,152 @@ class PipelineRunner:
                 return number
         return None
 
+    def _safe_positive_float(self, value: Any, *, default: float = 0.0) -> float:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return default
+        if not math.isfinite(number) or number <= 0:
+            return default
+        return round(number, 3)
+
+    def _safe_float(self, value: Any, default: float = 0.0) -> float:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return default
+        if not math.isfinite(number):
+            return default
+        return number
+
+    def _resolve_ai_voiceover_effective_target_seconds(
+        self,
+        *,
+        visual_total_seconds: float,
+        requested_target_seconds: float | None = None,
+        max_allowed_seconds: float | None = None,
+    ) -> float:
+        requested = self._safe_float(
+            requested_target_seconds or getattr(self.options, "target_duration_seconds", None),
+            float(getattr(self.duration_settings, "default_target_seconds", 30) or 30),
+        )
+
+        max_allowed = self._safe_float(
+            max_allowed_seconds or getattr(self.options, "max_output_video_seconds", None),
+            float(getattr(self.duration_settings, "max_long_video_seconds", 180) or 180),
+        )
+
+        if max_allowed <= 0:
+            max_allowed = 180.0
+
+        visual_total = self._safe_float(visual_total_seconds, 0.0)
+        mode = str(getattr(self.options, "target_duration_mode", "soft") or "soft").lower()
+
+        if mode == "fixed":
+            return round(min(max(requested, 1.0), max_allowed), 3)
+
+        if visual_total <= 0:
+            return round(min(max(requested, 1.0), max_allowed), 3)
+
+        return round(min(max(visual_total, 1.0), max_allowed), 3)
+
+    def _normalize_voiceover_budget_fields(self, shot: dict[str, Any]) -> dict[str, Any]:
+        item = dict(shot)
+
+        min_chars = self._first_number(item.get("narration_min_chars"))
+        target_chars = self._first_number(item.get("narration_target_chars"))
+        max_chars = self._first_number(item.get("narration_max_chars"))
+
+        voice_cfg = self.config.raw.get("voiceover", {}) if hasattr(self, "config") else {}
+        cps = float(voice_cfg.get("voiceover_chars_per_second") or 4.8)
+
+        target_duration = self._first_number(item.get("target_duration_seconds"))
+        if target_duration is None:
+            target_duration = self._first_number(item.get("duration_seconds"))
+
+        # 如果完全没有预算，则按目标时长估算。
+        if target_duration and target_duration > 0:
+            estimated_target = max(1, int(round(target_duration * cps)))
+            if target_chars is None or target_chars <= 0:
+                target_chars = estimated_target
+            if min_chars is None or min_chars <= 0:
+                min_chars = int(round(target_chars * 0.75))
+            if max_chars is None or max_chars <= 0:
+                max_chars = int(round(target_chars * 1.25))
+
+        # 如果仍然没有预算，直接返回，避免误伤旧产物。
+        if min_chars is None and target_chars is None and max_chars is None:
+            return item
+
+        # 补齐缺失值。
+        if target_chars is None:
+            if min_chars is not None and max_chars is not None:
+                target_chars = int(round((min_chars + max_chars) / 2))
+            elif min_chars is not None:
+                target_chars = min_chars
+            elif max_chars is not None:
+                target_chars = max_chars
+
+        if min_chars is None:
+            min_chars = int(round(float(target_chars) * 0.75))
+        if max_chars is None:
+            max_chars = int(round(float(target_chars) * 1.25))
+
+        min_chars = int(max(0, round(float(min_chars))))
+        target_chars = int(max(0, round(float(target_chars))))
+        max_chars = int(max(0, round(float(max_chars))))
+
+        # 核心修复：不能出现 min > target > max 这种矛盾。
+        if min_chars > target_chars:
+            min_chars = target_chars
+        if max_chars < target_chars:
+            max_chars = target_chars
+        if min_chars > max_chars:
+            min_chars = max_chars
+
+        # 对很短 shot 做保护，避免 0 字预算。
+        if target_duration and target_duration > 0:
+            min_floor = 6 if target_duration < 3 else 10
+            target_chars = max(target_chars, min_floor)
+            max_chars = max(max_chars, target_chars)
+            min_chars = min(max(min_chars, min_floor), target_chars)
+
+        item["narration_min_chars"] = min_chars
+        item["narration_target_chars"] = target_chars
+        item["narration_max_chars"] = max_chars
+        return item
+
+    def _resolve_tts_check_target_duration(self, shot: dict[str, Any]) -> tuple[float, float, float]:
+        target = self._safe_positive_float(shot.get("target_duration_seconds"), default=0.0)
+        source_duration = self._safe_positive_float(shot.get("duration_seconds"), default=0.0)
+
+        # AI 配音模式：优先使用配音目标时长。
+        if target <= 0 and self.options.production_mode == "ai_voiceover":
+            target = source_duration
+
+        # 非 AI 配音或旧产物：保留旧行为，兼容 duration_seconds。
+        if target <= 0:
+            target = source_duration
+
+        min_d = self._safe_positive_float(shot.get("min_duration_seconds"), default=0.0)
+        max_d = self._safe_positive_float(shot.get("max_duration_seconds"), default=0.0)
+
+        if target > 0:
+            if min_d <= 0:
+                min_d = round(target * 0.65, 3)
+            if max_d <= 0:
+                max_d = round(target * 1.35, 3)
+
+        if max_d > 0 and min_d > max_d:
+            min_d = round(max_d * 0.75, 3)
+        if target > 0:
+            if min_d > target:
+                min_d = round(target * 0.75, 3)
+            if max_d < target:
+                max_d = round(target * 1.25, 3)
+
+        return target, min_d, max_d
+
     def _time_value_seconds(self, value: Any) -> float | None:
         if value in (None, ""):
             return None
@@ -5361,20 +5539,14 @@ class PipelineRunner:
 
     def _resolve_voiceover_target_duration(self, visual_total: float, plan: dict[str, Any] | None = None) -> float:
         plan = plan or {}
-        for value in (
-            self._first_number(getattr(self.options, "target_duration_seconds", None)),
-            self._first_number(getattr(self.options, "max_output_video_seconds", None)),
-            self._first_number(plan.get("target_duration_seconds")),
-        ):
-            if value and value > 0:
-                return value
-        voice_cfg = self.config.raw.get("voiceover", {}) if hasattr(self, "config") else {}
-        default_target = self._first_number(voice_cfg.get("default_target_duration_seconds"))
-        if not default_target or default_target <= 0:
-            default_target = float(getattr(self.duration_settings, "default_target_seconds", 60.0) or 60.0)
-        if visual_total <= 0:
-            return default_target
-        return min(float(visual_total), float(default_target))
+        requested_target = plan.get("requested_target_duration_seconds") or plan.get("target_duration_seconds")
+        max_allowed = plan.get("max_allowed_seconds") or getattr(self.options, "max_output_video_seconds", None)
+
+        return self._resolve_ai_voiceover_effective_target_seconds(
+            visual_total_seconds=visual_total,
+            requested_target_seconds=requested_target,
+            max_allowed_seconds=max_allowed,
+        )
 
     def _assign_shot_duration_budget(self, editing_structure: list[dict[str, Any]], target_duration: float) -> list[dict[str, Any]]:
         if not editing_structure:
@@ -5397,6 +5569,16 @@ class PipelineRunner:
         if total_available <= 0:
             return items
         target_duration = max(0.0, float(target_duration or 0.0)) or total_available
+        if abs(target_duration - total_available) <= 0.5:
+            for item in items:
+                available = float(item.get("available_duration_seconds") or 0.0)
+                item["target_duration_seconds"] = round(available, 3)
+                item["min_duration_seconds"] = round(max(1.0, available * 0.65), 3)
+                item["max_duration_seconds"] = round(available * 1.35, 3)
+                item.setdefault("allow_trim", True)
+                item.setdefault("allow_extend", True)
+            return items
+
         for item in items:
             available = float(item.get("available_duration_seconds") or 0.0)
             if available <= 0:
@@ -5609,7 +5791,28 @@ class PipelineRunner:
             })
             editing_structure = []
             for idx, shot in enumerate(script.get("editing_structure", [])):
-                editing_structure.append({
+                source_duration = self._safe_positive_float(shot.get("duration_seconds"), default=0.0)
+                target_duration = self._safe_positive_float(
+                    shot.get("target_duration_seconds"),
+                    default=source_duration,
+                )
+                min_duration = self._safe_positive_float(
+                    shot.get("min_duration_seconds"),
+                    default=0.0,
+                )
+                max_duration = self._safe_positive_float(
+                    shot.get("max_duration_seconds"),
+                    default=0.0,
+                )
+
+                # 兜底：如果没有 min/max，按 target 给一个合理范围，不再只依赖原始画面 duration。
+                if target_duration > 0:
+                    if min_duration <= 0:
+                        min_duration = round(target_duration * 0.65, 3)
+                    if max_duration <= 0:
+                        max_duration = round(target_duration * 1.35, 3)
+
+                item = {
                     "order": shot.get("order", idx + 1),
                     "shot_id": shot.get("shot_id", f"{script.get('short_video_id', 'sv')}_s{idx + 1:02d}"),
                     "target_timeline": shot.get("target_timeline", ""),
@@ -5618,7 +5821,26 @@ class PipelineRunner:
                     "source_index": shot.get("source_index", ""),
                     "source_start": shot.get("source_start", ""),
                     "source_end": shot.get("source_end", ""),
-                    "duration_seconds": shot.get("duration_seconds", 0),
+                    "source_start_seconds": shot.get("source_start_seconds"),
+                    "source_end_seconds": shot.get("source_end_seconds"),
+                    "local_start": shot.get("local_start", shot.get("source_start", "")),
+                    "local_end": shot.get("local_end", shot.get("source_end", "")),
+                    "local_start_seconds": shot.get("local_start_seconds", shot.get("source_start_seconds")),
+                    "local_end_seconds": shot.get("local_end_seconds", shot.get("source_end_seconds")),
+
+                    # 原始画面长度仍保留，供 cut_plan/render 使用。
+                    "duration_seconds": source_duration,
+
+                    # AI 配音目标长度必须保留，供 voiceover/TTS 校验使用。
+                    "target_duration_seconds": target_duration,
+                    "min_duration_seconds": min_duration,
+                    "max_duration_seconds": max_duration,
+
+                    # 文案预算必须保留，供 voiceover_script 和校验使用。
+                    "narration_min_chars": shot.get("narration_min_chars"),
+                    "narration_target_chars": shot.get("narration_target_chars"),
+                    "narration_max_chars": shot.get("narration_max_chars"),
+
                     "purpose": shot.get("purpose", ""),
                     "visual": shot.get("visual", ""),
                     "visual_evidence_type": "",
@@ -5630,7 +5852,9 @@ class PipelineRunner:
                     "editing_note": shot.get("news_fact_to_explain", ""),
                     "news_fact_to_explain": shot.get("news_fact_to_explain", ""),
                     "must_say_facts": shot.get("must_say_facts", []),
-                })
+                }
+
+                editing_structure.append(self._normalize_voiceover_budget_fields(item))
             editing_script["scripts"].append({
                 "short_video_id": script.get("short_video_id", ""),
                 "title": script.get("title", ""),
@@ -5960,14 +6184,26 @@ class PipelineRunner:
         lines.append('输出 JSON 只允许包含 clip_id，例如 {"output_videos":[{"reassembly_id":"hr_001","title":"","clip_ids":["source_001_clip_0001"]}]}')
         return "\n".join(lines)
 
-    def _effective_ai_voiceover_max_seconds(self) -> int:
-        target = int(self.options.target_duration_seconds or self.duration_settings.default_target_seconds or 30)
-        configured_max = int(self.options.max_output_video_seconds or self.duration_settings.normal_max_seconds)
+    def _configured_ai_voiceover_max_seconds(self) -> float:
+        short_cfg = self.config.raw.get("short_video", {}) if hasattr(self, "config") else {}
+        values = [
+            short_cfg.get("ai_voiceover_max_output_seconds"),
+            short_cfg.get("max_long_video_seconds"),
+            getattr(self.options, "max_output_video_seconds", None),
+        ]
+        for value in values:
+            try:
+                number = float(value or 0)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(number) and number > 0:
+                return max(30.0, min(number, 180.0))
+        return 180.0
+
+    def _effective_ai_voiceover_max_seconds(self) -> float:
         if self.options.production_mode != "ai_voiceover":
-            return configured_max
-        if self.options.allow_long_video:
-            return min(configured_max, int(self.duration_settings.max_long_video_seconds))
-        return min(configured_max, max(target + 8, int(self.duration_settings.normal_max_seconds)))
+            return float(self.options.max_output_video_seconds or self.duration_settings.normal_max_seconds)
+        return self._configured_ai_voiceover_max_seconds()
 
     def _build_short_video_edit_plan_text(self) -> str:
         llm_cfg = self.config.raw.get("llm_input", {})
@@ -5987,6 +6223,9 @@ class PipelineRunner:
             f"- raw_max_output_video_seconds：{self.options.max_output_video_seconds}",
             f"- allow_long_video：{self.options.allow_long_video}",
             "- 重要：AI 配音视频优先接近 target_duration_seconds；除非明确允许长版，否则不要贴着 max_output_video_seconds 输出。",
+            "target_duration_seconds 是推荐目标，不是硬上限。",
+            "如果新闻信息量较大，可以超过 target_duration_seconds，但必须控制在 effective_max_output_video_seconds 以内。",
+            "AI 配音模式下，允许 60-180 秒长版解说；长版必须保证每个 shot 都有足够 narration_intent，便于后续 voiceover_script 生成足够长文案。",
             "",
             "新闻概览：",
             f"主题：{content.get('main_topic') or content.get('topic') or ''}",
@@ -7508,11 +7747,28 @@ class PipelineRunner:
         )
         print(f"完成: tts ({overall_status})")
         if overall_status == "failed":
-            error_type = "tts_missing_segments" if missing_tts_segments else ("tts_outputs_empty" if not outputs else "tts_failed_or_empty")
+            if missing_tts_segments:
+                error_type = "tts_missing_segments"
+                user_message = "TTS 生成失败：部分 narration_segments 没有成功生成音频。"
+            elif not outputs:
+                error_type = "tts_outputs_empty"
+                user_message = "TTS 生成失败：没有生成任何配音输出。"
+            elif reconcile_hard_videos or reconcile_hard_segments or not reconcile_ok:
+                error_type = "tts_duration_mismatch"
+                user_message = "TTS 已生成音频，但配音时长与目标时长严重不匹配。"
+            else:
+                error_type = "tts_failed_or_empty"
+                user_message = "TTS 生成失败：没有生成可用配音音频。"
+
             raise UserFacingPipelineError(
                 error_type,
-                user_message="TTS 生成失败：没有生成可用配音音频。",
-                suggestions=["检查 voiceover_script 文案是否为空。", "检查 TTS 模型日志。"],
+                user_message=user_message,
+                suggestions=[
+                    "优先从 short_video_edit_plan 重新运行，重新生成配音目标时长和文案预算。",
+                    "检查 agents/short_video_edit_plan/v*/short_video_edit_plan.json 中 target_duration_seconds 与 narration_*_chars 是否合理。",
+                    "检查 agents/voiceover_script/v*/voiceover_script.json 的 narration_text 是否过短。",
+                    "检查 tts_duration_reconcile.json 中 target_total_duration_seconds、tts_total_duration_seconds、coverage_ratio。",
+                ],
                 technical_detail={
                     "success": success,
                     "failed": failed,
@@ -7580,9 +7836,7 @@ class PipelineRunner:
                 if not isinstance(shot, dict):
                     continue
                 shot_id = str(shot.get("shot_id") or "")
-                target = float(shot.get("target_duration_seconds") or shot.get("duration_seconds") or 0)
-                min_d = float(shot.get("min_duration_seconds") or (target * 0.65 if target else 0))
-                max_d = float(shot.get("max_duration_seconds") or (target * 1.35 if target else 0))
+                target, min_d, max_d = self._resolve_tts_check_target_duration(shot)
                 tts_seg = tts_by_shot.get(shot_id)
                 actual = float((tts_seg or {}).get("actual_duration_seconds") or 0)
                 if not tts_seg or actual <= 0:
@@ -9730,6 +9984,11 @@ def parse_args(argv: list[str] | None = None) -> RunOptions:
     parser.add_argument("--common-only", action="store_true", help="Run only source-independent reusable analysis steps.")
     parser.add_argument("--only-analysis", action="store_true", help="只跑到风险审核，不生成配音和视频")
     parser.add_argument("--target-duration", type=int, default=int(default_config.short_video.get("default_target_seconds", 30)), dest="target_duration_seconds")
+    parser.add_argument(
+        "--target-duration-mode",
+        choices=["fixed", "soft"],
+        default=str(default_config.short_video.get("ai_voiceover_target_mode", "soft")),
+    )
     parser.add_argument("--output-mode", choices=["single", "multiple"], default="single")
     parser.add_argument("--max-output-videos", type=int, default=1)
     parser.add_argument("--min-output-video-seconds", type=int, default=30)

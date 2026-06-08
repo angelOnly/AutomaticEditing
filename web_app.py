@@ -204,11 +204,16 @@ class RunRequest(BaseModel):
     skip_tts: bool = False
     skip_render: bool = False
     target_duration_seconds: int = int(SHORT_VIDEO_DEFAULTS.get("default_target_seconds", 30))
-    target_duration_mode: str = "fixed"
+    target_duration_mode: str = str(SHORT_VIDEO_DEFAULTS.get("ai_voiceover_target_mode", "soft"))
     output_mode: str = "single"
     max_output_videos: int = 1
     min_output_video_seconds: int = 30
-    max_output_video_seconds: int = 45
+    max_output_video_seconds: int = int(
+        SHORT_VIDEO_DEFAULTS.get(
+            "ai_voiceover_max_output_seconds",
+            SHORT_VIDEO_DEFAULTS.get("max_long_video_seconds", 180),
+        )
+    )
     allow_long_video: bool = bool(SHORT_VIDEO_DEFAULTS.get("allow_long_video_default", False))
     require_tts: bool = bool(VOICEOVER_DEFAULTS.get("tts_required_by_default", True))
     voice_id: str | None = None
@@ -250,6 +255,14 @@ def get_config() -> dict[str, Any]:
             "default_target_seconds": int(SHORT_VIDEO_DEFAULTS.get("default_target_seconds", 30)),
             "hard_max_without_confirmation": int(SHORT_VIDEO_DEFAULTS.get("hard_max_without_confirmation", 60)),
             "allow_long_video_default": bool(SHORT_VIDEO_DEFAULTS.get("allow_long_video_default", False)),
+            "max_long_video_seconds": int(SHORT_VIDEO_DEFAULTS.get("max_long_video_seconds", 180)),
+            "ai_voiceover_target_mode": str(SHORT_VIDEO_DEFAULTS.get("ai_voiceover_target_mode", "soft")),
+            "ai_voiceover_max_output_seconds": int(
+                SHORT_VIDEO_DEFAULTS.get(
+                    "ai_voiceover_max_output_seconds",
+                    SHORT_VIDEO_DEFAULTS.get("max_long_video_seconds", 180),
+                )
+            ),
         },
         "voiceover": {
             "tts_required_by_default": bool(VOICEOVER_DEFAULTS.get("tts_required_by_default", True)),
@@ -1162,6 +1175,21 @@ def _build_run_command(
     source_request_path: Path | None = None,
 ) -> list[str]:
     runner = MULTI_SOURCE_RUNNER if source_request_path else RUNNER
+    max_output_seconds = int(req.max_output_video_seconds or 0)
+    configured_max = int(
+        SHORT_VIDEO_DEFAULTS.get(
+            "ai_voiceover_max_output_seconds",
+            SHORT_VIDEO_DEFAULTS.get("max_long_video_seconds", 180),
+        )
+    )
+
+    if req.production_mode == "ai_voiceover":
+        if max_output_seconds <= 0:
+            max_output_seconds = configured_max
+        max_output_seconds = max(30, min(max_output_seconds, configured_max))
+    else:
+        max_output_seconds = max(1, max_output_seconds or req.max_output_video_seconds)
+
     cmd = [
         sys.executable,
         "-u",
@@ -1176,6 +1204,8 @@ def _build_run_command(
         req.aspect_ratio,
         "--target-duration",
         str(req.target_duration_seconds),
+        "--target-duration-mode",
+        str(req.target_duration_mode or "soft"),
         "--audio-policy",
         req.audio_policy,
         "--production-mode",
@@ -1187,7 +1217,7 @@ def _build_run_command(
         "--min-output-video-seconds",
         str(req.min_output_video_seconds),
         "--max-output-video-seconds",
-        str(req.max_output_video_seconds),
+        str(max_output_seconds),
     ]
     if req.voice_id:
         cmd.extend(["--voice-id", req.voice_id])

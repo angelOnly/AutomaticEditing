@@ -158,6 +158,8 @@ const state = {
     default_run_mode: "all",
     default_target_seconds: 30,
     allow_long_video_default: true,
+    max_long_video_seconds: 180,
+    ai_voiceover_max_output_seconds: 180,
     tts_required_by_default: true,
     allow_original_audio_evidence: false,
   },
@@ -197,6 +199,9 @@ async function loadConfig() {
     state.defaults.default_run_mode = normalizeDefaultRunMode(state.defaults.default_run_mode);
     state.defaults.default_target_seconds = config.short_video?.default_target_seconds ?? state.defaults.default_target_seconds;
     state.defaults.allow_long_video_default = config.short_video?.allow_long_video_default ?? state.defaults.allow_long_video_default;
+    state.defaults.max_long_video_seconds = config.short_video?.max_long_video_seconds ?? state.defaults.max_long_video_seconds;
+    state.defaults.ai_voiceover_max_output_seconds = config.short_video?.ai_voiceover_max_output_seconds ?? state.defaults.ai_voiceover_max_output_seconds;
+    state.defaults.ai_voiceover_target_mode = config.short_video?.ai_voiceover_target_mode ?? "soft";
     state.defaults.tts_required_by_default = config.voiceover?.tts_required_by_default ?? state.defaults.tts_required_by_default;
     state.defaults.allow_original_audio_evidence = config.voiceover?.allow_original_audio_evidence ?? state.defaults.allow_original_audio_evidence;
     state.voices = config.voices || [];
@@ -1967,8 +1972,10 @@ function handleRunError(error) {
 function baseRunRequest() {
   const mode = $("runMode").value;
   const targetDuration = Number($("targetDuration").value || state.defaults.default_target_seconds || 30);
-  const allowLongVideo = false;
   const productionMode = $("productionMode").value;
+  const isAiVoiceover = productionMode === "ai_voiceover";
+  const allowLongVideo = isAiVoiceover ? Boolean(state.defaults.allow_long_video_default) : false;
+  const targetDurationMode = isAiVoiceover ? (state.defaults.ai_voiceover_target_mode || "soft") : "fixed";
   const outputMode = productionMode === "highlight_reassembly" ? ($("outputMode")?.value || "single") : "single";
   return {
     production_mode: productionMode,
@@ -1982,7 +1989,8 @@ function baseRunRequest() {
     frame_interval: Number($("frameInterval").value || state.defaults.default_frame_interval || 5),
     aspect_ratio: $("aspectRatio").value,
     target_duration_seconds: targetDuration,
-    target_duration_mode: allowLongVideo && targetDuration === 30 ? "auto_within_60" : "fixed",
+    target_duration_mode: targetDurationMode,
+    max_output_video_seconds: isAiVoiceover ? Math.max(30, Math.min(Number(state.defaults.ai_voiceover_max_output_seconds || state.defaults.max_long_video_seconds || 180), 180)) : targetDuration,
     allow_long_video: allowLongVideo,
     require_tts: productionMode === "highlight_reassembly" ? false : $("requireTts").checked,
     voice_id: productionMode === "highlight_reassembly" ? null : ($("voiceSelect")?.value || null),

@@ -210,8 +210,12 @@ normal_max_seconds = 35
 context_max_seconds = 45
 complex_max_seconds = 60
 hard_max_without_confirmation = 60
-allow_long_video_default = false
-max_long_video_seconds = 90
+allow_long_video_default = true
+max_long_video_seconds = 180
+ai_voiceover_max_output_seconds = 180
+ai_voiceover_target_mode = "soft"
+soft_target_tolerance_ratio = 0.5
+soft_target_min_extra_seconds = 15
 
 [voiceover]
 char_budget_soft_tolerance_chars = 3
