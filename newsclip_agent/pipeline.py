@@ -3282,11 +3282,113 @@ class PipelineRunner:
 
         return all_segments
 
-    def _build_content_analysis_micro_segment_text(self) -> str:
-        micro_segments = self._load_segments_for_content_analysis()
-        cfg = self.config.raw.get("asr_micro_segment", {})
-        max_segments = cfg.get("max_segments_for_content_analysis", 120)
-        
+    def _content_analysis_cfg(self) -> dict[str, Any]:
+        raw = self.config.raw.get("content_analysis", {}) or {}
+        llm_input_cfg = self.config.raw.get("llm_input", {}) or {}
+        asr_micro_cfg = self.config.raw.get("asr_micro_segment", {}) or {}
+
+        return {
+            "group_by_source": bool(raw.get("group_by_source", True)),
+            "group_when_source_count_gt": max(1, int(raw.get("group_when_source_count_gt", 3) or 3)),
+            "max_sources_per_group": max(1, int(raw.get("max_sources_per_group", 3) or 3)),
+            "max_segments_per_group": max(1, int(raw.get("max_segments_per_group", 40) or 40)),
+            "max_input_chars_per_group": max(
+                1000,
+                int(
+                    raw.get(
+                        "max_input_chars_per_group",
+                        min(10000, int(llm_input_cfg.get("max_content_analysis_input_chars", 12000) or 12000)),
+                    )
+                    or 10000
+                ),
+            ),
+            "max_selected_segments_per_group": max(1, int(raw.get("max_selected_segments_per_group", 6) or 6)),
+            "max_final_selected_segments": max(1, int(raw.get("max_final_selected_segments", 20) or 20)),
+            "allow_partial_group_success": bool(raw.get("allow_partial_group_success", True)),
+            "fallback_to_single_pass_when_empty": bool(raw.get("fallback_to_single_pass_when_empty", False)),
+            "legacy_max_segments": max(1, int(asr_micro_cfg.get("max_segments_for_content_analysis", 120) or 120)),
+        }
+
+    def _source_order_from_segments(self, segments: list[dict[str, Any]]) -> list[str]:
+        source_order: list[str] = []
+        seen: set[str] = set()
+        for seg in segments:
+            if not isinstance(seg, dict):
+                continue
+            source_id = str(seg.get("source_id") or "source_1").strip() or "source_1"
+            if source_id not in seen:
+                seen.add(source_id)
+                source_order.append(source_id)
+        return source_order
+
+    def _group_segments_for_content_analysis(
+        self,
+        segments: list[dict[str, Any]],
+        cfg: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        source_order = self._source_order_from_segments(segments)
+
+        if not cfg["group_by_source"] or len(source_order) <= cfg["group_when_source_count_gt"]:
+            return [{
+                "group_id": "all",
+                "group_index": 1,
+                "group_count": 1,
+                "source_ids": source_order,
+                "segments": segments[: cfg["legacy_max_segments"]],
+                "grouped": False,
+            }]
+
+        by_source: dict[str, list[dict[str, Any]]] = {source_id: [] for source_id in source_order}
+        for seg in segments:
+            if not isinstance(seg, dict):
+                continue
+            source_id = str(seg.get("source_id") or "source_1").strip() or "source_1"
+            by_source.setdefault(source_id, []).append(seg)
+
+        source_groups: list[list[str]] = []
+        max_sources = cfg["max_sources_per_group"]
+        for start in range(0, len(source_order), max_sources):
+            source_groups.append(source_order[start:start + max_sources])
+
+        groups: list[dict[str, Any]] = []
+        for index, source_ids in enumerate(source_groups, start=1):
+            group_segments: list[dict[str, Any]] = []
+            for source_id in source_ids:
+                group_segments.extend(by_source.get(source_id, []))
+
+            groups.append({
+                "group_id": f"group_{index:03d}",
+                "group_index": index,
+                "group_count": len(source_groups),
+                "source_ids": source_ids,
+                "segments": group_segments[: cfg["max_segments_per_group"]],
+                "grouped": True,
+            })
+
+        return [group for group in groups if group.get("segments")]
+
+    def _build_content_analysis_micro_segment_text(
+        self,
+        micro_segments: list[dict[str, Any]] | None = None,
+        *,
+        group_id: str = "all",
+        group_index: int = 1,
+        group_count: int = 1,
+        source_ids: list[str] | None = None,
+        max_selected_segments: int | None = None,
+        max_input_chars: int | None = None,
+    ) -> str:
+        if micro_segments is None:
+            micro_segments = self._load_segments_for_content_analysis()
+
+        cfg = self._content_analysis_cfg()
+        max_segments = cfg["legacy_max_segments"]
+        if max_input_chars is None:
+            max_input_chars = cfg["max_input_chars_per_group"]
+        if max_selected_segments is None:
+            max_selected_segments = cfg["max_selected_segments_per_group"]
+        source_ids = source_ids or self._source_order_from_segments(micro_segments)
+
         lines = [
             "你将看到一组已经按 ASR 语义切好的 micro_segments。",
             "每个 micro_segment_id 是唯一标识。",
@@ -3294,6 +3396,10 @@ class PipelineRunner:
             "不要合并多个 micro_segment。",
             "不要输出新的时间码。",
             "输出 JSON 格式：{\"selected_segments\":[{\"micro_segment_id\":\"...\",\"summary\":\"...\",\"role\":\"fact\"}]}",
+            "",
+            f"当前分组：{group_id}，第 {group_index}/{group_count} 组。",
+            "当前组 source_ids：" + ", ".join(source_ids),
+            f"当前组最多选择 {max_selected_segments} 个 micro_segment。",
             "",
             "选择偏好：",
             "优先选择 10～35 秒内的 micro_segment。",
@@ -3303,27 +3409,49 @@ class PipelineRunner:
             "",
         ]
 
+        included = 0
+        truncated = False
         for seg in micro_segments[:max_segments]:
             msid = str(seg.get("micro_segment_id") or "").strip()
             if not msid:
                 continue
-            lines.append(f"[{msid}]")
-            lines.append(f"source={seg.get('source_id', '')}")
-            lines.append(f"duration={seg.get('duration_seconds', '')}")
+
+            block_lines = [
+                f"[{msid}]",
+                f"source={seg.get('source_id', '')}",
+                f"duration={seg.get('duration_seconds', '')}",
+            ]
             if seg.get("preselect_summary"):
-                lines.append(f"预选摘要：{seg['preselect_summary']}")
+                block_lines.append(f"预选摘要：{seg['preselect_summary']}")
             else:
-                lines.append(f"摘要：{seg.get('summary', '')}")
+                summary = str(seg.get("summary") or "").strip()
+                if summary:
+                    block_lines.append(f"摘要：{summary}")
             
             speech = sanitize_llm_text(str(seg.get("asr_text") or seg.get("speech") or ""), max_chars=160)
             if speech:
-                lines.append(f"短ASR：{speech}")
+                block_lines.append(f"短ASR：{speech}")
             
             visual = compact_text(str(seg.get("visual_summary") or seg.get("visual") or ""), max_chars=80)
             if visual:
-                lines.append(f"短画面：{visual}")
+                block_lines.append(f"短画面：{visual}")
+
+            block = "\n".join(block_lines).strip()
+            candidate_text = "\n".join(lines + [block, ""]).strip()
+            if len(candidate_text) > max_input_chars:
+                truncated = True
+                break
+
+            lines.append(block)
             lines.append("")
-            
+            included += 1
+
+        if truncated:
+            lines.append("")
+            lines.append("注意：后续 micro_segments 已因输入长度预算被截断，不能选择未出现在上文的 micro_segment_id。")
+
+        lines.append("")
+        lines.append(f"本次实际提供 micro_segment 数：{included}")
         return "\n".join(lines).strip()
 
     def _normalize_content_analysis_selected_segments(self, result: Any) -> dict[str, Any]:
@@ -3406,6 +3534,60 @@ class PipelineRunner:
                     if key not in {"selected_segments", "segments", "candidate_clips", "candidate_segments"}
                 }
             } if base_result else {}),
+        }
+
+    def _merge_grouped_content_analysis_results(
+        self,
+        *,
+        group_results: list[dict[str, Any]],
+        group_errors: list[dict[str, Any]],
+        cfg: dict[str, Any],
+    ) -> dict[str, Any]:
+        selected: list[dict[str, Any]] = []
+        seen: set[str] = set()
+
+        for group in sorted(group_results, key=lambda x: int(x.get("group_index") or 0)):
+            count_in_group = 0
+            for item in group.get("selected_segments") or []:
+                if not isinstance(item, dict):
+                    continue
+                msid = str(item.get("micro_segment_id") or "").strip()
+                if not msid or msid in seen:
+                    continue
+
+                clean_item = {
+                    "micro_segment_id": msid,
+                    "summary": str(item.get("summary") or "").strip(),
+                    "role": str(item.get("role") or "fact").strip() or "fact",
+                    "source_group_id": group.get("group_id", ""),
+                }
+                selected.append(clean_item)
+                seen.add(msid)
+                count_in_group += 1
+
+                if count_in_group >= cfg["max_selected_segments_per_group"]:
+                    break
+
+            if len(selected) >= cfg["max_final_selected_segments"]:
+                break
+
+        selected = selected[: cfg["max_final_selected_segments"]]
+
+        return {
+            "version": "ai_voiceover_content_analysis_v2_grouped",
+            "input_unit": "micro_segment",
+            "selected_segments": selected,
+            "diagnostics": {
+                "selected_count": len(selected),
+                "group_count": len(group_results),
+                "group_error_count": len(group_errors),
+                "group_errors": group_errors,
+                "max_selected_segments_per_group": cfg["max_selected_segments_per_group"],
+                "max_final_selected_segments": cfg["max_final_selected_segments"],
+            },
+            "materialized_by_code": True,
+            "grouped_content_analysis": True,
+            "group_results": group_results,
         }
 
     def _materialize_content_analysis_candidates_from_segments(self, result: Any) -> dict[str, Any]:
@@ -3827,23 +4009,122 @@ class PipelineRunner:
                 suggestions=["确认 AGENT_INFO['content_analysis'] 绑定 CONTENT_ANALYSIS_MICRO_SEGMENT_PROMPT。"],
                 technical_detail={"prompt_version": prompt_version},
             )
-        text_input = self._build_content_analysis_micro_segment_text()
-        legacy_segment_hint = "只输出 segment_id" in text_input or "[segment_id]" in text_input
-        if legacy_segment_hint or "\ntime=" in text_input:
+
+        ca_cfg = self._content_analysis_cfg()
+        all_segments = self._load_segments_for_content_analysis()
+        groups = self._group_segments_for_content_analysis(all_segments, ca_cfg)
+        if not groups:
             raise UserFacingPipelineError(
-                "content_analysis_prompt_binding_invalid",
-                user_message="content_analysis 输入协议无效：不得向模型提示 segment_id 或 time 时间码。",
-                suggestions=["检查 _build_content_analysis_micro_segment_text() 是否只输出 micro_segment_id。"],
-                technical_detail={"legacy_segment_hint": legacy_segment_hint, "contains_time": "\ntime=" in text_input},
+                "content_analysis_no_input_segments",
+                user_message="内容分析失败：没有可用于 AI 配音终选的 micro_segment。",
+                suggestions=["回查 agents/asr_micro_segment/v*/micro_segments.json。", "回查 agents/content_analysis_preselect/v*/content_analysis_preselect.json。"],
             )
-        result = self._run_text_agent("content_analysis", text_input)
-        result = self._normalize_content_analysis_selected_segments(result)
+
+        group_results: list[dict[str, Any]] = []
+        group_errors: list[dict[str, Any]] = []
+
+        for group in groups:
+            try:
+                text_input = self._build_content_analysis_micro_segment_text(
+                    group["segments"],
+                    group_id=group["group_id"],
+                    group_index=group["group_index"],
+                    group_count=group["group_count"],
+                    source_ids=group["source_ids"],
+                    max_selected_segments=ca_cfg["max_selected_segments_per_group"],
+                    max_input_chars=ca_cfg["max_input_chars_per_group"],
+                )
+                print(
+                    f"LLM grouped input size [content_analysis][{group['group_id']}]: "
+                    f"{len(text_input)} chars, sources={group['source_ids']}, segments={len(group['segments'])}",
+                    flush=True,
+                )
+
+                legacy_segment_hint = "只输出 segment_id" in text_input or "[segment_id]" in text_input
+                if legacy_segment_hint or "\ntime=" in text_input:
+                    raise UserFacingPipelineError(
+                        "content_analysis_prompt_binding_invalid",
+                        user_message="content_analysis 输入协议无效：不得向模型提示 segment_id 或 time 时间码。",
+                        suggestions=["检查 _build_content_analysis_micro_segment_text() 是否只输出 micro_segment_id。"],
+                        technical_detail={
+                            "legacy_segment_hint": legacy_segment_hint,
+                            "contains_time": "\ntime=" in text_input,
+                            "group_id": group["group_id"],
+                        },
+                    )
+
+                model_result = self._run_text_agent("content_analysis", text_input, allow_reuse=False)
+                normalized = self._normalize_content_analysis_selected_segments(model_result)
+                allowed_ids = {
+                    str(seg.get("micro_segment_id") or "").strip()
+                    for seg in group["segments"]
+                    if isinstance(seg, dict) and str(seg.get("micro_segment_id") or "").strip()
+                }
+                selected = [
+                    item for item in normalized.get("selected_segments", [])
+                    if str(item.get("micro_segment_id") or "").strip() in allowed_ids
+                ]
+                invalid_cross_group = [
+                    item for item in normalized.get("selected_segments", [])
+                    if str(item.get("micro_segment_id") or "").strip() not in allowed_ids
+                ]
+                diagnostics = dict(normalized.get("diagnostics", {}))
+                if invalid_cross_group:
+                    diagnostics["invalid_cross_group_items"] = invalid_cross_group
+
+                group_results.append({
+                    "group_id": group["group_id"],
+                    "group_index": group["group_index"],
+                    "source_ids": group["source_ids"],
+                    "input_segment_count": len(group["segments"]),
+                    "selected_segments": selected,
+                    "diagnostics": diagnostics,
+                    "raw_model_plan": normalized.get("raw_model_plan"),
+                })
+            except Exception as exc:
+                group_errors.append({
+                    "group_id": group.get("group_id"),
+                    "group_index": group.get("group_index"),
+                    "source_ids": group.get("source_ids", []),
+                    "error": str(exc),
+                })
+                if not ca_cfg["allow_partial_group_success"] or len(groups) == 1:
+                    raise
+
+        result = self._merge_grouped_content_analysis_results(
+            group_results=group_results,
+            group_errors=group_errors,
+            cfg=ca_cfg,
+        )
+
+        if not result.get("selected_segments"):
+            if ca_cfg["fallback_to_single_pass_when_empty"] and len(groups) > 1:
+                text_input = self._build_content_analysis_micro_segment_text(
+                    all_segments,
+                    group_id="fallback_all",
+                    group_index=1,
+                    group_count=1,
+                    source_ids=self._source_order_from_segments(all_segments),
+                    max_selected_segments=ca_cfg["max_final_selected_segments"],
+                    max_input_chars=int(self.config.raw.get("llm_input", {}).get("max_content_analysis_input_chars", 12000) or 12000),
+                )
+                fallback_result = self._run_text_agent("content_analysis", text_input, allow_reuse=False)
+                result = self._normalize_content_analysis_selected_segments(fallback_result)
+
         if not result.get("selected_segments"):
             raise UserFacingPipelineError(
                 "content_analysis_selected_segments_empty",
                 user_message="内容分析失败：模型没有选出任何可用于 AI 配音的 micro_segment。",
-                suggestions=["回查 agents/content_analysis/v*/model_output.json。", "检查 asr_micro_segment 的 ASR 文本和画面摘要是否有效。"],
-                technical_detail={"raw_model_plan": result.get("raw_model_plan")},
+                suggestions=[
+                    "回查 agents/content_analysis/v*/model_output.json。",
+                    "检查 asr_micro_segment 的 ASR 文本和画面摘要是否有效。",
+                    "如果是多视频任务，请检查 content_analysis.json 里的 group_results 和 group_errors。",
+                ],
+                technical_detail={
+                    "group_results": group_results,
+                    "group_errors": group_errors,
+                    "raw_model_plan": result.get("raw_model_plan"),
+                },
             )
         self._overwrite_step_json("content_analysis", result, materialized=True)
         self._write_compat_content_analysis(result)
@@ -7098,7 +7379,7 @@ class PipelineRunner:
                 hint = "请检查该步骤输入压缩策略。"
             raise RuntimeError(f"LLM input size [{step}] exceeds limit={limit}; {hint}")
 
-    def _run_text_agent(self, step: str, input_data: Any) -> Any:
+    def _run_text_agent(self, step: str, input_data: Any, *, allow_reuse: bool = True) -> Any:
         if self.llm_text is None:
             raise RuntimeError("缺少 text LLM 配置")
         base, out_name, prompt, default_prompt_version = AGENT_INFO[step]
@@ -7109,7 +7390,7 @@ class PipelineRunner:
         max_tokens = int(llm_cfg.get("text_llm_max_tokens", 16000) or 16000)
         prompt_version = self.options.prompt_version or default_prompt_version
         input_hash = stable_hash({"input": input_data, "model": model, "fallback": fallback, "prompt": prompt, "prompt_version": prompt_version})
-        if self._can_reuse(step, input_hash):
+        if allow_reuse and self._can_reuse(step, input_hash):
             print(f"复用缓存: {step}")
             return self._load_step_json(step)
         version, vdir = self._version_dir(step, base)
@@ -9111,12 +9392,13 @@ class PipelineRunner:
         compacted: list[dict[str, Any]] = []
         cursor = 0.0
         gap = max(0.0, float(self.duration_settings.inter_sentence_gap_seconds or 0))
+        production_mode = getattr(self.options, "production_mode", "normal")
         for clip in clips:
             shot_id = str(clip.get("shot_id") or clip.get("source_shot_id") or "")
             segment = active_by_shot_id.get(shot_id)
             if not segment:
                 if (
-                    self.options.production_mode == "ai_voiceover"
+                    production_mode == "ai_voiceover"
                     and self.duration_settings.ai_voiceover_drop_unmatched_clips
                 ):
                     continue

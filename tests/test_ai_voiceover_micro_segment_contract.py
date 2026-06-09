@@ -56,6 +56,103 @@ def test_content_analysis_legacy_segment_id_is_diagnostic_only() -> None:
     assert output["diagnostics"]["legacy_segment_id_used"] == 1
 
 
+def test_content_analysis_groups_sources_in_stable_order() -> None:
+    runner = _runner()
+    runner.config.raw = {
+        "content_analysis": {
+            "group_by_source": True,
+            "group_when_source_count_gt": 3,
+            "max_sources_per_group": 3,
+            "max_segments_per_group": 40,
+        },
+        "asr_micro_segment": {"max_segments_for_content_analysis": 120},
+    }
+    segments = [
+        {"micro_segment_id": f"source_{i:03d}_ms_0001", "source_id": f"source_{i:03d}"}
+        for i in range(1, 9)
+    ]
+
+    groups = runner._group_segments_for_content_analysis(segments, runner._content_analysis_cfg())
+
+    assert [group["source_ids"] for group in groups] == [
+        ["source_001", "source_002", "source_003"],
+        ["source_004", "source_005", "source_006"],
+        ["source_007", "source_008"],
+    ]
+    assert [group["group_id"] for group in groups] == ["group_001", "group_002", "group_003"]
+
+
+def test_content_analysis_prompt_respects_char_budget() -> None:
+    runner = _runner()
+    runner.config.raw = {
+        "content_analysis": {
+            "max_input_chars_per_group": 1000,
+            "max_selected_segments_per_group": 6,
+        },
+        "asr_micro_segment": {"max_segments_for_content_analysis": 120},
+    }
+    segments = [
+        {
+            "micro_segment_id": f"ms_{i:03d}",
+            "source_id": "source_001",
+            "duration_seconds": 12,
+            "summary": "summary " * 20,
+            "asr_text": "speech " * 80,
+            "visual_summary": "visual " * 40,
+        }
+        for i in range(20)
+    ]
+
+    text = runner._build_content_analysis_micro_segment_text(
+        segments,
+        group_id="group_001",
+        group_index=1,
+        group_count=1,
+        source_ids=["source_001"],
+        max_input_chars=1000,
+    )
+
+    assert len(text) <= 1000
+    assert "本次实际提供 micro_segment 数" in text
+    assert "不能选择未出现在上文的 micro_segment_id" in text
+
+
+def test_merge_grouped_content_analysis_results_limits_and_dedupes() -> None:
+    runner = _runner()
+    cfg = {
+        "max_selected_segments_per_group": 2,
+        "max_final_selected_segments": 3,
+    }
+
+    output = runner._merge_grouped_content_analysis_results(
+        group_results=[
+            {
+                "group_id": "group_002",
+                "group_index": 2,
+                "selected_segments": [
+                    {"micro_segment_id": "ms_003", "summary": "third", "role": "fact"},
+                    {"micro_segment_id": "ms_004", "summary": "fourth", "role": "fact"},
+                ],
+            },
+            {
+                "group_id": "group_001",
+                "group_index": 1,
+                "selected_segments": [
+                    {"micro_segment_id": "ms_001", "summary": "first", "role": "fact"},
+                    {"micro_segment_id": "ms_002", "summary": "second", "role": "fact"},
+                    {"micro_segment_id": "ms_003", "summary": "duplicate", "role": "fact"},
+                ],
+            },
+        ],
+        group_errors=[],
+        cfg=cfg,
+    )
+
+    assert [item["micro_segment_id"] for item in output["selected_segments"]] == ["ms_001", "ms_002", "ms_003"]
+    assert output["selected_segments"][0]["source_group_id"] == "group_001"
+    assert output["diagnostics"]["selected_count"] == 3
+
+
 def test_short_video_edit_plan_reports_invalid_clip_ids() -> None:
     runner = _runner()
     runner._candidate_clips_by_id = lambda: {"clip_001": {"clip_id": "clip_001"}}

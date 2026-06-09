@@ -133,6 +133,17 @@ max_input_chars_per_batch = 8000
 require_micro_segment_id = true
 allow_empty_batch_result = true
 
+[content_analysis]
+group_by_source = true
+group_when_source_count_gt = 3
+max_sources_per_group = 3
+max_segments_per_group = 40
+max_input_chars_per_group = 10000
+max_selected_segments_per_group = 6
+max_final_selected_segments = 20
+allow_partial_group_success = true
+fallback_to_single_pass_when_empty = false
+
 [asr_micro_segment]
 enabled = true
 source = "raw_asr"
