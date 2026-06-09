@@ -90,12 +90,12 @@ EXCLUDES=(
 
 # 拷贝任务目录
 mkdir -p "${TEMP_DIR}/${TASK_NAME}"
-rsync -a "${EXCLUDES[@]}" "${TASK_DIR}/" "${TEMP_DIR}/${TASK_NAME}/"
+tar -cf - "${EXCLUDES[@]}" -C "$TASK_DIR" . | tar -xf - -C "${TEMP_DIR}/${TASK_NAME}"
 
 # 拷贝 common 目录
 COMMON_NAME=$(basename "$COMMON_DIR")
 mkdir -p "${TEMP_DIR}/${COMMON_NAME}"
-rsync -a "${EXCLUDES[@]}" "${COMMON_DIR}/" "${TEMP_DIR}/${COMMON_NAME}/"
+tar -cf - "${EXCLUDES[@]}" -C "$COMMON_DIR" . | tar -xf - -C "${TEMP_DIR}/${COMMON_NAME}"
 
 echo "正在生成 ZIP 文件，请稍候..."
 # 进入临时目录并打包，保证 zip 内部的目录层级正确
