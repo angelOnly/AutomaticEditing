@@ -33,6 +33,8 @@ HIGHLIGHT_DETECTION_PROMPT = _load_prompt("highlight_detection.txt")
 ASR_EVENT_CANDIDATE_PROMPT = _load_prompt("asr_event_candidate.txt")
 # AI 配音选片规划：从候选 clips 中决定每条短视频使用哪些 clip。
 SHORT_VIDEO_EDIT_PLAN_TEXT_PROMPT = _load_prompt("short_video_edit_plan_text.txt")
+# AI 配音选片规划超时重试：基于上一次失败结果重新压缩 clip_ids。
+SHORT_VIDEO_EDIT_PLAN_RETRY_TEXT_PROMPT = _load_prompt("short_video_edit_plan_retry_text.txt")
 # AI 配音文案：根据短视频 shots 生成 narration_text 和分段文案。
 VOICEOVER_SCRIPT_TEXT_PROMPT = _load_prompt("voiceover_script_text.txt")
 # AI 配音局部修复：只修复 TTS 时长过长或过短的 narration_segments。

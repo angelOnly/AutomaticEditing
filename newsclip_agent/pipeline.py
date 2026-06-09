@@ -92,7 +92,7 @@ AGENT_INFO = {
     "asr_micro_segment": ("agents/asr_micro_segment", "micro_segments.json", prompts.ASR_MICRO_SEGMENT_PROMPT, "asr_micro_segment_v1"),
     "content_analysis_preselect": ("agents/content_analysis_preselect", "content_analysis_preselect.json", prompts.CONTENT_ANALYSIS_PRESELECT_PROMPT, "content_analysis_preselect_v1"),
     "content_analysis": ("agents/content_analysis", "content_analysis.json", prompts.CONTENT_ANALYSIS_MICRO_SEGMENT_PROMPT, "content_analysis_micro_segment_v1"),
-    "short_video_edit_plan": ("agents/short_video_edit_plan", "short_video_edit_plan.json", prompts.SHORT_VIDEO_EDIT_PLAN_TEXT_PROMPT, "short_video_edit_plan_text_v1"),
+    "short_video_edit_plan": ("agents/short_video_edit_plan", "short_video_edit_plan.json", prompts.SHORT_VIDEO_EDIT_PLAN_TEXT_PROMPT, "short_video_edit_plan_text_v2"),
     "voiceover_script": ("agents/voiceover_script", "voiceover_script.json", prompts.VOICEOVER_SCRIPT_TEXT_PROMPT, "voiceover_script_text_v1"),
     "highlight_reassembly_plan": ("agents/highlight_reassembly", "highlight_reassembly_plan.json", prompts.HIGHLIGHT_REASSEMBLY_TEXT_PROMPT, "highlight_reassembly_text_v1"),
     "news_quality_ai_review": ("agents/news_quality_ai_review", "news_quality_ai_review.json", prompts.NEWS_QUALITY_AI_REVIEW_PROMPT, "news_quality_ai_review_v1"),
@@ -4592,10 +4592,13 @@ class PipelineRunner:
                 user_message="选片规划失败：AI 配音候选片段为空。",
                 suggestions=["回查 ai_voiceover_candidates/v*/candidate_clips.json。", "从 content_analysis 重新运行。"],
             )
+
         text_input = self._build_short_video_edit_plan_text()
         raw_result = self._run_text_agent("short_video_edit_plan", text_input)
+
         first_diagnostics = self._short_video_edit_plan_semantic_diagnostics(raw_result)
         retry_diagnostics: dict[str, Any] | None = None
+
         if self.options.production_mode == "ai_voiceover" and not first_diagnostics.get("ok"):
             first_out = self.task_dir / self._step_output("short_video_edit_plan")
             if first_out.exists():
@@ -4625,16 +4628,111 @@ class PipelineRunner:
                     suggestions=["回查 agents/short_video_edit_plan/v*/semantic_retry_diagnostics.json。", "检查 candidate_clips 是否为空或 clip_id 是否过长难以复制。"],
                     technical_detail={"first": first_diagnostics, "retry": retry_diagnostics},
                 )
+
         result = self._materialize_short_video_edit_plan(raw_result)
+
+        duration_retry_info = None
+        trim_info = None
+
+        if self.options.production_mode == "ai_voiceover":
+            cfg = self._short_video_edit_plan_duration_cfg()
+            duration_diag = self._short_video_plan_duration_diagnostics(result)
+            out = self.task_dir / self._step_output("short_video_edit_plan")
+            if out.exists():
+                write_json(out.parent / "duration_first_diagnostics.json", duration_diag)
+
+            need_duration_retry = (
+                cfg["duration_retry_enabled"]
+                and (
+                    duration_diag.get("hard_failed")
+                    or duration_diag.get("soft_exceeded")
+                )
+            )
+
+            # 如果只是略微超过 soft_budget，但没有超过 hard_budget，可以选择不重试。
+            # 为了避免 target=30 时输出 100+ 秒，建议 soft_exceeded 也重试一次。
+            if need_duration_retry:
+                retry_input = self._build_short_video_edit_plan_duration_retry_text(
+                    materialized=result,
+                    diagnostics=duration_diag,
+                )
+                retry_raw_result = self._run_short_video_edit_plan_retry_agent(retry_input)
+                retry_semantic = self._short_video_edit_plan_semantic_diagnostics(retry_raw_result)
+
+                if out.exists():
+                    write_json(out.parent / "duration_retry_response.json", retry_raw_result)
+                    write_json(out.parent / "duration_retry_semantic_diagnostics.json", retry_semantic)
+
+                if retry_semantic.get("ok"):
+                    retry_result = self._materialize_short_video_edit_plan(retry_raw_result)
+                    retry_duration_diag = self._short_video_plan_duration_diagnostics(retry_result)
+                    if out.exists():
+                        write_json(out.parent / "duration_retry_diagnostics.json", retry_duration_diag)
+
+                    raw_result = retry_raw_result
+                    result = retry_result
+                    duration_retry_info = {
+                        "triggered": True,
+                        "first": duration_diag,
+                        "retry": retry_duration_diag,
+                        "retry_semantic": retry_semantic,
+                    }
+                else:
+                    duration_retry_info = {
+                        "triggered": True,
+                        "first": duration_diag,
+                        "retry_semantic": retry_semantic,
+                        "retry_ignored": True,
+                    }
+
+            # 重试后仍超过 hard_budget，则代码兜底裁剪。
+            final_diag = self._short_video_plan_duration_diagnostics(result)
+            if final_diag.get("hard_failed") and cfg["fallback_trim_enabled"]:
+                budgets = final_diag.get("budgets") or self._short_video_edit_plan_budgets()
+                budget = budgets["soft_budget_seconds"] if cfg["fallback_trim_prefer_soft_budget"] else budgets["hard_budget_seconds"]
+
+                trimmed_raw, trim_info = self._trim_raw_short_video_plan_to_budget(
+                    raw_result,
+                    budget_seconds=float(budget),
+                    min_clip_count=cfg["fallback_trim_min_clip_count"],
+                )
+                trimmed_result = self._materialize_short_video_edit_plan(trimmed_raw)
+                trimmed_diag = self._short_video_plan_duration_diagnostics(trimmed_result)
+
+                # 如果按 soft_budget 裁剪后仍失败，再按 hard_budget 裁一次。
+                if trimmed_diag.get("hard_failed") and budget < budgets["hard_budget_seconds"]:
+                    trimmed_raw, trim_info_hard = self._trim_raw_short_video_plan_to_budget(
+                        raw_result,
+                        budget_seconds=float(budgets["hard_budget_seconds"]),
+                        min_clip_count=cfg["fallback_trim_min_clip_count"],
+                    )
+                    trimmed_result = self._materialize_short_video_edit_plan(trimmed_raw)
+                    trimmed_diag = self._short_video_plan_duration_diagnostics(trimmed_result)
+                    trim_info = {
+                        "soft_trim": trim_info,
+                        "hard_trim": trim_info_hard,
+                    }
+
+                raw_result = trimmed_raw
+                result = trimmed_result
+                if out.exists():
+                    write_json(out.parent / "duration_trim_info.json", trim_info)
+                    write_json(out.parent / "duration_trim_diagnostics.json", trimmed_diag)
+
         if retry_diagnostics is not None:
             result["semantic_retry"] = {"first": first_diagnostics, "retry": retry_diagnostics}
         else:
             result["semantic_retry"] = {"first": first_diagnostics}
+
+        if duration_retry_info:
+            result["duration_retry"] = duration_retry_info
+        if trim_info:
+            result["duration_trim"] = trim_info
+
         self._validate_ai_voiceover_editing_structure_or_raise(result)
         self._validate_ai_voiceover_plan_duration_or_raise(result)
         self._overwrite_step_json("short_video_edit_plan", result, materialized=True)
         self._write_compat_short_video_plan_and_editing_script(result)
-
     def step_merge_decision(self) -> None:
         self._mark_skipped("merge_decision", "已删除：不要乱拆的规则已前移到 short_video_edit_plan。")
 
@@ -6486,27 +6584,282 @@ class PipelineRunner:
             return float(self.options.max_output_video_seconds or self.duration_settings.normal_max_seconds)
         return self._configured_ai_voiceover_max_seconds()
 
+
+    def _short_video_edit_plan_duration_cfg(self) -> dict[str, Any]:
+        cfg = self.config.raw.get("short_video_edit_plan", {}) if hasattr(self, "config") else {}
+        return {
+            "duration_retry_enabled": bool(cfg.get("duration_retry_enabled", True)),
+            "duration_retry_max_rounds": int(cfg.get("duration_retry_max_rounds", 1) or 1),
+            "duration_soft_budget_ratio": float(cfg.get("duration_soft_budget_ratio", 2.0) or 2.0),
+            "duration_soft_budget_min_seconds": float(cfg.get("duration_soft_budget_min_seconds", 45) or 45),
+            "duration_soft_budget_max_seconds": float(cfg.get("duration_soft_budget_max_seconds", 90) or 90),
+            "fallback_trim_enabled": bool(cfg.get("fallback_trim_enabled", True)),
+            "fallback_trim_min_clip_count": int(cfg.get("fallback_trim_min_clip_count", 1) or 1),
+            "fallback_trim_prefer_soft_budget": bool(cfg.get("fallback_trim_prefer_soft_budget", True)),
+        }
+
+    def _short_video_edit_plan_budgets(self) -> dict[str, float]:
+        target = float(getattr(self.options, "target_duration_seconds", 30) or 30)
+        hard = float(self._effective_ai_voiceover_max_seconds())
+        cfg = self._short_video_edit_plan_duration_cfg()
+
+        soft = target * cfg["duration_soft_budget_ratio"]
+        soft = max(soft, cfg["duration_soft_budget_min_seconds"])
+        soft = min(soft, cfg["duration_soft_budget_max_seconds"])
+        soft = min(soft, hard)
+
+        return {
+            "target_seconds": round(target, 3),
+            "soft_budget_seconds": round(soft, 3),
+            "hard_budget_seconds": round(hard, 3),
+        }
+
+    def _short_video_plan_duration_diagnostics(self, edit_plan: dict[str, Any]) -> dict[str, Any]:
+        budgets = self._short_video_edit_plan_budgets()
+        scripts = edit_plan.get("scripts") or []
+        items: list[dict[str, Any]] = []
+        hard_failed = False
+        soft_exceeded = False
+
+        for script in scripts:
+            if not isinstance(script, dict):
+                continue
+            sid = str(script.get("short_video_id") or "unknown")
+            clips = script.get("source_clip_ids") or []
+            visual_seconds = editing_structure_duration(script.get("editing_structure") or [])
+
+            item = {
+                "short_video_id": sid,
+                "source_clip_ids": clips,
+                "clip_count": len(clips) if isinstance(clips, list) else 0,
+                "visual_total_seconds": round(visual_seconds, 3),
+                "target_seconds": budgets["target_seconds"],
+                "soft_budget_seconds": budgets["soft_budget_seconds"],
+                "hard_budget_seconds": budgets["hard_budget_seconds"],
+                "soft_exceeded": visual_seconds > budgets["soft_budget_seconds"] + 0.01,
+                "hard_exceeded": visual_seconds > budgets["hard_budget_seconds"] + 0.01,
+            }
+            if item["soft_exceeded"]:
+                soft_exceeded = True
+            if item["hard_exceeded"]:
+                hard_failed = True
+            items.append(item)
+
+        return {
+            "ok": not hard_failed,
+            "hard_failed": hard_failed,
+            "soft_exceeded": soft_exceeded,
+            "items": items,
+            "budgets": budgets,
+        }
+
+    def _build_short_video_edit_plan_duration_retry_text(
+        self,
+        *,
+        materialized: dict[str, Any],
+        diagnostics: dict[str, Any],
+    ) -> str:
+        clips_by_id = self._candidate_clips_by_id()
+        budgets = diagnostics.get("budgets") or self._short_video_edit_plan_budgets()
+
+        selected_ids: list[str] = []
+        for script in materialized.get("scripts") or []:
+            if not isinstance(script, dict):
+                continue
+            for cid in script.get("source_clip_ids") or []:
+                cid = str(cid).strip()
+                if cid and cid not in selected_ids:
+                    selected_ids.append(cid)
+
+        lines = [
+            "运行参数：",
+            f"- target_duration_seconds：{budgets.get('target_seconds')}",
+            f"- soft_budget_seconds：{budgets.get('soft_budget_seconds')}",
+            f"- hard_budget_seconds：{budgets.get('hard_budget_seconds')}",
+            f"- allow_long_video：{self.options.allow_long_video}",
+            f"- output_mode：{self.options.output_mode}",
+            f"- max_output_videos：{self.options.max_output_videos}",
+            "",
+            "上一次选择失败：",
+        ]
+
+        for item in diagnostics.get("items") or []:
+            lines.append(
+                f"- {item.get('short_video_id')}: "
+                f"clip_count={item.get('clip_count')}, "
+                f"visual_total_seconds={item.get('visual_total_seconds')}, "
+                f"soft_exceeded={item.get('soft_exceeded')}, "
+                f"hard_exceeded={item.get('hard_exceeded')}"
+            )
+
+        lines.extend([
+            "",
+            "上一次选择的 clips：",
+        ])
+
+        for cid in selected_ids:
+            clip = clips_by_id.get(cid)
+            if not clip:
+                lines.append(f"- {cid}: 未找到候选详情")
+                continue
+            duration = float(clip.get("duration_seconds") or 0)
+            summary = compact_text(str(clip.get("summary") or clip.get("event_summary") or ""), max_chars=180)
+            speech = sanitize_llm_text(str(clip.get("speech") or clip.get("asr_text") or ""), max_chars=220)
+            visual = compact_text(str(clip.get("visual") or clip.get("visual_summary") or ""), max_chars=160)
+            lines.append(f"- {cid} duration={duration:.3f}s")
+            if summary:
+                lines.append(f"  摘要：{summary}")
+            if speech:
+                lines.append(f"  声音：{speech}")
+            if visual:
+                lines.append(f"  画面：{visual}")
+
+        lines.extend([
+            "",
+            "完整候选 clips：",
+        ])
+
+        for index, clip in enumerate(self._load_candidate_clips_for_current_mode()):
+            cid = self._clip_id(clip, index)
+            duration = float(clip.get("duration_seconds") or 0)
+            summary = compact_text(str(clip.get("summary") or clip.get("event_summary") or ""), max_chars=180)
+            speech = sanitize_llm_text(str(clip.get("speech") or clip.get("asr_text") or ""), max_chars=220)
+            visual = compact_text(str(clip.get("visual") or clip.get("visual_summary") or ""), max_chars=160)
+            lines.append(f"- {cid} duration={duration:.3f}s role={clip.get('role', 'fact')}")
+            if summary:
+                lines.append(f"  摘要：{summary}")
+            if speech:
+                lines.append(f"  声音：{speech}")
+            if visual:
+                lines.append(f"  画面：{visual}")
+
+        return "\n".join(lines)
+
+    def _clip_duration_by_id(self) -> dict[str, float]:
+        durations: dict[str, float] = {}
+        for index, clip in enumerate(self._load_candidate_clips_for_current_mode()):
+            cid = self._clip_id(clip, index)
+            if not cid:
+                continue
+            try:
+                durations[cid] = max(0.0, float(clip.get("duration_seconds") or 0))
+            except (TypeError, ValueError):
+                durations[cid] = 0.0
+        return durations
+
+    def _trim_raw_short_video_plan_to_budget(
+        self,
+        raw_result: Any,
+        *,
+        budget_seconds: float,
+        min_clip_count: int = 1,
+    ) -> tuple[Any, dict[str, Any]]:
+        durations = self._clip_duration_by_id()
+
+        if isinstance(raw_result, list):
+            raw_videos = raw_result
+            root_is_list = True
+        elif isinstance(raw_result, dict):
+            raw_videos = raw_result.get("videos")
+            if not isinstance(raw_videos, list):
+                raw_videos = raw_result.get("scripts") if isinstance(raw_result.get("scripts"), list) else []
+            root_is_list = False
+        else:
+            return raw_result, {"trimmed": False, "reason": "raw_result_not_supported"}
+
+        trimmed_videos = []
+        trim_reports = []
+
+        for video in raw_videos:
+            if not isinstance(video, dict):
+                continue
+
+            selected_clips_raw = video.get("selected_clips")
+            if isinstance(selected_clips_raw, list) and selected_clips_raw:
+                clip_ids = [
+                    str(item.get("clip_id") or item.get("source_clip_id") or "").strip()
+                    for item in selected_clips_raw
+                    if isinstance(item, dict)
+                ]
+            else:
+                clip_ids = self._coerce_id_list(video.get("clip_ids") or video.get("source_clip_ids"))
+
+            kept: list[str] = []
+            dropped: list[str] = []
+            total = 0.0
+
+            for cid in clip_ids:
+                duration = durations.get(cid, 0.0)
+                if duration <= 0:
+                    dropped.append(cid)
+                    continue
+                if kept and total + duration > budget_seconds + 0.01:
+                    dropped.append(cid)
+                    continue
+                if not kept and duration > budget_seconds + 0.01:
+                    # 单个 clip 已经超过预算时，仍保留一个，后续让原有 hard 校验报错；
+                    # 不在这里切原片时间，避免破坏 clip 语义。
+                    kept.append(cid)
+                    total += duration
+                    continue
+                kept.append(cid)
+                total += duration
+
+            if len(kept) < min_clip_count and clip_ids:
+                # 兜底至少保留第一个有效 clip
+                first = clip_ids[0]
+                if first not in kept:
+                    kept = [first]
+                    total = durations.get(first, 0.0)
+                    dropped = [cid for cid in clip_ids if cid != first]
+
+            new_video = dict(video)
+            new_video.pop("selected_clips", None)
+            new_video["clip_ids"] = kept
+            trimmed_videos.append(new_video)
+
+            trim_reports.append({
+                "original_clip_ids": clip_ids,
+                "kept_clip_ids": kept,
+                "dropped_clip_ids": dropped,
+                "kept_duration_seconds": round(total, 3),
+                "budget_seconds": round(budget_seconds, 3),
+            })
+
+        if root_is_list:
+            trimmed_result = trimmed_videos
+        else:
+            trimmed_result = dict(raw_result)
+            if isinstance(raw_result.get("videos"), list):
+                trimmed_result["videos"] = trimmed_videos
+            elif isinstance(raw_result.get("scripts"), list):
+                trimmed_result["scripts"] = trimmed_videos
+            else:
+                trimmed_result["videos"] = trimmed_videos
+
+        return trimmed_result, {
+            "trimmed": True,
+            "budget_seconds": round(budget_seconds, 3),
+            "reports": trim_reports,
+        }
+
     def _build_short_video_edit_plan_text(self) -> str:
         llm_cfg = self.config.raw.get("llm_input", {})
         max_clips = int(llm_cfg.get("max_llm_candidate_clips", llm_cfg.get("max_candidate_clips_for_edit_plan", 14)) or 14)
         content = self._load_optional_step_json("content_analysis", {})
         clips = self._load_candidate_clips_for_current_mode()[:max_clips]
-        effective_max = self._effective_ai_voiceover_max_seconds()
+        budgets = self._short_video_edit_plan_budgets()
+
         lines = [
-            "任务：请生成 AI 配音短视频选片与讲述规划。",
-            "",
             "运行参数：",
             f"- output_mode：{self.options.output_mode}",
             f"- max_output_videos：{self.options.max_output_videos}",
             f"- min_output_video_seconds：{self.options.min_output_video_seconds}",
-            f"- target_duration_seconds：{self.options.target_duration_seconds}",
-            f"- effective_max_output_video_seconds：{effective_max}",
+            f"- target_duration_seconds：{budgets['target_seconds']}",
+            f"- soft_budget_seconds：{budgets['soft_budget_seconds']}",
+            f"- hard_budget_seconds：{budgets['hard_budget_seconds']}",
             f"- raw_max_output_video_seconds：{self.options.max_output_video_seconds}",
             f"- allow_long_video：{self.options.allow_long_video}",
-            "- 重要：AI 配音视频优先接近 target_duration_seconds；除非明确允许长版，否则不要贴着 max_output_video_seconds 输出。",
-            "target_duration_seconds 是推荐目标，不是硬上限。",
-            "如果新闻信息量较大，可以超过 target_duration_seconds，但必须控制在 effective_max_output_video_seconds 以内。",
-            "AI 配音模式下，允许 60-180 秒长版解说；长版必须保证每个 shot 都有足够 narration_intent，便于后续 voiceover_script 生成足够长文案。",
             "",
             "新闻概览：",
             f"主题：{content.get('main_topic') or content.get('topic') or ''}",
@@ -6515,6 +6868,7 @@ class PipelineRunner:
         ]
         for fact in (content.get("key_facts") or [])[: int(llm_cfg.get("max_llm_key_facts", 8) or 8)]:
             lines.append(f"- {fact if isinstance(fact, str) else json.dumps(fact, ensure_ascii=False)}")
+
         lines.append("")
         lines.append("候选 clips：")
         for index, clip in enumerate(clips):
@@ -6524,9 +6878,7 @@ class PipelineRunner:
             lines.append(f"声音：{sanitize_llm_text(str(clip.get('speech') or clip.get('asr_text') or ''), max_chars=360)}")
             lines.append(f"画面：{compact_text(str(clip.get('visual') or clip.get('visual_context') or ''), max_chars=220)}")
             lines.append("")
-        lines.append('输出 JSON：只返回数组，例如 [{"clip_ids":["source_001_clip_0001"]}]。不要输出时间戳，不要输出额外字段。')
         return "\n".join(lines)
-
     def _build_merge_decision_text(self, edit_plan: dict[str, Any]) -> str:
         lines = ["Task: decide whether planned short videos should be merged.", ""]
         for index, script in enumerate(edit_plan.get("scripts", []) or []):
@@ -7380,16 +7732,27 @@ class PipelineRunner:
             raise RuntimeError(f"LLM input size [{step}] exceeds limit={limit}; {hint}")
 
     def _run_text_agent(self, step: str, input_data: Any, *, allow_reuse: bool = True) -> Any:
+        _, _, prompt, _ = AGENT_INFO[step]
+        return self._run_text_agent_with_prompt(step, input_data, prompt, allow_reuse=allow_reuse)
+
+    def _run_short_video_edit_plan_retry_agent(self, retry_input: str) -> Any:
+        return self._run_text_agent_with_prompt(
+            "short_video_edit_plan",
+            retry_input,
+            prompts.SHORT_VIDEO_EDIT_PLAN_RETRY_TEXT_PROMPT,
+        )
+
+    def _run_text_agent_with_prompt(self, step: str, input_data: Any, prompt_text: str, *, allow_reuse: bool = True) -> Any:
         if self.llm_text is None:
             raise RuntimeError("缺少 text LLM 配置")
-        base, out_name, prompt, default_prompt_version = AGENT_INFO[step]
+        base, out_name, _, default_prompt_version = AGENT_INFO[step]
         llm_cfg = self.config.llm
         provider = llm_cfg.get("text_llm_provider", "openai")
         model = self.options.model or llm_cfg.get("text_llm_model_name") or llm_cfg.get(f"text_{provider}_model_name")
         fallback = llm_cfg.get(f"text_{provider}_fallback_models", [])
         max_tokens = int(llm_cfg.get("text_llm_max_tokens", 16000) or 16000)
         prompt_version = self.options.prompt_version or default_prompt_version
-        input_hash = stable_hash({"input": input_data, "model": model, "fallback": fallback, "prompt": prompt, "prompt_version": prompt_version})
+        input_hash = stable_hash({"input": input_data, "model": model, "fallback": fallback, "prompt": prompt_text, "prompt_version": prompt_version})
         if allow_reuse and self._can_reuse(step, input_hash):
             print(f"复用缓存: {step}")
             return self._load_step_json(step)
@@ -7401,11 +7764,11 @@ class PipelineRunner:
             write_json(vdir / "input_meta.json", {"type": "text", "chars": len(input_data)})
         else:
             write_json(vdir / "input.json", input_data)
-        write_text(vdir / "prompt.txt", prompt)
+        write_text(vdir / "prompt.txt", prompt_text)
         result = self.llm_text.call_json(
             model=model,
             fallback_models=fallback,
-            prompt=prompt,
+            prompt=prompt_text,
             input_data=input_data,
             temperature=0.2,
             debug_dir=vdir / "_llm_debug",
