@@ -1,20 +1,18 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
-from newsclip_agent.utils import ensure_dir
+from newsclip_agent.utils import ensure_dir, write_json
 
 
 class JobStore:
     def __init__(self, directory: str | Path):
         self.directory = ensure_dir(Path(directory))
-    
+
     def save_job(self, task_id: str, job_data: dict[str, Any]) -> None:
-        path = self.directory / f"{task_id}.json"
-        with path.open("w", encoding="utf-8") as f:
-            json.dump(job_data, f, ensure_ascii=False, indent=2)
+        # 走 utils.write_json 的原子写，避免半写入损坏 job json。
+        write_json(self.directory / f"{task_id}.json", job_data)
             
     def load_jobs(self) -> dict[str, dict[str, Any]]:
         jobs = {}

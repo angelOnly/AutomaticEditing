@@ -602,10 +602,11 @@ function updateSummaryControls() {
 
 function syncOutputModeControls() {
   const isReassembly = $("productionMode")?.value === "highlight_reassembly";
-  const outputMode = isReassembly ? ($("outputMode")?.value || "single") : "single";
+  // 视频重组默认“生成多个视频”；AI 配音解说不暴露该选项，最终按单条处理。
+  // 不再在切到非重组模式时把 outputMode 重置为 single，否则重组的多视频默认值会被冲掉。
+  const outputMode = isReassembly ? ($("outputMode")?.value || "multiple") : "single";
 
   $("outputModeWrap")?.classList.toggle("hidden", !isReassembly);
-  if (!isReassembly && $("outputMode")) $("outputMode").value = "single";
   $("maxOutputVideosWrap")?.classList.toggle("hidden", !isReassembly || outputMode !== "multiple");
   if ($("reassemblyOutputMode")) $("reassemblyOutputMode").value = outputMode === "multiple" ? "multiple" : "single";
 }

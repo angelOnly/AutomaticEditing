@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import hashlib
 import json
+import re
 import shutil
 import signal
 import subprocess
@@ -73,6 +74,8 @@ REMOTE_PREFETCH_LOCK = RLock()
 WEB_CONCURRENCY = PROJECT_CONFIG.raw.get("web_concurrency", {})
 MAX_RUNNING_JOBS = int(os.environ.get("WEB_MAX_RUNNING_JOBS", WEB_CONCURRENCY.get("max_running_jobs", 2)))
 MAX_PENDING_JOBS = int(os.environ.get("WEB_MAX_PENDING_JOBS", WEB_CONCURRENCY.get("max_pending_jobs", 20)))
+# 活跃任务（pending+running）总数上限，超过即拒绝创建新任务，避免一次性堆出大量任务把机器/Web 拖垮。
+MAX_ACTIVE_JOBS = int(os.environ.get("WEB_MAX_ACTIVE_JOBS", WEB_CONCURRENCY.get("max_active_jobs", 4)))
 SAME_TASK_POLICY = str(WEB_CONCURRENCY.get("same_task_policy", "reject"))
 
 
@@ -1156,7 +1159,10 @@ def run_pipeline(req: RunRequest) -> dict[str, Any]:
         _validate_source_request_items(raw_source_items)
         fingerprint = _source_request_fingerprint(req, raw_source_items)
         input_name_for_task = _display_source_request_name(raw_source_items)
-        task_id = _normalize_new_task_id(req.task_id, input_name_for_task, req.production_mode, fingerprint)
+        if _should_fingerprint_task_id(req):
+            task_id = _make_task_id_from_fingerprint(input_name_for_task, req.production_mode, fingerprint)
+        else:
+            task_id = _normalize_new_task_id(req.task_id, input_name_for_task, req.production_mode, fingerprint)
         task_id = _with_mode_suffix(task_id, req.production_mode)
         task_dir = ensure_dir(OUTPUTS_DIR / task_id)
         source_request_path = task_dir / "input" / "source_request.json"
@@ -1187,7 +1193,7 @@ def run_pipeline(req: RunRequest) -> dict[str, Any]:
             req.remote_video = source_items[0].remote
         fingerprint = _run_fingerprint(req, input_path)
         input_name_for_task = _display_input_name(req)
-        if input_name_for_task and not req.task_id:
+        if input_name_for_task and _should_fingerprint_task_id(req):
             task_id = _make_task_id_from_fingerprint(input_name_for_task, req.production_mode, fingerprint)
         else:
             task_id = _resolve_run_task_id(req)
@@ -1197,7 +1203,7 @@ def run_pipeline(req: RunRequest) -> dict[str, Any]:
         input_path = _prepare_run_input_video(req)
         fingerprint = _run_fingerprint(req, input_path) if input_path else ""
         input_name_for_task = _display_input_name(req)
-        if input_name_for_task and not req.task_id:
+        if input_name_for_task and _should_fingerprint_task_id(req):
             task_id = _make_task_id_from_fingerprint(input_name_for_task, req.production_mode, fingerprint)
         else:
             task_id = _resolve_run_task_id(req)
@@ -1251,6 +1257,16 @@ def run_pipeline(req: RunRequest) -> dict[str, Any]:
         active_job = _find_active_job_by_task_id(task_id)
         if active_job and SAME_TASK_POLICY == "reject":
             raise HTTPException(409, f"任务 {task_id} 已有运行中或排队中的 job，请不要对同一任务并发运行")
+        active_count = sum(
+            1
+            for job_id_existing in list(JOBS)
+            if _refresh_job(job_id_existing, schedule_next=False).get("status") in {"pending", "running"}
+        )
+        if active_count >= MAX_ACTIVE_JOBS:
+            raise HTTPException(
+                429,
+                f"当前已有 {active_count} 个任务在排队/运行（上限 {MAX_ACTIVE_JOBS}），请等已有任务完成后再创建。",
+            )
         pending_count = sum(1 for job in JOBS.values() if job.get("status") == "pending")
         if pending_count >= MAX_PENDING_JOBS:
             raise HTTPException(429, "等待队列已满，请稍后再提交")
@@ -2475,6 +2491,22 @@ def _make_task_id_from_fingerprint(input_video: str | None, production_mode: str
         safe = "".join(ch if ch.isalnum() else "_" for ch in name).strip("_")
         prefix = safe[:24] or "task"
     return f"{prefix}_{_mode_slug(production_mode)}_{fingerprint}"
+
+
+def _is_auto_generated_task_id(task_id: str | None) -> bool:
+    """前端 suggestedTaskId() 生成的 id 以 _YYYYMMDD_HHMM(SS) 时间戳结尾。
+    这类 id 每次提交都不同，会让基于 task_id 的去重永远失效，因此视为“自动生成”，
+    交给基于素材内容指纹的 task_id 去重（相同素材+相同参数复用同一任务）。"""
+    return bool(re.search(r"_\d{8}_\d{4,6}$", (task_id or "").strip()))
+
+
+def _should_fingerprint_task_id(req: RunRequest) -> bool:
+    """是否用素材内容指纹生成 task_id（相同素材+相同参数复用同一任务）。
+    仅在“新建任务”时生效：未指定 task_id，或指定的是前端自动生成的带时间戳 id；
+    且不是对已有任务的重跑/复用（rerun / rerun_from / reuse_from_task_id），以免改写到别的目录。"""
+    if req.rerun or req.rerun_from or req.reuse_from_task_id:
+        return False
+    return not (req.task_id or "").strip() or _is_auto_generated_task_id(req.task_id)
 
 
 def _normalize_new_task_id(task_id: str | None, input_name: str | None, production_mode: str, fingerprint: str) -> str:

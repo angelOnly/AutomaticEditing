@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -29,15 +30,29 @@ def read_json(path: str | Path, default: Any = None) -> Any:
     try:
         with p.open("r", encoding="utf-8") as f:
             return json.load(f)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+        # 文件可能被并发写入打断 / 半写入而损坏（非法 UTF-8 或截断），
+        # 此处兜底返回默认值，避免单个损坏文件让整个接口 500（如 /api/tasks）。
         return default
 
 
 def write_json(path: str | Path, data: Any) -> Path:
     p = Path(path)
     ensure_dir(p.parent)
-    with p.open("w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    # 原子写：先写同目录临时文件再 os.replace，避免进程被杀/并发写导致半写入的损坏 JSON。
+    fd, tmp_name = tempfile.mkstemp(dir=str(p.parent), prefix=f".{p.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_name, p)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
     return p
 
 
