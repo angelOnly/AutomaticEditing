@@ -1,8 +1,11 @@
 ﻿from __future__ import annotations
 
+import http.client
 import json
 import os
 import re
+import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -439,29 +442,63 @@ def _post_json(url: str, payload: dict[str, Any], *, headers: dict[str, str], ti
         raise RuntimeError(f"UCMS request failed: {exc}") from exc
 
 
-def _download_file(url: str, target: Path, *, headers: dict[str, str], timeout: int) -> None:
+# 瞬时网络错误：DNS 抖动（gaierror 经 URLError 抛出）、连接重置、读超时、半截响应等。
+# 这些重试一次大概率就过去；4xx/未知异常不在此列，照常直接失败。
+_TRANSIENT_DOWNLOAD_ERRORS = (
+    urllib.error.URLError,
+    http.client.IncompleteRead,
+    ConnectionError,
+    TimeoutError,
+)
+
+
+def _download_file(
+    url: str,
+    target: Path,
+    *,
+    headers: dict[str, str],
+    timeout: int,
+    retries: int = 3,
+    backoff_seconds: float = 1.0,
+) -> None:
     ensure_dir(target.parent)
 
     safe_url = _quote_url_for_http(url)
     safe_headers = _ascii_safe_headers(headers)
 
     req = urllib.request.Request(safe_url, headers=safe_headers, method="GET")
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp, target.open("wb") as out:
-            for chunk in iter(lambda: resp.read(1024 * 1024), b""):
-                out.write(chunk)
-    except urllib.error.HTTPError as exc:
-        if target.exists():
-            target.unlink(missing_ok=True)
-        raise RuntimeError(f"remote video download failed: HTTP {exc.code}, url={_mask_url(safe_url)}") from exc
-    except urllib.error.URLError as exc:
-        if target.exists():
-            target.unlink(missing_ok=True)
-        raise RuntimeError(f"remote video download failed: {exc}, url={_mask_url(safe_url)}") from exc
-    except Exception:
-        if target.exists():
-            target.unlink(missing_ok=True)
-        raise
+    for attempt in range(1, max(1, retries) + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp, target.open("wb") as out:
+                for chunk in iter(lambda: resp.read(1024 * 1024), b""):
+                    out.write(chunk)
+            return
+        except urllib.error.HTTPError as exc:
+            # 4xx 是客户端错误（URL/权限），重试无意义；5xx 才值得退避重试。
+            if target.exists():
+                target.unlink(missing_ok=True)
+            if exc.code < 500 or attempt >= retries:
+                raise RuntimeError(f"remote video download failed: HTTP {exc.code}, url={_mask_url(safe_url)}") from exc
+            last_exc: Exception = exc
+        except _TRANSIENT_DOWNLOAD_ERRORS as exc:
+            if target.exists():
+                target.unlink(missing_ok=True)
+            if attempt >= retries:
+                raise RuntimeError(f"remote video download failed: {exc}, url={_mask_url(safe_url)}") from exc
+            last_exc = exc
+        except Exception:
+            if target.exists():
+                target.unlink(missing_ok=True)
+            raise
+
+        wait = backoff_seconds * (2 ** (attempt - 1))
+        print(
+            f"[remote_ucms] download attempt {attempt}/{retries} failed ({last_exc}); "
+            f"retrying in {wait:.0f}s, url={_mask_url(safe_url)}",
+            file=sys.stderr,
+            flush=True,
+        )
+        time.sleep(wait)
 
 
 def _quote_url_for_http(url: str) -> str:
