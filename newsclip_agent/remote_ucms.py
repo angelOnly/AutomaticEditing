@@ -1,10 +1,12 @@
 ﻿from __future__ import annotations
 
 import json
+import os
 import re
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -231,9 +233,24 @@ def download_ucms_video(
     raw_url = str(url)
     safe_url = _quote_url_for_http(raw_url)
 
-    tmp = target.with_suffix(".downloading")
-    _download_file(safe_url, tmp, headers=cfg.headers, timeout=cfg.request_timeout_seconds)
-    tmp.replace(target)
+    # 临时文件名按进程+随机串唯一化：Web 进程的预取与 runner 子进程会并发下载同一个远程
+    # 视频，若共用确定性的 .downloading 路径，先完成者把它 rename 成 .mp4 后，另一个 replace
+    # 时就会 FileNotFoundError。唯一化后各写各的临时文件，replace 原子且后者覆盖（内容相同）。
+    tmp = target.with_suffix(f".{os.getpid()}.{uuid.uuid4().hex[:8]}.downloading")
+    try:
+        _download_file(safe_url, tmp, headers=cfg.headers, timeout=cfg.request_timeout_seconds)
+        os.replace(tmp, target)
+    except (FileNotFoundError, PermissionError):
+        # 并发下载者已生成目标文件（POSIX 下临时文件被先完成者移走，Windows 下 replace 撞锁），
+        # 目标已就绪则直接复用，不视为失败；否则是真实错误，照常抛出。
+        if not (target.exists() and target.stat().st_size > 0):
+            raise
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
     meta = {
         "source_type": "remote_ucms",
         "downloaded_at": datetime.now().isoformat(timespec="seconds"),
