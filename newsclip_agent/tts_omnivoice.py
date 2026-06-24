@@ -9,6 +9,9 @@ from .utils import ensure_dir
 
 
 SAMPLE_RATE = 24000
+# 文本时长估算的默认播报速率（字/秒）。仅作为库级兜底；真实预算由 pipeline
+# 的 _effective_chars_per_second()（实测/校准值，约 5.x）统一接管。
+DEFAULT_CHARS_PER_SECOND = 5.0
 _MODEL_CACHE: dict[tuple[str, str], Any] = {}
 REQUIRED_TRANSFORMERS_VERSION = "5.3.0"
 
@@ -148,7 +151,7 @@ def generate_omnivoice_audio(
             file=str(output),
             status="success" if meta["voice_file_exists"] else "failed",
             text_length=len(text),
-            estimated_duration_seconds=round(len(text) / 4.2, 3),
+            estimated_duration_seconds=round(len(text) / DEFAULT_CHARS_PER_SECOND, 3),
             actual_duration_seconds=meta["actual_duration_seconds"],
             sample_rate=meta["sample_rate"],
             channels=meta["channels"],

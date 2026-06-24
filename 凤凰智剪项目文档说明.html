@@ -1,0 +1,1552 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>凤凰智剪 项目架构培训说明</title>
+  <style>
+    html { scroll-behavior: smooth; }
+
+    :root {
+      --bg: #f5f7fb;
+      --card: #ffffff;
+      --text: #1f2937;
+      --muted: #6b7280;
+      --line: #d8dee9;
+      --primary: #2457d6;
+      --primary-soft: #e9efff;
+      --green: #0f8b6f;
+      --green-soft: #e8f7f2;
+      --orange: #c76a00;
+      --orange-soft: #fff2df;
+      --purple: #6b46c1;
+      --purple-soft: #f1ebff;
+      --danger: #b42318;
+      --danger-soft: #fff0ef;
+      --shadow: 0 12px 32px rgba(31, 41, 55, 0.08);
+      --radius: 18px;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", Arial, sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(circle at top left, rgba(36, 87, 214, 0.12), transparent 32rem),
+        radial-gradient(circle at top right, rgba(15, 139, 111, 0.10), transparent 30rem),
+        var(--bg);
+      line-height: 1.65;
+    }
+
+    .page {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 34px 22px 80px;
+    }
+
+    .hero {
+      background: linear-gradient(135deg, #153d9c 0%, #2457d6 52%, #0f8b6f 100%);
+      color: white;
+      border-radius: 28px;
+      padding: 44px 44px 38px;
+      box-shadow: var(--shadow);
+      position: relative;
+      overflow: hidden;
+    }
+
+    .hero::after {
+      content: "";
+      position: absolute;
+      width: 380px;
+      height: 380px;
+      border-radius: 50%;
+      right: -120px;
+      top: -110px;
+      background: rgba(255, 255, 255, 0.12);
+    }
+
+    .hero h1 {
+      margin: 0 0 16px;
+      font-size: 38px;
+      line-height: 1.18;
+      letter-spacing: -0.02em;
+    }
+
+    .hero p {
+      margin: 0;
+      max-width: 900px;
+      font-size: 18px;
+      opacity: 0.95;
+    }
+
+    .hero .tags {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 26px;
+    }
+
+    .tag {
+      display: inline-flex;
+      align-items: center;
+      padding: 7px 12px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.18);
+      color: white;
+      font-size: 14px;
+      backdrop-filter: blur(8px);
+    }
+
+    .toc {
+      position: sticky;
+      top: 0;
+      z-index: 1000;
+      display: grid;
+      grid-template-columns: repeat(6, 1fr);
+      gap: 12px;
+      margin: 24px 0 34px;
+      padding: 12px 0;
+      background: rgba(245, 247, 251, 0.92);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      border-radius: 0 0 20px 20px;
+    }
+
+    .toc a {
+      display: block;
+      text-decoration: none;
+      color: var(--text);
+      background: var(--card);
+      padding: 15px 16px;
+      border-radius: 16px;
+      box-shadow: var(--shadow);
+      font-weight: 700;
+      border: 1px solid rgba(216, 222, 233, 0.7);
+    }
+
+    section {
+      scroll-margin-top: 96px;
+      margin-top: 34px;
+      background: var(--card);
+      border-radius: 24px;
+      padding: 32px;
+      box-shadow: var(--shadow);
+      border: 1px solid rgba(216, 222, 233, 0.72);
+    }
+
+    .section-title {
+      display: flex;
+      align-items: center;
+      gap: 13px;
+      margin: 0 0 20px;
+      font-size: 28px;
+      line-height: 1.25;
+    }
+
+    .section-title .num {
+      width: 38px;
+      height: 38px;
+      border-radius: 12px;
+      background: var(--primary-soft);
+      color: var(--primary);
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 17px;
+      font-weight: 800;
+      flex: 0 0 auto;
+    }
+
+    h3 {
+      margin: 26px 0 12px;
+      font-size: 21px;
+    }
+
+    p {
+      margin: 10px 0;
+    }
+
+    .lead {
+      color: #374151;
+      font-size: 17px;
+    }
+
+    .grid-2 {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 18px;
+      margin-top: 18px;
+    }
+
+    .grid-3 {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 16px;
+      margin-top: 18px;
+    }
+
+    .card {
+      background: #fbfcff;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      padding: 18px;
+    }
+
+    .card h4 {
+      margin: 0 0 8px;
+      font-size: 17px;
+    }
+
+    .card p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 15px;
+    }
+
+    .highlight {
+      background: var(--primary-soft);
+      border-left: 5px solid var(--primary);
+      padding: 16px 18px;
+      border-radius: 14px;
+      margin: 20px 0;
+      font-weight: 650;
+    }
+
+    .note {
+      color: var(--muted);
+      font-size: 14px;
+      margin-top: 8px;
+    }
+
+    ul {
+      padding-left: 1.2em;
+      margin: 10px 0 0;
+    }
+
+    li {
+      margin: 6px 0;
+    }
+
+    .flow {
+      margin: 22px 0 24px;
+      padding: 22px;
+      background: linear-gradient(180deg, #fbfcff, #f7f9ff);
+      border: 1px solid var(--line);
+      border-radius: 22px;
+      overflow-x: auto;
+    }
+
+    .flow-title {
+      font-weight: 800;
+      margin-bottom: 16px;
+      color: #111827;
+    }
+
+    .flow-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-width: max-content;
+      margin: 12px 0;
+    }
+
+    .flow-col {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      min-width: max-content;
+    }
+
+    .node {
+      min-width: 132px;
+      max-width: 180px;
+      min-height: 54px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+      padding: 10px 14px;
+      border-radius: 15px;
+      border: 1px solid var(--line);
+      background: white;
+      font-weight: 750;
+      box-shadow: 0 8px 18px rgba(31, 41, 55, 0.05);
+      line-height: 1.35;
+      white-space: normal;
+    }
+
+    .node.small {
+      min-width: 116px;
+      min-height: 46px;
+      font-size: 14px;
+    }
+
+    .node.primary {
+      background: var(--primary-soft);
+      color: #173f9c;
+      border-color: #b9c9ff;
+    }
+
+    .node.green {
+      background: var(--green-soft);
+      color: #0b6a55;
+      border-color: #a9e2d2;
+    }
+
+    .node.orange {
+      background: var(--orange-soft);
+      color: #904b00;
+      border-color: #ffd29b;
+    }
+
+    .node.purple {
+      background: var(--purple-soft);
+      color: #5335a3;
+      border-color: #d8c8ff;
+    }
+
+    .node.danger {
+      background: var(--danger-soft);
+      color: var(--danger);
+      border-color: #ffc7c2;
+    }
+
+    .arrow {
+      color: #7b8798;
+      font-size: 24px;
+      font-weight: 800;
+      flex: 0 0 auto;
+    }
+
+    .split {
+      display: grid;
+      grid-template-columns: 1.05fr 0.95fr;
+      gap: 22px;
+      align-items: start;
+    }
+
+    .subflow {
+      border: 1px dashed #bdc7d8;
+      border-radius: 18px;
+      padding: 14px;
+      background: rgba(255, 255, 255, 0.72);
+    }
+
+    .subflow h4 {
+      margin: 0 0 10px;
+    }
+
+    .pill-list {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 9px;
+      margin-top: 12px;
+    }
+
+    .pill {
+      padding: 7px 10px;
+      background: #f3f4f6;
+      border: 1px solid #e5e7eb;
+      border-radius: 999px;
+      font-size: 14px;
+      color: #374151;
+    }
+
+    .quote {
+      font-size: 20px;
+      font-weight: 800;
+      line-height: 1.55;
+      padding: 22px;
+      border-radius: 20px;
+      background: linear-gradient(135deg, var(--primary-soft), var(--green-soft));
+      border: 1px solid #cbd7ff;
+      margin: 20px 0 6px;
+    }
+
+    .compare {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 14px;
+      overflow: hidden;
+      border-radius: 16px;
+      border: 1px solid var(--line);
+    }
+
+    .compare th,
+    .compare td {
+      padding: 13px 14px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+    }
+
+    .compare th {
+      background: #f3f6ff;
+      color: #1f3b7a;
+    }
+
+    .compare tr:last-child td {
+      border-bottom: 0;
+    }
+
+    .footer {
+      margin-top: 34px;
+      padding: 24px;
+      color: var(--muted);
+      text-align: center;
+      font-size: 14px;
+    }
+
+    @media (max-width: 900px) {
+      .hero {
+        padding: 32px 24px;
+      }
+      .hero h1 {
+        font-size: 30px;
+      }
+      .toc {
+        top: 0;
+        grid-template-columns: 1fr 1fr;
+        max-height: 42vh;
+        overflow-y: auto;
+      }
+      section {
+        scroll-margin-top: 180px;
+        padding: 24px;
+      }
+      .grid-2,
+      .grid-3,
+      .split {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    @media print {
+      body {
+        background: white;
+      }
+      .toc {
+        display: none;
+      }
+      section, .hero {
+        box-shadow: none;
+        break-inside: avoid;
+      }
+      .page {
+        max-width: none;
+      }
+    }
+  
+    .toc a.active {
+      background: var(--primary);
+      color: #ffffff;
+      border-color: var(--primary);
+      box-shadow: 0 12px 24px rgba(36, 87, 214, 0.20);
+    }
+
+    .tab-section {
+      display: none;
+    }
+
+    .tab-section.active {
+      display: block;
+    }
+
+  
+    .detail-doc {
+      max-width: 980px;
+      margin: 0 auto;
+    }
+
+    .detail-doc h1 {
+      font-size: 30px;
+      margin: 0 0 22px;
+      line-height: 1.25;
+    }
+
+    .detail-doc h2 {
+      font-size: 25px;
+      margin: 34px 0 14px;
+      padding-top: 12px;
+      border-top: 1px solid var(--line);
+      line-height: 1.3;
+    }
+
+    .detail-doc h3 {
+      font-size: 20px;
+      margin: 26px 0 10px;
+    }
+
+    .detail-doc p {
+      font-size: 16px;
+      line-height: 1.85;
+    }
+
+    .detail-doc pre {
+      background: #0f172a;
+      color: #e5e7eb;
+      padding: 18px 20px;
+      border-radius: 16px;
+      overflow-x: auto;
+      line-height: 1.65;
+      font-size: 14px;
+      margin: 16px 0 22px;
+    }
+
+    .detail-doc code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    }
+
+    .detail-doc ul,
+    .detail-doc ol {
+      margin: 12px 0 18px;
+      padding-left: 1.5em;
+    }
+
+    .detail-doc li {
+      margin: 7px 0;
+    }
+
+    .detail-doc blockquote {
+      margin: 18px 0;
+      padding: 14px 18px;
+      border-left: 5px solid var(--primary);
+      background: var(--primary-soft);
+      border-radius: 14px;
+      color: #334155;
+    }
+
+  
+    .detail-doc strong {
+      font-weight: 800;
+      color: #102a6b;
+      background: linear-gradient(transparent 58%, rgba(36, 87, 214, 0.16) 58%);
+      padding: 0 2px;
+    }
+
+    .detail-doc p code,
+    .detail-doc li code {
+      background: #eef2ff;
+      color: #173f9c;
+      border: 1px solid #dbe4ff;
+      padding: 2px 6px;
+      border-radius: 7px;
+      font-size: 0.92em;
+    }
+
+  </style>
+</head>
+<body>
+  <main class="page">
+    <header class="hero">
+      <h1>凤凰智剪 项目架构培训说明</h1>
+      <p>
+        本项目是面向新闻短视频生产的智能工作台：先把单源或多源新闻素材解析成可复用的结构化素材池，
+        再派生出两条生产链路——AI 配音解说与原声高光重组。整体优势在于公共分析复用、素材语义化、
+        大模型输入压缩、代码物化时间线、配音与画面双向对齐、多源并发与生产级任务管理。
+      </p>
+      <div class="tags">
+        <span class="tag">新闻视频智能拆条</span>
+        <span class="tag">AI 配音解说</span>
+        <span class="tag">原声高光重组</span>
+        <span class="tag">公共素材分析</span>
+        <span class="tag">多源素材池</span>
+      </div>
+    </header>
+
+    <nav class="toc">
+      <a href="#overview" class="active">项目总览</a>
+      <a href="#common">公共模块</a>
+      <a href="#voiceover">AI 配音模块</a>
+      <a href="#reassembly">视频重组</a>
+      <a href="#extra">细节补充说明</a>
+      <a href="#project-detail-doc">项目细节文档</a>
+    </nav>
+
+    <section id="overview" class="tab-section active">
+      <h2 class="section-title"><span class="num">一</span>项目总览：项目总架构与项目介绍</h2>
+
+      <p class="lead">
+        凤凰智剪 不是一个简单的“视频剪辑脚本”，而是一个完整的新闻视频智能生产系统。
+        它通过 Web 工作台接收任务，通过任务队列调度执行，通过公共分析层沉淀素材资产，
+        再根据生产模式生成 AI 配音解说视频或原声高光重组视频。
+      </p>
+
+      <div class="flow">
+        <div class="flow-title">项目总架构流程图</div>
+        <div class="flow-row">
+          <div class="node primary">启动工作台</div>
+          <div class="arrow">→</div>
+          <div class="node primary">环境预检查</div>
+          <div class="arrow">→</div>
+          <div class="node primary">网页提交任务</div>
+          <div class="arrow">→</div>
+          <div class="node primary">任务队列管理</div>
+          <div class="arrow">→</div>
+          <div class="node green">公共素材分析</div>
+        </div>
+        <div class="flow-row">
+          <div class="node green">公共素材分析</div>
+          <div class="arrow">→</div>
+          <div class="node orange">AI 配音解说</div>
+          <div class="arrow">→</div>
+          <div class="node orange">配音短视频成片</div>
+        </div>
+        <div class="flow-row">
+          <div class="node green">公共素材分析</div>
+          <div class="arrow">→</div>
+          <div class="node purple">视频高光重组</div>
+          <div class="arrow">→</div>
+          <div class="node purple">原声重组成片</div>
+        </div>
+      </div>
+
+      <h3>项目定位</h3>
+      <p>
+        这个项目适合用于新闻素材二次生产，尤其适合凤凰卫视新闻、国际时政、发布会、现场报道、长视频切短视频等场景。
+        它不是只做“剪切”，而是先理解素材内容，再决定如何生产短视频。
+      </p>
+
+      <div class="grid-3">
+        <div class="card">
+          <h4>统一入口</h4>
+          <p>通过网页提交任务，支持上传、本地素材、远程素材、多源素材，并统一进入任务调度。</p>
+        </div>
+        <div class="card">
+          <h4>统一分析</h4>
+          <p>先做视频信息、音频、画面、语音、时间线、摘要等公共分析，形成可复用素材池。</p>
+        </div>
+        <div class="card">
+          <h4>双生产模式</h4>
+          <p>同一批素材可以生成 AI 配音解说版，也可以生成保留原声的高光重组版。</p>
+        </div>
+      </div>
+
+      <h3>整体优势</h3>
+      <div class="highlight">
+        项目的核心价值是：把“原始视频”变成“可复用的新闻素材资产”，再由不同生产链路消费这些资产。
+      </div>
+
+      <ul>
+        <li>适合培训讲解，因为架构层次清晰：入口层、任务层、公共分析层、生产链路层、质量控制层、渲染层。</li>
+        <li>适合生产落地，因为它有队列、断点续跑、缓存复用、失败记录、任务状态、输出管理。</li>
+        <li>适合扩展，因为公共分析层可以继续支撑更多生产模式，例如不同角度短视频、不同音色版本、不同目标时长版本。</li>
+      </ul>
+    </section>
+
+    <section id="common" class="tab-section">
+      <h2 class="section-title"><span class="num">二</span>公共模块：流程图、功能介绍、细节、亮点</h2>
+
+      <p class="lead">
+        公共模块是整个项目的底座。它负责把原始视频或多源视频解析成结构化素材资产。
+        下游的 AI 配音模块和视频重组模块都不直接面对原始视频，而是复用公共分析层生成的素材池。
+      </p>
+
+      <div class="flow">
+        <div class="flow-title">公共模块流程图</div>
+        <div class="flow-row">
+          <div class="node green">输入素材</div>
+          <div class="arrow">→</div>
+          <div class="node green">素材准备</div>
+          <div class="arrow">→</div>
+          <div class="node green">素材分析</div>
+          <div class="arrow">→</div>
+          <div class="node green">素材聚合</div>
+          <div class="arrow">→</div>
+          <div class="node green">公共素材池</div>
+        </div>
+        <div class="flow-row">
+          <div class="node small">视频信息读取</div>
+          <div class="arrow">→</div>
+          <div class="node small">素材质量检查</div>
+          <div class="arrow">→</div>
+          <div class="node small">音频提取</div>
+          <div class="arrow">→</div>
+          <div class="node small">关键帧抽取</div>
+          <div class="arrow">→</div>
+          <div class="node small">视频分块</div>
+          <div class="arrow">→</div>
+          <div class="node small">语音识别</div>
+          <div class="arrow">→</div>
+          <div class="node small">语音摘要</div>
+          <div class="arrow">→</div>
+          <div class="node small">画面理解</div>
+          <div class="arrow">→</div>
+          <div class="node small">时间线融合</div>
+          <div class="arrow">→</div>
+          <div class="node small">时间线压缩</div>
+        </div>
+        <div class="flow-row">
+          <div class="node green">公共素材池</div>
+          <div class="arrow">→</div>
+          <div class="node orange">供 AI 配音复用</div>
+          <div class="arrow">→</div>
+          <div class="node purple">供视频重组复用</div>
+        </div>
+      </div>
+
+      <h3>功能介绍</h3>
+      <p>
+        公共模块主要做三件事：第一，准备和检查素材；第二，抽取语音、画面、时间等基础信息；
+        第三，把这些信息聚合成统一的素材池，供下游模块复用。
+      </p>
+
+      <div class="grid-2">
+        <div class="card">
+          <h4>素材准备与质量检查</h4>
+          <p>检查视频是否可读、是否有音轨、是否能被处理，避免后续剪辑阶段才暴露源文件问题。</p>
+        </div>
+        <div class="card">
+          <h4>语音与画面双分析</h4>
+          <p>语音识别负责理解“说了什么”，画面理解负责判断“画面出现了什么”，两者共同构成新闻素材理解。</p>
+        </div>
+        <div class="card">
+          <h4>时间线融合</h4>
+          <p>把语音、画面、时间范围整合到统一时间线上，后续选片、配音、重组都基于同一套时间语义。</p>
+        </div>
+        <div class="card">
+          <h4>素材聚合</h4>
+          <p>把单源或多源素材整理成公共素材池，包含素材摘要、时间线摘要、原始语音索引等关键产物。</p>
+        </div>
+      </div>
+
+      <h3>关键细节</h3>
+      <ul>
+        <li>公共分析支持单视频，也支持多源素材池。</li>
+        <li>多源素材可以并发分析，每个素材有独立状态、进度、失败信息和分析结果。</li>
+        <li>公共分析的结果可以被复用，同一批素材不需要重复做语音识别和画面理解。</li>
+        <li>时间线使用本地素材时间，避免多源素材被拼成虚拟时间后产生定位混乱。</li>
+        <li>大模型输入会经过摘要压缩，减少无效字段，降低成本和模型误判概率。</li>
+      </ul>
+
+      <h3>公共模块亮点</h3>
+      <div class="grid-3">
+        <div class="card">
+          <h4>亮点一：素材资产化</h4>
+          <p>公共模块把视频从“文件”变成“结构化素材资产”，后续所有生产链路都可以复用。</p>
+        </div>
+        <div class="card">
+          <h4>亮点二：多源统一处理</h4>
+          <p>多个新闻素材可以进入同一个素材池，统一分析、统一筛选、统一进入后续生产。</p>
+        </div>
+        <div class="card">
+          <h4>亮点三：减少重复成本</h4>
+          <p>昂贵的语音识别、画面理解、大模型摘要只需要做一次，不同模式可重复使用。</p>
+        </div>
+      </div>
+
+      <div class="quote">
+        公共模块不是普通缓存，而是整个系统的“素材语义中台”。
+      </div>
+    </section>
+
+    <section id="voiceover" class="tab-section">
+      <h2 class="section-title"><span class="num">三</span>AI 配音模块：流程图、功能介绍、细节、亮点</h2>
+
+      <p class="lead">
+        AI 配音模块的目标是生成“解说型新闻短视频”。它会从公共素材池中选择适合解说的新闻片段，
+        规划镜头结构，生成中文新闻解说稿，调用文字转语音生成配音，再让画面、配音、字幕进行对齐。
+      </p>
+
+      <div class="flow">
+        <div class="flow-title">AI 配音模块主流程图</div>
+        <div class="flow-row">
+          <div class="node green">公共素材池</div>
+          <div class="arrow">→</div>
+          <div class="node orange">语音微分段</div>
+          <div class="arrow">→</div>
+          <div class="node orange">内容预选</div>
+          <div class="arrow">→</div>
+          <div class="node orange">内容分析</div>
+          <div class="arrow">→</div>
+          <div class="node orange">候选片段生成</div>
+        </div>
+        <div class="flow-row">
+          <div class="node orange">候选片段生成</div>
+          <div class="arrow">→</div>
+          <div class="node orange">短视频剪辑规划</div>
+          <div class="arrow">→</div>
+          <div class="node orange">解说文案生成</div>
+          <div class="arrow">→</div>
+          <div class="node orange">文案质量检查</div>
+          <div class="arrow">→</div>
+          <div class="node orange">配音生成</div>
+        </div>
+        <div class="flow-row">
+          <div class="node orange">配音生成</div>
+          <div class="arrow">→</div>
+          <div class="node orange">字幕生成</div>
+          <div class="arrow">→</div>
+          <div class="node orange">剪辑计划</div>
+          <div class="arrow">→</div>
+          <div class="node orange">新闻质量检查</div>
+          <div class="arrow">→</div>
+          <div class="node orange">最终渲染</div>
+        </div>
+      </div>
+
+      <h3>功能介绍</h3>
+      <p>
+        AI 配音模块做的是“新闻解说短视频自动生产”。它不仅要选出有价值的画面，还要生成与画面匹配的解说词，
+        并最终处理好配音长度、画面长度、字幕长度之间的关系。
+      </p>
+
+      <div class="grid-2">
+        <div class="card">
+          <h4>从真实语音时间生成微片段</h4>
+          <p>系统不是简单按固定分钟切片，而是从语音识别结果中提取更细粒度的新闻语义片段。</p>
+        </div>
+        <div class="card">
+          <h4>候选片段由代码落地</h4>
+          <p>大模型负责判断新闻价值，代码负责把判断结果转换成真实可剪辑的素材时间段。</p>
+        </div>
+        <div class="card">
+          <h4>解说稿按镜头生成</h4>
+          <p>每段解说都对应具体镜头，方便后续配音、字幕、剪辑严格对齐。</p>
+        </div>
+        <div class="card">
+          <h4>配音反向约束画面</h4>
+          <p>配音生成后会拿到真实音频时长，剪辑计划会根据真实时长调整画面长度。</p>
+        </div>
+      </div>
+
+      <h3>AI 配音里的核心：配音与视频片段双向对齐</h3>
+      <p>
+        这个模块最值得培训讲解的地方，是它不是“先剪视频再盖配音”，也不是“先生成配音再随便配画面”，
+        而是形成了一个双向闭环。
+      </p>
+
+      <div class="flow">
+        <div class="flow-title">配音与画面双向对齐流程图</div>
+        <div class="flow-row">
+          <div class="node orange">剪辑规划</div>
+          <div class="arrow">→</div>
+          <div class="node orange">每个镜头有目标时长</div>
+          <div class="arrow">→</div>
+          <div class="node orange">解说文案按镜头生成</div>
+          <div class="arrow">→</div>
+          <div class="node orange">每句文案对应一个镜头</div>
+        </div>
+        <div class="flow-row">
+          <div class="node orange">每句文案对应一个镜头</div>
+          <div class="arrow">→</div>
+          <div class="node orange">分段生成配音</div>
+          <div class="arrow">→</div>
+          <div class="node orange">统计真实配音时长</div>
+          <div class="arrow">→</div>
+          <div class="node orange">反向调整画面长度</div>
+        </div>
+        <div class="flow-row">
+          <div class="node orange">反向调整画面长度</div>
+          <div class="arrow">→</div>
+          <div class="node green">略短则压缩画面</div>
+          <div class="arrow">→</div>
+          <div class="node green">略长则延长画面</div>
+          <div class="arrow">→</div>
+          <div class="node danger">严重不匹配则阻断</div>
+          <div class="arrow">→</div>
+          <div class="node orange">字幕跟随配音</div>
+        </div>
+      </div>
+
+      <h3>关键细节</h3>
+      <ul>
+        <li>解说文案不是整篇一口气生成，而是拆成多个镜头级解说段。</li>
+        <li>配音可以按镜头分段生成，每段都有对应的目标开始时间、目标结束时间和目标时长。</li>
+        <li>系统会检查哪些文案段没有成功生成配音，避免成片缺声音。</li>
+        <li>系统会比较配音真实时长和视频画面时长，超出容忍范围会阻断或提示重跑。</li>
+        <li>如果配音略短，画面可以向配音收缩；如果配音略长，系统可以尝试自动延长画面。</li>
+        <li>字幕可以跟随真实配音节奏，而不是只按预估文字长度生成。</li>
+      </ul>
+
+      <h3>AI 配音模块亮点</h3>
+      <div class="grid-3">
+        <div class="card">
+          <h4>亮点一：不是粗暴切片</h4>
+          <p>通过语音微分段和内容筛选，让候选片段更接近真实新闻语义。</p>
+        </div>
+        <div class="card">
+          <h4>亮点二：文案与镜头绑定</h4>
+          <p>每段文案对应具体镜头，后续配音、字幕、剪辑都能精确关联。</p>
+        </div>
+        <div class="card">
+          <h4>亮点三：配音真实时长回流</h4>
+          <p>配音生成后不是结束，而是将真实音频时长回传给剪辑计划。</p>
+        </div>
+        <div class="card">
+          <h4>亮点四：自动修复能力</h4>
+          <p>文案长度、段落时长、整体时长不合适时，系统可以进行局部修复或阻断。</p>
+        </div>
+        <div class="card">
+          <h4>亮点五：原声策略可控</h4>
+          <p>AI 配音模式默认压低或禁用原声，也可按证据型原声窗口保留关键现场声音。</p>
+        </div>
+        <div class="card">
+          <h4>亮点六：适合新闻口播</h4>
+          <p>最终效果更像新闻短视频解说，而不是简单视频摘要。</p>
+        </div>
+      </div>
+
+      <div class="quote">
+        AI 配音模块的核心优势：画面约束文案，配音反向约束画面，字幕跟随真实配音，形成生产闭环。
+      </div>
+    </section>
+
+    <section id="reassembly" class="tab-section">
+      <h2 class="section-title"><span class="num">四</span>视频重组：流程图、功能介绍、细节、亮点</h2>
+
+      <p class="lead">
+        视频重组模块的目标是生成“原声高光新闻视频”。它不重新配音，而是从素材中找出信息密度高、表达完整、
+        有现场价值的原声片段，再按新闻叙事逻辑重新编排。
+      </p>
+
+      <div class="flow">
+        <div class="flow-title">视频重组模块流程图</div>
+        <div class="flow-row">
+          <div class="node green">公共素材池</div>
+          <div class="arrow">→</div>
+          <div class="node purple">整片新闻理解</div>
+          <div class="arrow">→</div>
+          <div class="node purple">原声事件候选</div>
+          <div class="arrow">→</div>
+          <div class="node purple">候选复核过滤</div>
+          <div class="arrow">→</div>
+          <div class="node purple">高光重组规划</div>
+        </div>
+        <div class="flow-row">
+          <div class="node purple">高光重组规划</div>
+          <div class="arrow">→</div>
+          <div class="node purple">重组剪辑计划</div>
+          <div class="arrow">→</div>
+          <div class="node purple">新闻质量检查</div>
+          <div class="arrow">→</div>
+          <div class="node purple">AI 质量复核</div>
+          <div class="arrow">→</div>
+          <div class="node purple">原声重组渲染</div>
+        </div>
+      </div>
+
+      <h3>功能介绍</h3>
+      <p>
+        视频重组模块适合处理有原声价值的新闻素材，例如发布会、讲话、记者连线、现场采访、冲突现场、国际时政表态等。
+        它更强调“保留原话、保留现场感、保留证据性”。
+      </p>
+
+      <div class="grid-2">
+        <div class="card">
+          <h4>先理解整条新闻</h4>
+          <p>系统会先理解素材主题、摘要、关键事实，再从中寻找高光事件，而不是机械截取。</p>
+        </div>
+        <div class="card">
+          <h4>从语音事件中选高光</h4>
+          <p>候选片段主要来自原始语音内容，适合保留人物讲话和现场原声。</p>
+        </div>
+        <div class="card">
+          <h4>支持连续片段合并</h4>
+          <p>同一素材内连续相关的片段可以合并，避免一条新闻被切得过碎。</p>
+        </div>
+        <div class="card">
+          <h4>不跨素材乱合并</h4>
+          <p>不同素材来源保持独立时间定位，避免多源重组时出现时间和来源混乱。</p>
+        </div>
+      </div>
+
+      <h3>关键细节</h3>
+      <ul>
+        <li>视频重组模式会自动使用原声音频策略，不走配音生成。</li>
+        <li>候选片段来自新闻事件，而不是只按画面好看程度截取。</li>
+        <li>同一个素材内，连续且相关的事件片段可以被合并成更完整的表达。</li>
+        <li>不同素材来源之间不会随意合并，确保每个片段都能定位回正确原视频。</li>
+        <li>重组规划生成后，还会由代码转换成可执行剪辑计划，并校验时间字段是否有效。</li>
+        <li>最终渲染前仍然会经过新闻质量检查和 AI 质量复核。</li>
+      </ul>
+
+      <h3>视频重组模块亮点</h3>
+      <div class="grid-3">
+        <div class="card">
+          <h4>亮点一：新闻可信度高</h4>
+          <p>保留原声表达，不改写人物原话，适合严肃新闻和国际时政内容。</p>
+        </div>
+        <div class="card">
+          <h4>亮点二：现场感强</h4>
+          <p>保留现场声音、语气、停顿和环境氛围，比纯配音更有新闻冲击力。</p>
+        </div>
+        <div class="card">
+          <h4>亮点三：事件驱动选片</h4>
+          <p>从新闻事件中筛选高光，而不是只靠视觉刺激或固定时长切片。</p>
+        </div>
+        <div class="card">
+          <h4>亮点四：适合多素材比较</h4>
+          <p>多个新闻素材可以进入同一素材池，由系统筛选最有价值的片段。</p>
+        </div>
+        <div class="card">
+          <h4>亮点五：防止片段过碎</h4>
+          <p>支持对连续相关片段进行合并，提升故事完整性。</p>
+        </div>
+        <div class="card">
+          <h4>亮点六：工程可控</h4>
+          <p>模型给出编辑意图，代码负责时间校验和剪辑落地，减少不可控输出。</p>
+        </div>
+      </div>
+
+      <div class="quote">
+        视频重组模块的核心优势：保留新闻现场原声，用结构化候选池和重组规划完成可信高光剪辑。
+      </div>
+    </section>
+
+    <section id="extra" class="tab-section">
+      <h2 class="section-title"><span class="num">五</span>细节补充说明：模块之外的一些亮点</h2>
+
+      <p class="lead">
+        除了公共模块、AI 配音模块、视频重组模块之外，项目还有一些偏工程化和生产化的设计点，
+        这些内容适合在培训最后作为“项目为什么更适合真实落地”的补充说明。
+      </p>
+
+      <div class="grid-2">
+        <div class="card">
+          <h4>任务队列与并发控制</h4>
+          <p>网页提交任务后，不是直接阻塞运行，而是进入任务队列。系统可以限制同时运行任务数量和排队数量，避免机器被打满。</p>
+        </div>
+        <div class="card">
+          <h4>任务去重</h4>
+          <p>相同任务如果正在运行或已经完成，系统可以复用已有任务，避免重复提交造成资源浪费。</p>
+        </div>
+        <div class="card">
+          <h4>断点续跑</h4>
+          <p>每个步骤都会记录状态和产物，失败后可以从指定步骤重跑，不需要从头开始。</p>
+        </div>
+        <div class="card">
+          <h4>版本化产物</h4>
+          <p>每个步骤输出有独立版本目录，便于回看、复用、对比和排查问题。</p>
+        </div>
+        <div class="card">
+          <h4>用户可见错误</h4>
+          <p>系统不是只抛底层异常，而是会给出更适合操作人员理解的错误原因和处理建议。</p>
+        </div>
+        <div class="card">
+          <h4>素材质量前置</h4>
+          <p>在进入昂贵的大模型和剪辑流程前，先检查素材是否可用，减少后续阶段浪费。</p>
+        </div>
+      </div>
+
+      <h3>生产级设计亮点</h3>
+      <table class="compare">
+        <thead>
+          <tr>
+            <th>能力</th>
+            <th>解决的问题</th>
+            <th>培训时可以强调的价值</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>公共素材池</td>
+            <td>同一素材重复分析成本高</td>
+            <td>一次分析，多次生产，多种模式复用</td>
+          </tr>
+          <tr>
+            <td>大模型输入压缩</td>
+            <td>原始分析结果太长、字段太多、容易干扰模型</td>
+            <td>降低成本，提高稳定性，减少幻觉</td>
+          </tr>
+          <tr>
+            <td>代码物化时间线</td>
+            <td>大模型生成时间码不可靠</td>
+            <td>模型做判断，代码做落地，剪辑更可控</td>
+          </tr>
+          <tr>
+            <td>配音与画面对齐</td>
+            <td>解说稿、配音、画面长度容易不匹配</td>
+            <td>形成“文案—配音—画面—字幕”的闭环</td>
+          </tr>
+          <tr>
+            <td>多源并发分析</td>
+            <td>多条新闻素材处理慢，失败影响整体</td>
+            <td>支持素材池生产，支持部分成功继续向下游输出</td>
+          </tr>
+          <tr>
+            <td>质量门禁</td>
+            <td>坏素材、空文案、无效剪辑计划可能直接进入渲染</td>
+            <td>提前阻断风险，减少无效成片</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>适合培训结尾的总结话术</h3>
+      <div class="quote">
+        凤凰智剪的优势不只是“能自动剪视频”，而是把新闻视频生产拆成了可复用、可检查、可追踪、可扩展的工程化流程。
+        公共模块负责沉淀素材资产，AI 配音模块负责解说型短视频生产，视频重组模块负责原声高光生产。
+        三者组合起来，形成了一个面向新闻短视频生产的智能工作台。
+      </div>
+
+      <div class="pill-list">
+        <span class="pill">公共分析复用</span>
+        <span class="pill">多源素材池</span>
+        <span class="pill">语音与画面融合</span>
+        <span class="pill">大模型输入压缩</span>
+        <span class="pill">代码物化时间线</span>
+        <span class="pill">配音画面双向对齐</span>
+        <span class="pill">原声高光重组</span>
+        <span class="pill">质量门禁</span>
+        <span class="pill">断点续跑</span>
+        <span class="pill">生产级任务管理</span>
+      </div>
+    </section>
+
+    <section id="project-detail-doc" class="tab-section">
+      <div class="detail-doc">
+<h1>凤凰智剪项目架构链路说明文档</h1>
+<blockquote><p>本文档用于项目培训、技术讲解和方案汇报。</p>
+<p>写法遵循：<strong>先给完整链路，再解释链路逻辑，再重点展开亮点设计</strong>。</p>
+<p>不是逐个文件说明，也不是简单演讲稿，而是围绕项目整体架构、公共模块、AI 配音解说、视频重组几个核心板块，把“链路是什么、功能是什么、为什么这样设计、亮点在哪里”讲清楚。</p></blockquote>
+<p>---</p>
+<h1>一、项目总览</h1>
+<h2>1.1 项目完整链路</h2>
+<pre><code>用户提交新闻视频素材
+  ↓
+网页工作台接收任务
+  ↓
+任务参数归一化与任务队列调度
+  ↓
+公共素材分析层
+  ↓
+生成公共素材池
+  ↓
+按生产模式分流
+  ├─ AI 配音解说链路
+  │    ↓
+  │  生成 AI 解说新闻短视频
+  │
+  └─ 原声高光重组链路
+       ↓
+     生成原声新闻高光短视频</code></pre>
+<h2>1.2 总体链路说明</h2>
+<p>凤凰智剪的整体架构不是“上传视频后直接剪辑”，而是先把新闻视频素材解析成可以被系统理解和复用的素材资产，再根据不同生产目标进入不同生产链路。</p>
+<p>这个设计的关键点是：<strong>公共素材分析层在前，具体生产链路在后</strong>。</p>
+<p>也就是说，系统不会让 AI 配音模块和视频重组模块各自重新做语音识别、画面理解、素材时间线分析，而是先统一做一遍公共分析，生成公共素材池。后续 AI 配音解说和原声高光重组都复用这套素材池。</p>
+<p>这样设计有几个明显优势：</p>
+<p>第一，减少重复成本。语音识别、画面理解、大模型摘要都是高成本步骤，如果每条生产链路都重新跑一遍，会浪费大量时间和算力。</p>
+<p>第二，保证素材理解一致。AI 配音和视频重组基于同一套语音、画面、时间线和素材来源信息，避免不同模块对同一条视频产生不一致理解。</p>
+<p>第三，方便扩展更多生产模式。公共素材池一旦建立，未来不仅可以做 AI 配音和原声重组，还可以继续扩展多版本短视频、多语言解说、不同平台比例、专题合集等能力。</p>
+<p>第四，提升工程稳定性。大模型负责理解、判断、规划；代码负责时间、来源、边界、剪辑和渲染。这样既发挥 AI 的理解能力，又避免大模型直接生成不可执行的时间码和剪辑计划。</p>
+<p>一句话概括：<strong>凤凰智剪的核心架构是“先素材资产化，再多链路生产”。</strong></p>
+<p>---</p>
+<h1>二、公共素材分析模块</h1>
+<h2>2.1 公共模块完整链路</h2>
+<pre><code>输入新闻视频素材
+  ↓
+素材准备与来源登记
+  ↓
+视频信息读取
+  ↓
+素材质量检查
+  ↓
+音频提取
+  ↓
+关键帧抽取
+  ↓
+视频分块
+  ↓
+语音识别
+  ↓
+语音摘要
+  ↓
+画面理解
+  ↓
+语音、画面、时间融合
+  ↓
+时间线压缩
+  ↓
+多源素材聚合
+  ↓
+公共素材池</code></pre>
+<h2>2.2 公共模块整体说明</h2>
+<p>公共素材分析模块是整个项目的底座。它的作用不是直接决定最终成片，而是先把原始新闻视频变成结构化素材资产。</p>
+<p>原始视频本质上只是一个媒体文件。系统并不知道它里面说了什么，画面是什么，哪段有新闻价值，哪段是现场原声，哪段适合配音，哪段适合做高光，也不知道每个片段应该怎么精确回到原视频进行裁剪。所以公共模块要先做一件事：<strong>把视频拆解成系统能理解、能复用、能剪辑的素材结构。</strong></p>
+<p>这条链路里，前面的素材准备、视频信息读取、质量检查、音频提取、抽帧、分块属于基础处理。它们解决的是素材能不能被系统稳定处理的问题。比如视频是否可读、是否有音轨、时长是多少、如何抽帧、如何分块。这些步骤比较基础，但它们为后面所有 AI 分析和剪辑执行提供了确定性基础。</p>
+<p>真正核心的部分从语音识别、语音摘要、画面理解开始。语音识别回答“这段新闻说了什么”，画面理解回答“这段视频画面出现了什么”。新闻视频不能只看语音，也不能只看画面。很多时候，文字内容很重要，但画面可能是资料画面；也有时候画面很有冲击力，但语音只是背景介绍。所以系统必须把语音和画面结合起来判断。</p>
+<p>语音和画面分析完成后，系统会把它们融合到统一时间线上。这个时间线是公共模块最重要的中间结果。它让系统知道某个时间段内：说了什么、画面是什么、出现了哪些人物和地点线索、屏幕上有什么文字、是否是现场画面、是否有风险、来自哪条素材、对应原视频哪个时间范围。</p>
+<p>然后系统会生成压缩版时间线。完整时间线适合代码使用，但不适合直接给大模型，因为字段多、内容长、噪声大。压缩版时间线会保留必要信息，减少冗余字段，让大模型在后续做新闻理解、选片和规划时更稳定。</p>
+<p>最后，如果是多源素材，系统会把多条视频的分析结果聚合成公共素材池。这里有一个很重要的设计：多源素材不是简单拼接成一条虚拟视频，而是保留每条素材自己的来源和本地时间。这样后续无论 AI 配音还是视频重组，都能准确知道每个片段来自哪条视频，应该从哪一秒剪到哪一秒。</p>
+<h2>2.3 公共模块为什么要这样设计</h2>
+<p>公共模块这样设计，核心原因是新闻视频生产不能直接从原始视频进入大模型。大模型可以理解内容，但它不适合直接承担视频工程里的精确时间定位、素材来源管理、边界校验和剪辑执行。</p>
+<p>如果没有公共素材分析层，后面会出现几个问题：</p>
+<p>第一，AI 配音模块需要自己做语音识别、画面理解和时间线整理；视频重组模块也要重复做一遍。这会导致重复开发、重复计算和结果不一致。</p>
+<p>第二，大模型容易拿到过长、过乱的输入。原始语音、视觉结果、视频元数据如果直接拼给模型，会让模型难以聚焦真正有价值的新闻信息。</p>
+<p>第三，多源素材会非常容易出错。不同素材的时间线不同，如果不保留来源和本地时间，下游剪辑可能会把 A 视频的时间码用到 B 视频上。</p>
+<p>第四，后续选片和渲染没有可靠依据。系统必须知道每个候选片段的真实来源、真实开始时间、真实结束时间，才能真正剪出来。</p>
+<p>所以公共模块的设计思路是：</p>
+<pre><code>先用代码和模型共同完成素材理解
+  ↓
+再把结果沉淀成公共素材池
+  ↓
+下游只围绕公共素材池做生产</code></pre>
+<h2>2.4 公共模块亮点</h2>
+<p>公共模块最大的亮点是“素材中台化”。</p>
+<p>它不是普通缓存，而是整个项目的素材语义中台。它把原始视频变成了两类数据：</p>
+<pre><code>给代码用的数据：
+  原始语音索引
+  准确时间
+  素材来源
+  视频路径
+  完整时间线
+  可裁剪边界
+
+给模型用的数据：
+  压缩时间线
+  语音摘要
+  画面摘要
+  新闻事实线索
+  素材摘要
+  候选上下文</code></pre>
+<p>这种双层数据设计非常关键。代码需要完整、准确、可执行的数据；模型需要简洁、清楚、低噪声的数据。公共模块把这两类需求分开处理，使后续链路既能稳定执行，又能利用大模型理解新闻内容。</p>
+<p>---</p>
+<h1>三、AI 配音解说模块</h1>
+<h2>3.1 AI 配音模块完整链路</h2>
+<pre><code>公共素材池
+  ↓
+语音微分段
+  ↓
+内容预选
+  ↓
+内容分析
+  ↓
+候选片段池
+  ↓
+成片故事规划
+  ↓
+画面镜头计划
+  ↓
+每个镜头分配时长预算
+  ↓
+根据时长预算生成 AI 配音文案
+  ↓
+文案质量检查
+  ↓
+按镜头生成 TTS
+  ↓
+检查 TTS 实际时长和画面预算是否匹配
+  ↓
+不匹配则修复文案、调整画面、补片或轻微变速
+  ↓
+生成最终剪辑计划
+  ↓
+生成字幕
+  ↓
+新闻质量检查
+  ↓
+渲染成片</code></pre>
+<h2>3.2 AI 配音链路整体说明</h2>
+<p>AI 配音模块的目标是生成“解说型新闻短视频”。它不是简单把原视频切几段，再生成一段配音盖上去，而是要完成新闻短视频生产中的完整闭环：选内容、定故事、排镜头、控时长、写文案、生成配音、校验音画、生成字幕、最终渲染。</p>
+<p>这条链路的前半段解决“用哪些内容”的问题。公共素材池提供语音、画面、时间线和来源信息。系统先从原始语音中做微分段，把粗粒度的视频块拆成更细的新闻语义单元。这样做是因为一段几十秒的视频块里可能包含多个新闻点，直接拿整块做候选会太粗，也容易夹杂无关内容。</p>
+<p>微分段之后，系统会做内容预选和内容分析。内容预选负责先把明显低价值的片段过滤掉，比如空话、重复句、过渡句、半句话、信息密度很低的内容。内容分析则进一步判断哪些片段真正适合做 AI 配音短视频素材。这里判断的不是“原声是否精彩”，而是“这段内容能不能被重新解说、有没有画面承载、能不能作为短视频中的一个镜头、是否能和其他片段组成故事”。</p>
+<p>内容分析之后，系统会生成候选片段池。这里有一个关键设计：大模型只负责判断哪段内容值得用，真正的视频时间段由代码生成。代码会根据语音微分段的真实开始时间和结束时间，加上合适的前后留白，并限制在原视频边界内，生成可剪辑的候选片段。这样可以避免大模型直接生成时间码导致越界、错位、来源混乱等问题。</p>
+<p>链路的中段解决“怎么讲故事”的问题。候选片段池只是素材，还不是成片。系统需要先做成片故事规划，确定这条短视频讲什么主题，用哪些素材，先讲什么，后讲什么，哪些是开头，哪些是背景，哪些是核心事实。然后进一步生成画面镜头计划，明确每个镜头用哪个候选片段、承担什么叙事功能、对应哪些新闻事实。</p>
+<p>这里最重要的一步是：<strong>每个镜头分配时长预算</strong>。这是 AI 配音链路能不能稳定的关键。文案不能先自由生成，再强行塞进视频里。正确的顺序应该是先知道每个镜头有什么画面、能放多长，再根据这个时长预算生成文案。否则就会出现一个 4 秒镜头生成了 12 秒配音文案，或者一个 10 秒镜头只有 2 秒配音的情况。</p>
+<p>链路的后半段解决“文案、配音、画面、字幕怎么对齐”的问题。系统根据每个镜头的时长预算生成 AI 配音文案，并且文案是按镜头分段的。每段文案都对应一个镜头，这样后面才能按镜头生成 TTS、按镜头检查时长、按镜头生成字幕和剪辑计划。</p>
+<p>文案生成后先做质量检查，确认是否覆盖必要事实、是否有编造、是否过长或过短、是否每个镜头都有对应文案。通过后再进入 TTS。TTS 阶段不是只生成一整段音频，而是按镜头生成分段配音。这样系统可以拿到每个镜头真实的配音时长。</p>
+<p>真实 TTS 时长出来后，系统会检查它和画面预算是否匹配。如果配音略短，可以压缩画面；如果配音略长，可以延长画面、补片或调整片段；如果明显过长，则需要缩短文案或重新生成该镜头文案；如果差异严重，就应该阻断，不让它进入渲染。这个过程就是 AI 配音模块最重要的亮点：<strong>TTS 实际时长回流，反向约束画面剪辑。</strong></p>
+<p>最后，系统根据修复后的镜头、配音和字幕关系生成最终剪辑计划，再进行新闻质量检查和渲染。最终剪辑计划必须在 TTS 之后才能真正稳定，因为只有 TTS 完成后，系统才知道真实配音时长。</p>
+<h2>3.3 AI 配音为什么要这样设计</h2>
+<p>AI 配音短视频最容易失败的地方，不是“能不能生成文案”，而是文案、配音、画面、字幕四者是否对得上。</p>
+<p>如果采用简单链路：</p>
+<pre><code>候选片段
+  ↓
+生成一段文案
+  ↓
+生成一段 TTS
+  ↓
+直接渲染</code></pre>
+<p>这个链路能跑，但不够稳。它会产生很多问题：</p>
+<ul>
+<li>文案没有严格对应镜头；</li>
+<li>配音时长和画面时长不匹配；</li>
+<li>字幕和声音不同步；</li>
+<li>某些镜头画面撑不住对应文案；</li>
+<li>某些画面空转；</li>
+<li>成片节奏拖沓或过快；</li>
+<li>TTS 失败后难以定位是哪一段出问题；</li>
+<li>文案过长只能整篇重写，不能局部修复。</li>
+</ul>
+<p>所以更合理的设计是：</p>
+<pre><code>先确定候选片段
+  ↓
+再规划成片故事
+  ↓
+再规划画面镜头
+  ↓
+再给每个镜头分配时长
+  ↓
+再按镜头生成文案
+  ↓
+再按镜头生成 TTS
+  ↓
+再用 TTS 真实时长校验和调整画面
+  ↓
+最后生成剪辑计划</code></pre>
+<p>这个链路虽然更长，但它解决了 AI 配音视频生产中最核心的问题：音画对齐和生产稳定性。</p>
+<h2>3.4 AI 配音核心亮点：TTS 与视频片段双向对齐</h2>
+<p>AI 配音模块最值得重点讲的亮点，就是 TTS 和视频片段的双向对齐。</p>
+<p>它的关键链路是：</p>
+<pre><code>候选片段池
+  ↓
+成片故事规划
+  ↓
+画面镜头计划
+  ↓
+每个镜头分配时长预算
+  ↓
+根据时长预算生成 AI 配音文案
+  ↓
+按镜头生成 TTS
+  ↓
+检查 TTS 实际时长和画面预算是否匹配
+  ↓
+不匹配则改文案、调画面、补片或轻微变速
+  ↓
+最终剪辑计划
+  ↓
+渲染</code></pre>
+<p>这个亮点的核心思想是：<strong>不是画面被动等配音，也不是配音被动贴画面，而是两者互相约束。</strong></p>
+<p>第一层约束是画面对文案的约束。</p>
+<p>在生成文案之前，系统已经知道每个镜头的画面素材和时长预算。文案生成时必须考虑这个镜头大概能讲多少内容。这样可以从源头减少文案过长或过短的问题。</p>
+<p>第二层约束是 TTS 对画面的反向约束。</p>
+<p>即使文案控制了字数，TTS 真实读出来的时长也可能和预估不同。因为不同标点、停顿、音色、语速都会影响真实音频时长。所以 TTS 完成后，系统必须以实际音频时长为准，反向调整画面。</p>
+<p>第三层约束是质量门禁。</p>
+<p>如果画面和 TTS 只是轻微不匹配，系统可以自动修复；如果严重不匹配，就不能继续渲染。这样可以避免输出明显失败的视频。</p>
+<p>这个设计的价值很大。</p>
+<p>它让 AI 配音视频从“能生成”提升到“能生产”。</p>
+<p>因为真正的视频生产不是生成一段文字和一段声音，而是要让文字、声音、画面、字幕和节奏都成立。</p>
+<h2>3.5 AI 配音模块总结</h2>
+<p>AI 配音模块的核心不是 TTS 本身，而是围绕 TTS 建立了一条完整生产链路：</p>
+<pre><code>素材候选
+  ↓
+故事结构
+  ↓
+镜头结构
+  ↓
+时长预算
+  ↓
+解说文案
+  ↓
+TTS
+  ↓
+时长校验
+  ↓
+剪辑计划
+  ↓
+渲染</code></pre>
+<p>这个设计让系统避免了“先写稿再硬配画面”的不稳定方式，而是采用“先画面规划，再文案生成，再 TTS 回流校验”的闭环方式。</p>
+<p>---</p>
+<h1>四、原声高光重组模块</h1>
+<h2>4.1 视频重组完整链路</h2>
+<pre><code>公共素材池
+  ↓
+整片新闻理解
+  ↓
+原声事件候选
+  ↓
+候选片段物化
+  ↓
+候选复核过滤
+  ↓
+高光重组规划
+  ↓
+重组剪辑计划
+  ↓
+新闻质量检查
+  ↓
+原声重组渲染</code></pre>
+<h2>4.2 视频重组链路整体说明</h2>
+<p>视频重组模块的目标是生成“保留原声的新闻高光短视频”。它和 AI 配音模块的目标完全不同。AI 配音是重新组织新闻并用 AI 解说讲清楚，视频重组则是保留人物原话、现场声音和新闻现场感，把有价值的原声片段重新编排成短视频。</p>
+<p>这条链路从公共素材池开始。公共素材池已经提供了时间线、语音识别、画面摘要、素材来源和本地时间。视频重组不需要重新做语音识别和画面理解，而是直接复用这些素材事实。</p>
+<p>视频重组首先做整片新闻理解。这个步骤很重要，因为原声高光不能只看某一句话“听起来有冲击力”。一句话是否重要，要看它在整条新闻中的位置。比如某个发言可能是核心表态，也可能只是背景铺垫；某段采访可能本身完整，也可能需要前文问题才能理解。所以系统要先理解整条新闻的主题、主要事实、人物、地点和事件结构。</p>
+<p>然后进入原声事件候选。这个阶段会从原始语音中找出适合保留原声的片段。这里的筛选标准和 AI 配音不同。AI 配音关注的是“这段内容能不能被重新解说”，视频重组关注的是“这段原声本身是否值得保留”。适合进入原声候选的片段通常是明确表态、采访回答、现场描述、发布会回应、冲突现场、记者连线等。系统要避免选半句话、重复句、弱背景、过渡语或者缺少上下文的片段。</p>
+<p>候选出来后，仍然需要代码物化成真实可剪辑的视频片段。模型可以判断某个语音事件值得保留，但具体从哪一秒剪到哪一秒，必须由代码根据原始语音时间和素材边界生成。这样可以保证候选片段真实存在、来源正确、时间不越界。</p>
+<p>之后是候选复核过滤。初步候选可能会有重复、信息不足、表达不完整或不适合成片的片段。复核过滤的作用是进一步缩小候选池，让后面的高光重组规划基于更干净、更高质量的原声片段。</p>
+<p>高光重组规划负责把候选片段组织成最终短视频。它要决定选哪些片段、按什么顺序排列、生成几条视频、每条视频的主题是什么、哪些片段要排除。这里不是简单拼接，而是要形成新闻叙事。一个好的原声高光视频，通常需要用最有价值的原声开头，再补充上下文，最后用有结论性或冲击力的片段收尾。</p>
+<p>规划完成后，系统会生成重组剪辑计划。这个步骤由代码完成，负责检查片段是否存在、来源是否正确、时间是否有效、是否越界、是否有原声音频、是否可渲染。只有通过检查后，才进入最终原声重组渲染。</p>
+<h2>4.3 视频重组为什么要独立于 AI 配音</h2>
+<p>视频重组必须独立成一条链路，因为它的产品目标、候选标准和质量检查都和 AI 配音不同。</p>
+<p>AI 配音的目标是“重新讲清楚新闻”，所以它需要文案、TTS、字幕和音画对齐。</p>
+<p>视频重组的目标是“保留新闻现场原声”，所以它不需要 TTS，也不应该用 AI 文案覆盖原声价值。</p>
+<p>严肃新闻里，很多内容的价值就来自原话本身。比如发布会回应、领导人讲话、记者现场描述、当事人采访、国际时政表态。如果这些内容被 AI 配音改写，新闻可信度和现场感都会下降。</p>
+<p>所以视频重组链路强调：</p>
+<pre><code>保留原声
+  ↓
+保留现场感
+  ↓
+保留人物原话
+  ↓
+保留新闻证据性</code></pre>
+<p>它和 AI 配音不是谁替代谁，而是服务不同新闻场景。</p>
+<h2>4.4 视频重组核心亮点</h2>
+<p>视频重组最大的亮点是“事件驱动的原声重组”。</p>
+<p>普通高光剪辑可能只看画面冲击力，或者按固定时长截取。</p>
+<p>凤凰智剪的视频重组则先理解整条新闻，再从原始语音中筛选有事件价值的原声片段，然后再做重组规划。</p>
+<p>这个设计带来几个优势：</p>
+<p>第一，新闻可信度更高。</p>
+<p>因为它保留原声和原话，适合严肃新闻、国际时政、发布会、采访等场景。</p>
+<p>第二，表达更完整。</p>
+<p>系统会避免半句话、弱背景、重复内容，也支持同一素材内连续相关片段合并，减少片段过碎的问题。</p>
+<p>第三，多源更安全。</p>
+<p>多源素材保留来源和本地时间，不会把不同视频的时间线混在一起。跨素材可以在重组规划层面排序，但不应该在候选物化阶段乱合并。</p>
+<p>第四，模型和代码分工清晰。</p>
+<p>模型负责判断哪些原声有价值、如何组织叙事；代码负责把片段落地成真实可剪辑计划。</p>
+<p>---</p>
+<h1>五、公共模块如何支撑两个下游</h1>
+<h2>5.1 复用链路</h2>
+<pre><code>原始新闻素材
+  ↓
+公共素材分析
+  ↓
+公共素材池
+  ├─ 原始语音索引
+  ├─ 压缩时间线
+  ├─ 画面摘要
+  ├─ 素材摘要
+  ├─ 来源信息
+  └─ 本地时间
+       ↓
+  ├─ AI 配音解说复用
+  └─ 原声高光重组复用</code></pre>
+<h2>5.2 复用逻辑说明</h2>
+<p>公共素材池对 AI 配音和视频重组的价值不同。</p>
+<p>AI 配音主要复用公共素材池中的原始语音索引、时间线摘要、画面摘要和来源时间信息。原始语音索引用于生成语音微分段，时间线摘要用于理解上下文，画面摘要用于判断片段是否适合作为镜头，来源和本地时间用于生成可剪辑候选片段。</p>
+<p>视频重组主要复用公共素材池中的原声语音内容、整片时间线、画面上下文、来源信息和原始音频。它需要从原声中找高光事件，也需要保证片段能回到原始素材裁剪和保留原声。</p>
+<p>所以公共素材池不是一个简单中间文件，而是两个下游链路共同依赖的素材基础。</p>
+<p>它的设计让项目形成了清晰分层：</p>
+<pre><code>公共模块负责素材理解
+AI 配音模块负责解说型生产
+视频重组模块负责原声型生产</code></pre>
+<p>---</p>
+<h1>六、整体架构设计亮点</h1>
+<h2>6.1 亮点一：公共素材中台</h2>
+<pre><code>原始视频
+  ↓
+公共分析
+  ↓
+素材资产
+  ↓
+多链路复用</code></pre>
+<p>这个设计让系统从“单次剪辑工具”变成“可扩展的视频生产平台”。</p>
+<p>只要公共素材池存在，后续可以基于它生成不同类型的视频。</p>
+<h2>6.2 亮点二：AI 配音链路不是简单 TTS</h2>
+<p>AI 配音模块真正的链路是：</p>
+<pre><code>候选片段
+  ↓
+故事规划
+  ↓
+镜头计划
+  ↓
+时长预算
+  ↓
+文案生成
+  ↓
+TTS
+  ↓
+时长校验
+  ↓
+剪辑计划</code></pre>
+<p>这个链路解决了 AI 配音视频最难的问题：文案、配音、画面、字幕如何对齐。</p>
+<h2>6.3 亮点三：TTS 实际时长回流</h2>
+<p>普通自动配音可能只根据文案估算时长。</p>
+<p>凤凰智剪会在 TTS 生成后读取真实音频时长，再反向调整画面和剪辑计划。</p>
+<p>这个设计能显著降低音画不同步、字幕不同步、画面空转等问题。</p>
+<h2>6.4 亮点四：视频重组保留新闻可信度</h2>
+<p>视频重组不走 AI 配音，而是保留原声。</p>
+<p>这对新闻项目非常重要，因为很多新闻内容的价值就在原话、语气和现场声音里。</p>
+<h2>6.5 亮点五：模型和代码分工明确</h2>
+<pre><code>模型负责：
+  新闻理解
+  内容判断
+  叙事规划
+  文案生成
+
+代码负责：
+  时间计算
+  片段边界
+  来源校验
+  TTS 文件检查
+  音画时长检查
+  剪辑计划
+  渲染执行</code></pre>
+<p>这种分工让系统既有智能判断，又能稳定落地。</p>
+<h2>6.6 亮点六：质量门禁贯穿全流程</h2>
+<p>系统不是最后才检查，而是在多个关键节点检查：</p>
+<pre><code>素材质量
+  ↓
+候选质量
+  ↓
+文案质量
+  ↓
+TTS 成功情况
+  ↓
+TTS 与画面时长
+  ↓
+剪辑计划
+  ↓
+新闻质量
+  ↓
+渲染结果</code></pre>
+<p>这样可以尽早发现问题，避免坏结果一路进入最终成片。</p>
+<p>---</p>
+<h1>七、最终项目介绍</h1>
+<p>凤凰智剪是一个面向新闻短视频生产的智能剪辑系统。它的核心架构是先通过公共素材分析层，把原始新闻视频转成结构化、可复用、可追踪的素材资产，再基于同一素材池生成不同形态的新闻短视频。</p>
+<p>公共模块负责素材理解，包括素材准备、视频信息读取、音频提取、关键帧抽取、视频分块、语音识别、语音摘要、画面理解、时间线融合、多源素材聚合等能力。它的最终产物是公共素材池，供下游 AI 配音解说和原声高光重组复用。</p>
+<p>AI 配音模块负责生成解说型新闻短视频。它不是简单写稿和 TTS，而是先从公共素材池中生成候选片段，再做成片故事规划、画面镜头计划和镜头时长预算，然后根据预算生成镜头级 AI 配音文案。TTS 生成后，系统会检查真实配音时长和画面预算是否匹配，并通过文案修复、画面调整、补片或轻微变速等方式进行修正，最后生成最终剪辑计划并渲染成片。</p>
+<p>视频重组模块负责生成保留原声的新闻高光短视频。它会先理解整条新闻，再从原声中筛选有事件价值和现场价值的片段，经过候选物化、复核过滤和高光重组规划后，生成原声重组剪辑计划并渲染成片。这个模块适合发布会、采访、现场报道、国际时政表态等强调可信度和现场感的场景。</p>
+<p>整个项目的核心优势是：公共分析复用、AI 负责理解规划、代码负责时间和剪辑落地、TTS 与画面形成闭环校验、视频重组保留原声可信度。</p>
+<p>因此，凤凰智剪不是普通自动剪辑工具，而是一个面向新闻场景的智能视频生产平台。</p>
+      </div>
+    </section>
+
+    <footer class="footer">
+      凤凰智剪项目架构培训网页 · 适用于项目讲解、内部培训、方案汇报
+    </footer>
+  </main>
+
+  <script>
+    document.addEventListener("DOMContentLoaded", function () {
+      const tabs = Array.from(document.querySelectorAll(".toc a"));
+      const sections = Array.from(document.querySelectorAll(".tab-section"));
+
+      function showSection(hash, shouldScroll) {
+        const targetId = (hash || "#overview").replace("#", "");
+        const target = document.getElementById(targetId);
+        if (!target) return;
+
+        sections.forEach(section => {
+          section.classList.toggle("active", section.id === targetId);
+        });
+
+        tabs.forEach(tab => {
+          tab.classList.toggle("active", tab.getAttribute("href") === "#" + targetId);
+        });
+
+        if (shouldScroll) {
+          const toc = document.querySelector(".toc");
+          const top = toc ? toc.offsetTop : 0;
+          window.scrollTo({ top: top, behavior: "smooth" });
+        }
+      }
+
+      tabs.forEach(tab => {
+        tab.addEventListener("click", function (event) {
+          event.preventDefault();
+          const hash = this.getAttribute("href");
+          history.replaceState(null, "", hash);
+          showSection(hash, true);
+        });
+      });
+
+      showSection(window.location.hash || "#overview", false);
+    });
+  </script>
+
+</body>
+</html>

@@ -172,6 +172,38 @@ def normalize_ucms_item(item: dict[str, Any], *, prefer_quality: str = "high") -
     }
 
 
+def _normalized_remote_video(remote_video: dict[str, Any], *, prefer_quality: str) -> dict[str, Any]:
+    """Return a normalized remote video dict, skipping re-normalization when already normalized."""
+    if not isinstance(remote_video, dict):
+        raise RuntimeError("remote_video must be a dict")
+    if "download_url" in remote_video:
+        return remote_video
+    return normalize_ucms_item(remote_video, prefer_quality=prefer_quality)
+
+
+def remote_cache_path(
+    cfg: RemoteVideoSourceConfig,
+    remote_video: dict[str, Any],
+    *,
+    create_dir: bool = False,
+) -> Path:
+    """Deterministic local cache path for a remote video.
+
+    Mirrors the target chosen by :func:`download_ucms_video` so callers can locate
+    (or pre-check) the cached file without triggering a download. Used by the web
+    layer to serve a downloaded copy for 原片 preview when the remote signed URL
+    has expired.
+    """
+    normalized = _normalized_remote_video(remote_video, prefer_quality=cfg.prefer_quality)
+    station = _safe_path_part(normalized.get("record_station") or "unknown_station")
+    name = _safe_path_part(normalized.get("name") or "remote_video")
+    rid = _safe_path_part(normalized.get("remote_id") or normalized.get("id") or normalized.get("guid") or "unknown")
+    target_dir = cfg.cache_dir / station
+    if create_dir:
+        ensure_dir(target_dir)
+    return target_dir / f"{rid}_{name}{VIDEO_SUFFIX}"
+
+
 def download_ucms_video(
     cfg: RemoteVideoSourceConfig,
     remote_video: dict[str, Any],
@@ -179,20 +211,12 @@ def download_ucms_video(
     root_dir: Path,
     force: bool = False,
 ) -> dict[str, Any]:
-    normalized = (
-        normalize_ucms_item(remote_video, prefer_quality=cfg.prefer_quality)
-        if "download_url" not in remote_video
-        else remote_video
-    )
+    normalized = _normalized_remote_video(remote_video, prefer_quality=cfg.prefer_quality)
     url = normalized.get("download_url") or normalized.get("media_high_url") or normalized.get("media_low_url")
     if not url:
         raise RuntimeError("Remote video has no downloadable URL")
 
-    station = _safe_path_part(normalized.get("record_station") or "unknown_station")
-    name = _safe_path_part(normalized.get("name") or "remote_video")
-    rid = _safe_path_part(normalized.get("remote_id") or normalized.get("id") or normalized.get("guid") or "unknown")
-    target_dir = ensure_dir(cfg.cache_dir / station)
-    target = target_dir / f"{rid}_{name}{VIDEO_SUFFIX}"
+    target = remote_cache_path(cfg, normalized, create_dir=True)
     meta_path = target.with_suffix(".json")
 
     if target.exists() and target.stat().st_size > 0 and not force:

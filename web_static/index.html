@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>凤凰智剪</title>
     <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
-    <link rel="stylesheet" href="/static/styles.css?v=20260601_multisource" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260624_commentary" />
   </head>
   <body>
     <div class="app-shell">
@@ -321,6 +321,7 @@
               <div class="draft-box">
                 <div id="previewListTitle" class="draft-title">成片列表</div>
                 <div id="draftList" class="draft-list">当前任务还没有生成粗剪视频。</div>
+                <button id="generateCommentary" class="button secondary commentary-btn hidden"><i data-lucide="newspaper"></i><span>图文解说</span></button>
               </div>
             </section>
 
@@ -365,6 +366,21 @@
       </main>
     </div>
 
-    <script src="/static/app.js?v=20260604_unified_progress"></script>
+    <div id="commentaryModal" class="commentary-modal hidden">
+      <div class="commentary-backdrop" data-commentary-close="1"></div>
+      <div class="commentary-card" role="dialog" aria-modal="true" aria-label="图文解说">
+        <div class="commentary-card-header">
+          <h3>图文解说</h3>
+          <div class="commentary-actions">
+            <button id="commentaryRegen" class="button secondary"><i data-lucide="refresh-cw"></i><span>重新生成</span></button>
+            <button id="commentaryCopy" class="button secondary"><i data-lucide="copy"></i><span>复制Markdown</span></button>
+            <button id="commentaryClose" class="button secondary" data-commentary-close="1"><i data-lucide="x"></i><span>关闭</span></button>
+          </div>
+        </div>
+        <div id="commentaryBody" class="commentary-body"></div>
+      </div>
+    </div>
+
+    <script src="/static/app.js?v=20260624_commentary"></script>
   </body>
 </html>

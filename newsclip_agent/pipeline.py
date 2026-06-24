@@ -17,6 +17,7 @@ from typing import Any, Callable
 from .config import ProjectConfig, load_config
 from .llm import OpenAICompatibleClient
 from . import prompts
+from . import commentary
 from .duration_policy import (
     build_voiceover_timing_contract,
     clean_voiceover_text,
@@ -2234,7 +2235,7 @@ class PipelineRunner:
         provider = llm_cfg.get("vision_llm_provider", "openai")
         model = self.options.model or llm_cfg.get(f"vision_{provider}_model_name")
         fallback = llm_cfg.get(f"vision_{provider}_fallback_models", [])
-        prompt_version = self.options.prompt_version or "vision_chunk_v1"
+        prompt_version = self.options.prompt_version or "vision_chunk_v2"
         base_input_hash = stable_hash({
             "chunks": self._step_content_hash("chunk_build"),
             "asr": self._step_content_hash("asr"),
@@ -2271,17 +2272,29 @@ class PipelineRunner:
                 continue
             chunks_to_process.append(chunk)
 
+        # 关键帧时间映射：frame_extract 里每帧带本地秒数(seconds)，但 chunk 只存了文件路径，
+        # 这里反查回来，好让 vision 逐帧输出"这一刻是主持人还是现场"。
+        frames_doc = self._load_optional_step_json("frame_extract", {"frames": []})
+        frame_seconds_by_file = {
+            str(f.get("file")): self._safe_float(f.get("seconds"), 0.0)
+            for f in frames_doc.get("frames", [])
+            if isinstance(f, dict) and f.get("file")
+        }
+
         def process_one_chunk(chunk: dict[str, Any]) -> dict[str, Any]:
             cid = chunk["chunk_id"]
             cdir = ensure_dir(vdir / cid)
             asr_segments = self._segments_in_range(asr.get("segments", []), chunk["start"], chunk["end"])
-            frame_paths = [str(self.task_dir / f) for f in chunk.get("frames", []) if (self.task_dir / f).exists()]
-            frame_paths = select_frames_for_vision(frame_paths, max_frames=max(1, int(self.options.vision_max_frames_per_chunk or 1)))
+            chunk_frame_files = [f for f in chunk.get("frames", []) if (self.task_dir / f).exists()]
+            chunk_frame_files = select_frames_for_vision(chunk_frame_files, max_frames=max(1, int(self.options.vision_max_frames_per_chunk or 1)))
+            frame_paths = [str(self.task_dir / f) for f in chunk_frame_files]
+            frame_times = [round(frame_seconds_by_file.get(f, 0.0), 3) for f in chunk_frame_files]
             input_data = {
                 "chunk_id": cid,
                 "time_range": chunk.get("time_range", ""),
                 "source_id": chunk.get("source_id", ""),
-                "frames": f"{len(frame_paths)} key frames attached as images",
+                "frame_times": frame_times,
+                "frames": f"{len(frame_paths)} key frames attached as images, in chronological order matching frame_times",
                 "asr_text": asr_digest_by_id.get(cid) or compact_asr_for_llm(" ".join(s.get("text", "") for s in asr_segments), max_chars=500),
             }
             write_json(cdir / "input.json", input_data)
@@ -2297,7 +2310,7 @@ class PipelineRunner:
                     debug_dir=cdir / "_llm_debug",
                 )
                 parsed = result.parsed
-                parsed = self._materialize_vision_chunk_result(parsed, chunk_id=cid, time_range=chunk["time_range"])
+                parsed = self._materialize_vision_chunk_result(parsed, chunk_id=cid, time_range=chunk["time_range"], frame_times=frame_times)
                 raw = {
                     "model": result.model,
                     "created_at": now_iso(),
@@ -2403,6 +2416,8 @@ class PipelineRunner:
                 "asr_segments": segs,
                 "scene_type": vr.get("scene_type", ""),
                 "visual_summary": vr.get("visual_summary") or vr.get("visual", ""),
+                "frame_shots": vr.get("frame_shots", []),
+                "footage_types": vr.get("footage_types", []),
                 "screen_text": vr.get("screen_text", []),
                 "visible_people": vr.get("visible_people", []),
                 "is_live_scene": vr.get("is_live_scene", False),
@@ -2456,6 +2471,8 @@ class PipelineRunner:
                 "screen_text": compact_list(item.get("screen_text", []), max_items=int(llm_input_cfg.get("max_screen_text_items", 5))),
                 "people": compact_list(item.get("visible_people", []), max_items=int(llm_input_cfg.get("max_people_items", 5))),
                 "scene": item.get("scene_type", ""),
+                "frame_shots": item.get("frame_shots", []),
+                "footage_types": item.get("footage_types", []),
                 "visual_score": item.get("visual_value_score", 0),
                 "hook_score": item.get("hook_score", 0),
                 "flags": build_chunk_flags(item),
@@ -3454,6 +3471,31 @@ class PipelineRunner:
         lines.append(f"本次实际提供 micro_segment 数：{included}")
         return "\n".join(lines).strip()
 
+    def _recover_corrupted_micro_segment_id(
+        self, raw_id: str, seg_map: dict[str, Any], seen: set[str]
+    ) -> str | None:
+        """容错恢复被 LLM 改写的 micro_segment_id。
+
+        content_analysis 这步偶尔会把 id 里的 source UUID 截断或少写几位
+        （实测："...c703e51f_ms_0001_1" 被写成 "...c703e_ms_0001_1"），
+        精确匹配会把整条源的候选静默丢光（6 选中→只剩 1）。这里按
+        段内编号后缀(_ms_xxxx_x)完全一致 + source 前缀互为前缀 的唯一性恢复，
+        匹配不唯一就放弃（宁可少捞也不串源）。"""
+        marker = "_ms_"
+        pos = raw_id.find(marker)
+        if pos < 8:  # source 前缀至少要够长，避免误配
+            return None
+        head = raw_id[:pos]
+        suffix = raw_id[pos:]
+        matches: list[str] = []
+        for key in seg_map:
+            if key in seen or key == raw_id or not key.endswith(suffix):
+                continue
+            key_head = key[: key.find(marker)]
+            if key_head.startswith(head) or head.startswith(key_head):
+                matches.append(key)
+        return matches[0] if len(matches) == 1 else None
+
     def _normalize_content_analysis_selected_segments(self, result: Any) -> dict[str, Any]:
         raw_items: Any
         if isinstance(result, list):
@@ -3504,6 +3546,15 @@ class PipelineRunner:
             else:
                 diagnostics["invalid_items"].append({"index": index, "reason": "item_not_string_or_object"})
                 continue
+            if micro_segment_id and micro_segment_id not in seg_map and micro_segment_id not in seen:
+                recovered = self._recover_corrupted_micro_segment_id(micro_segment_id, seg_map, seen)
+                if recovered:
+                    diagnostics.setdefault("recovered_ids", []).append({
+                        "index": index,
+                        "raw": micro_segment_id,
+                        "recovered": recovered,
+                    })
+                    micro_segment_id = recovered
             if not micro_segment_id or micro_segment_id in seen or micro_segment_id not in seg_map:
                 diagnostics["invalid_items"].append({
                     "index": index,
@@ -4935,7 +4986,7 @@ class PipelineRunner:
             "raw_model_plan": result,
         }
 
-    def _materialize_vision_chunk_result(self, result: Any, *, chunk_id: str, time_range: str) -> dict[str, Any]:
+    def _materialize_vision_chunk_result(self, result: Any, *, chunk_id: str, time_range: str, frame_times: list[float] | None = None) -> dict[str, Any]:
         raw = result if isinstance(result, dict) else {}
         visual = str(raw.get("visual") or raw.get("visual_summary") or "").strip()
         screen_text = raw.get("screen_text")
@@ -4950,6 +5001,27 @@ class PipelineRunner:
         warnings = raw.get("warnings")
         if not isinstance(warnings, list):
             warnings = []
+        # 逐帧镜头类型：vision 现在按关键帧输出 shot_type，缺 t 时按顺序回填 frame_times。
+        frame_times = frame_times or []
+        frame_shots: list[dict[str, Any]] = []
+        raw_frames = raw.get("frames")
+        if isinstance(raw_frames, list):
+            for idx, fr in enumerate(raw_frames):
+                if not isinstance(fr, dict):
+                    continue
+                t_value = fr.get("t")
+                if t_value in (None, "") and idx < len(frame_times):
+                    t_value = frame_times[idx]
+                frame_shots.append({
+                    "t": self._safe_float(t_value, 0.0),
+                    "shot_type": str(fr.get("shot_type") or "").strip(),
+                    "visual": str(fr.get("visual") or "").strip(),
+                })
+        footage_types: list[str] = []
+        for fr in frame_shots:
+            st = fr["shot_type"]
+            if st and st not in footage_types:
+                footage_types.append(st)
         return {
             "chunk_id": chunk_id,
             "time_range": time_range,
@@ -4960,6 +5032,8 @@ class PipelineRunner:
             "visible_people": visible_people,
             "location_clues": location_clues,
             "footage_type": str(raw.get("footage_type") or ""),
+            "frame_shots": frame_shots,
+            "footage_types": footage_types,
             "asr_visual_consistency": str(raw.get("asr_visual_consistency") or ""),
             "warnings": warnings,
             "materialized_by_code": True,
@@ -5752,7 +5826,7 @@ class PipelineRunner:
         max_chars = self._first_number(item.get("narration_max_chars"))
 
         voice_cfg = self.config.raw.get("voiceover", {}) if hasattr(self, "config") else {}
-        cps = float(voice_cfg.get("voiceover_chars_per_second") or 4.8)
+        cps = self._effective_chars_per_second()
 
         target_duration = self._first_number(item.get("target_duration_seconds"))
         if target_duration is None:
@@ -5974,9 +6048,12 @@ class PipelineRunner:
 
     def _attach_voiceover_char_budget(self, editing_structure: list[dict[str, Any]]) -> list[dict[str, Any]]:
         voice_cfg = self.config.raw.get("voiceover", {}) if hasattr(self, "config") else {}
-        cps = float(voice_cfg.get("voiceover_chars_per_second") or voice_cfg.get("chars_per_second") or 4.8)
-        min_cps = float(voice_cfg.get("voiceover_min_chars_per_second") or 3.8)
-        max_cps = float(voice_cfg.get("voiceover_max_chars_per_second") or 5.8)
+        # 以真实播报速率为中心分配字数预算（实测/校准值），并保留原 min/max 的相对带宽。
+        cps = self._effective_chars_per_second()
+        base_cps = float(voice_cfg.get("voiceover_chars_per_second") or voice_cfg.get("chars_per_second") or 4.8)
+        scale = cps / base_cps if base_cps > 0 else 1.0
+        min_cps = float(voice_cfg.get("voiceover_min_chars_per_second") or 3.8) * scale
+        max_cps = float(voice_cfg.get("voiceover_max_chars_per_second") or 5.8) * scale
         global_min = int(voice_cfg.get("shot_min_text_chars") or 10)
         global_max = int(voice_cfg.get("shot_max_text_chars") or 90)
         result: list[dict[str, Any]] = []
@@ -6603,10 +6680,32 @@ class PipelineRunner:
         hard = float(self._effective_ai_voiceover_max_seconds())
         cfg = self._short_video_edit_plan_duration_cfg()
 
+        # 长素材(如 10min 多主题)：默认目标(30s)会让规划塌缩成一两个片段、丢掉大半新闻点。
+        # 这里把目标抬到"可用候选片段能覆盖的内容量"(≤长素材首选时长、受硬上限约束)，
+        # 引导规划覆盖主要新闻点、多选镜头。仍是软目标——LLM 可在 30s~2min 间自由取舍，不强制具体时长。
+        source_seconds = self._current_source_duration_seconds()
+        is_long_source = source_seconds >= float(self.duration_settings.long_source_threshold_seconds or 600)
+        if is_long_source:
+            pool_seconds = 0.0
+            try:
+                pool_seconds = sum(
+                    self._safe_float(c.get("duration_seconds"), 0.0)
+                    for c in self._load_candidate_clips_for_current_mode()
+                    if isinstance(c, dict)
+                )
+            except Exception:
+                pool_seconds = 0.0
+            preferred = float(self.duration_settings.long_source_preferred_total_output_seconds or 150)
+            coverage = min(pool_seconds, preferred) if pool_seconds > 0 else preferred
+            target = min(max(target, coverage), hard)
+
         soft = target * cfg["duration_soft_budget_ratio"]
         soft = max(soft, cfg["duration_soft_budget_min_seconds"])
         soft = min(soft, cfg["duration_soft_budget_max_seconds"])
         soft = min(soft, hard)
+        if is_long_source:
+            # 长素材不要把 soft 压回 90s 小值，至少给到目标量级(受硬上限约束)。
+            soft = min(max(soft, min(target, hard)), hard)
 
         return {
             "target_seconds": round(target, 3),
@@ -6860,6 +6959,16 @@ class PipelineRunner:
             f"- hard_budget_seconds：{budgets['hard_budget_seconds']}",
             f"- raw_max_output_video_seconds：{self.options.max_output_video_seconds}",
             f"- allow_long_video：{self.options.allow_long_video}",
+            f"- 真实播报速率(字/秒)：{self._effective_chars_per_second():.2f}（按此估算每个镜头文案字数，避免配音过短或过长）",
+            *(
+                [
+                    "- 选片要求：本批素材较长、包含多条不同新闻；请覆盖其中的主要新闻点，尽量多用候选 clips、"
+                    "用多个镜头把每个重点讲清楚，围绕 soft_budget_seconds 组织内容；"
+                    "不要只选一两个片段，也不要把不同新闻硬塞进一个镜头。"
+                ]
+                if self._current_source_duration_seconds() >= float(self.duration_settings.long_source_threshold_seconds or 600)
+                else []
+            ),
             "",
             "新闻概览：",
             f"主题：{content.get('main_topic') or content.get('topic') or ''}",
@@ -6990,6 +7099,70 @@ class PipelineRunner:
         clean = clean_voiceover_text(str(text or ""))
         return len(re.sub(r"\s+", "", clean))
 
+    def _effective_chars_per_second(self) -> float:
+        """真实 TTS 播报速率（字/秒）的当前最佳估计。
+
+        用于文案字数预算与时长估算：要填满 T 秒画面，文案应约 T×rate 字，
+        rate 即真实播报速率。优先用本任务上一轮 TTS 实测校准值，其次用配置
+        tts_actual_chars_per_second 先验，最后兜底。统一口径可消除“按 4.8 估、
+        实读约 5.2”造成的系统性偏短，从源头减少画面被砍/阻断。
+        """
+        voice_cfg = self.config.raw.get("voiceover", {}) if hasattr(self, "config") else {}
+        calibration = self.manifest.get("tts_calibration") if isinstance(getattr(self, "manifest", None), dict) else None
+        if isinstance(calibration, dict):
+            measured = self._safe_positive_float(calibration.get("chars_per_second"), default=0.0)
+            if 3.0 <= measured <= 8.0:
+                return measured
+        prior = self._safe_positive_float(
+            voice_cfg.get("tts_actual_chars_per_second"),
+            default=float(getattr(self.duration_settings, "tts_actual_chars_per_second", 5.2) or 5.2),
+        )
+        if 3.0 <= prior <= 8.0:
+            return prior
+        return 5.0
+
+    def _measure_tts_chars_per_second(self, outputs: list[dict[str, Any]]) -> dict[str, Any] | None:
+        """从本轮 TTS 实际输出反推真实播报速率，供下次预算自校准。
+
+        只统计成功且足够长的样本（≥0.5s、≥3 字），并对结果做合理区间夹取，
+        避免极短片段或异常值污染校准。无有效样本则返回 None（保留旧先验）。
+        """
+        total_chars = 0
+        total_seconds = 0.0
+        sample_count = 0
+        for item in outputs:
+            if not isinstance(item, dict):
+                continue
+            segments = item.get("segments") or []
+            if segments:
+                for seg in segments:
+                    if not isinstance(seg, dict) or seg.get("status") != "success":
+                        continue
+                    seconds = self._safe_positive_float(seg.get("actual_duration_seconds"), default=0.0)
+                    chars = self._voiceover_text_chars(seg.get("text") or "")
+                    if seconds >= 0.5 and chars >= 3:
+                        total_seconds += seconds
+                        total_chars += chars
+                        sample_count += 1
+            elif item.get("status") == "success":
+                seconds = self._safe_positive_float(item.get("actual_duration_seconds"), default=0.0)
+                chars = int(item.get("narration_char_count") or 0)
+                if seconds >= 0.5 and chars >= 3:
+                    total_seconds += seconds
+                    total_chars += chars
+                    sample_count += 1
+        if sample_count == 0 or total_seconds <= 0 or total_chars <= 0:
+            return None
+        rate = total_chars / total_seconds
+        if not (3.0 <= rate <= 8.0):
+            return None
+        return {
+            "chars_per_second": round(rate, 3),
+            "total_chars": total_chars,
+            "total_seconds": round(total_seconds, 3),
+            "sample_count": sample_count,
+        }
+
     def _attach_voiceover_script_timings(self, voiceover_output: dict[str, Any], edit_plan: dict[str, Any]) -> None:
         scripts = voiceover_output.get("scripts", []) if isinstance(voiceover_output, dict) else []
         edit_scripts = edit_plan.get("scripts", []) if isinstance(edit_plan, dict) else []
@@ -7092,8 +7265,8 @@ class PipelineRunner:
             return []
         voice_cfg = self.config.raw.get("voiceover", {}) if hasattr(self, "config") else {}
         min_ratio = float(voice_cfg.get("pre_tts_segment_min_ratio", 0.65))
-        cps = float(voice_cfg.get("voiceover_chars_per_second", 4.8))
-        
+        cps = self._effective_chars_per_second()
+
         issues = []
         scripts = voiceover_output.get("scripts", []) if isinstance(voiceover_output, dict) else []
         for script in scripts:
@@ -7134,7 +7307,7 @@ class PipelineRunner:
         voice_cfg = self.config.raw.get("voiceover", {}) if hasattr(self, "config") else {}
         soft_min_ratio = float(script_cfg.get("script_estimated_soft_min_ratio", 0.85))
         hard_min_ratio = float(script_cfg.get("script_estimated_hard_min_ratio", 0.65))
-        cps = float(voice_cfg.get("voiceover_chars_per_second", 4.8))
+        cps = self._effective_chars_per_second()
         
         issues = []
         voice_scripts = voiceover_output.get("scripts", []) if isinstance(voiceover_output, dict) else []
@@ -7809,7 +7982,7 @@ class PipelineRunner:
             "allow_long_video_meaning": "allow_complete_story_within_60_seconds",
             "when_allow_long_video_target_range": [45, 60],
             "target_duration_is_soft_when_allow_long_video": True,
-            "chars_per_second": settings.chars_per_second,
+            "chars_per_second": self._effective_chars_per_second(),
             "audio_policy": self.options.audio_policy,
             "require_tts": self.options.require_tts,
             "ai_voiceover_original_audio_max_seconds": settings.ai_voiceover_original_audio_max_seconds,
@@ -7992,7 +8165,7 @@ class PipelineRunner:
                 sanitized,
                 float(item.get("target_duration_seconds") or self.options.target_duration_seconds or self.duration_settings.default_target_seconds),
                 float(item.get("max_allowed_seconds") or self.duration_settings.normal_max_seconds),
-                self.duration_settings.chars_per_second,
+                self._effective_chars_per_second(),
             )
             item["narration_text"] = clean_voiceover_text(sanitized)
             if item.get("script_with_pause_marks"):
@@ -8017,7 +8190,7 @@ class PipelineRunner:
 
         voice_cfg = self.config.raw.get("voiceover", {})
         min_ratio = float(voice_cfg.get("pre_tts_segment_min_ratio", 0.65))
-        chars_per_second = float(voice_cfg.get("voiceover_chars_per_second", 4.8))
+        chars_per_second = self._effective_chars_per_second()
 
         issues = []
         for script in voiceover_output.get("scripts") or []:
@@ -8041,14 +8214,15 @@ class PipelineRunner:
                     })
 
         if issues:
-            raise UserFacingPipelineError(
-                "voiceover_script_segment_duration_too_short",
-                user_message="配音文案生成失败：部分 shot 的文案明显短于画面目标时长。",
-                suggestions=[
-                    "从 voiceover_script 重跑，让模型按每个 shot 的 target 秒数补足文案。",
-                    "如果希望视频更短，请从 short_video_edit_plan 重跑，减少画面片段。",
-                ],
-                technical_detail={"issues": issues[:50]},
+            # 用户策略：AI 配音不强制写满、不强制目标时长，文案偏短不再阻断，
+            # 交由下游 compaction 把画面向配音收缩（短一点没关系）。仅记录警告。
+            print(
+                "配音文案分段偏短（AI 配音模式，仅警告不阻断，画面将向配音收缩）：\n"
+                + "\n".join(
+                    f"- {it['short_video_id']}/{it.get('shot_id')}: 约 {it['estimated_text_duration_seconds']}s"
+                    f" < 目标 {it['target_duration_seconds']}s × {it['min_ratio']}"
+                    for it in issues[:50]
+                )
             )
 
     def _validate_voiceover_script_duration_or_raise(self, voiceover_output: dict[str, Any]) -> None:
@@ -8096,10 +8270,18 @@ class PipelineRunner:
             )
 
         if hard_issues:
-            raise RuntimeError(
-                "AI voiceover script does not satisfy target duration requirements; blocked before TTS/cut/render:\n"
-                + "\n".join(f"- {issue}" for issue in hard_issues)
-            )
+            # 用户策略：AI 配音不强制写满、不强制目标时长。文案偏短只警告不阻断，
+            # 画面会向配音收缩；非 AI 配音模式仍按原逻辑阻断。
+            if getattr(self.options, "production_mode", "") == "ai_voiceover":
+                print(
+                    "配音文案时长偏短（AI 配音模式，仅警告不阻断，画面将向配音收缩）：\n"
+                    + "\n".join(f"- {issue}" for issue in hard_issues)
+                )
+            else:
+                raise RuntimeError(
+                    "AI voiceover script does not satisfy target duration requirements; blocked before TTS/cut/render:\n"
+                    + "\n".join(f"- {issue}" for issue in hard_issues)
+                )
 
     def _format_compact_duration_message(
         self,
@@ -8313,7 +8495,8 @@ class PipelineRunner:
                 "status": item_status,
                 "error": error,
                 "text_length": len(text),
-                "estimated_duration_seconds": round(len(text) / max(self.duration_settings.chars_per_second, 0.1), 3),
+                "narration_char_count": self._voiceover_text_chars(text),
+                "estimated_duration_seconds": round(self._voiceover_text_chars(text) / max(self._effective_chars_per_second(), 0.1), 3),
                 "actual_duration_seconds": 0.0,
                 "sample_rate": 24000,
                 "voice_file_exists": out.exists(),
@@ -8329,16 +8512,32 @@ class PipelineRunner:
             elif result is not None:
                 output_item.update(result.to_dict())
                 output_item["file"] = relpath(out, self.task_dir)
+            # 估算时长统一用真实播报速率口径，避免被 TTS 库默认值（4.2）覆盖。
+            output_item["estimated_duration_seconds"] = round(
+                self._voiceover_text_chars(text) / max(self._effective_chars_per_second(), 0.1), 3
+            )
             outputs.append(output_item)
             step_status = self._base_status("tts", version, stable_hash({"sid": sid, "text": text}), [out] if out.exists() else [])
             step_status.update({"status": item_status, "error": error})
             self._write_status(vdir, step_status)
         release_omnivoice_models()
+        calibration = self._measure_tts_chars_per_second(outputs)
+        if calibration:
+            calibration["voice_id"] = voice_config.get("voice_id", "")
+            calibration["speed"] = voice_config.get("speed")
+            calibration["measured_at"] = now_iso()
+            self.manifest["tts_calibration"] = calibration
+            self._save_manifest()
+            print(
+                f"TTS 语速校准: {calibration['chars_per_second']:.2f} 字/秒"
+                f"（样本 {calibration['sample_count']} 段，重跑配音预算时将据此调整）"
+            )
         out_index = write_json(base_dir / "tts_outputs.json", {
             "version": version,
             "outputs": outputs,
             "voice_id": voice_config.get("voice_id", ""),
             "voice_name": voice_config.get("voice_name", ""),
+            "tts_calibration": calibration or {},
         })
         reconcile = self._build_tts_duration_reconcile(editing, voiceover, {"outputs": outputs})
         expected_tts_segments = self._expected_tts_segment_keys() if tts_is_hard_required else set()
@@ -9312,9 +9511,14 @@ class PipelineRunner:
             if duration > remain:
                 source_start = timecode_to_seconds(new_clip.get("source_start"))
                 new_duration = max(0.1, remain)
-                new_clip["source_end"] = seconds_to_timecode(source_start + new_duration, ms=True)
+                source_end = source_start + new_duration
+                new_clip["source_end"] = seconds_to_timecode(source_end, ms=True)
                 new_clip["duration_seconds"] = round(new_duration, 3)
                 new_clip["target_end_seconds"] = round(cursor + new_duration, 3)
+                # 同步 local_*（渲染按 local 裁源视频），避免裁切后画面仍按原长。
+                new_clip["source_end_seconds"] = round(source_end, 3)
+                new_clip["local_end_seconds"] = round(source_end, 3)
+                new_clip["local_end"] = seconds_to_timecode(source_end, ms=True)
                 cut_tail_seconds += duration - new_duration
                 duration = new_duration
             else:
@@ -9369,6 +9573,7 @@ class PipelineRunner:
         voice_by_id = {x.get("short_video_id"): x for x in voiceover_script.get("scripts", []) if isinstance(x, dict)}
         output_videos = []
         source_duration = self._current_source_duration_seconds()
+        source_shot_index = self._source_shot_index() if self.options.production_mode == "ai_voiceover" else {}
         for script in editing.get("scripts", []):
             sid = script.get("short_video_id") or f"SV{len(output_videos)+1:03d}"
             clips = []
@@ -9515,11 +9720,16 @@ class PipelineRunner:
                     repair_reasons.append(warning_reason)
                     warnings.append(warning_reason)
                 if block_reason and self.options.audio_policy != "original":
-                    raise RuntimeError(
-                        "最终成片时长未达到目标要求，已停止渲染。\n"
-                        + block_reason
-                        + "\n建议：重新运行“生成配音文案”，让 AI 配音稿更完整；如果素材信息不足，请合并更多片段或降低目标时长。"
-                    )
+                    # 用户策略：不强制目标时长，成片偏短不阻断渲染，仅警告（画面已向配音收缩）。
+                    if self.options.production_mode == "ai_voiceover":
+                        repair_reasons.append("compact_below_target_warning_only")
+                        warnings.append(block_reason)
+                    else:
+                        raise RuntimeError(
+                            "最终成片时长未达到目标要求，已停止渲染。\n"
+                            + block_reason
+                            + "\n建议：重新运行“生成配音文案”，让 AI 配音稿更完整；如果素材信息不足，请合并更多片段或降低目标时长。"
+                        )
             auto_extended_seconds = 0.0
             if self.options.audio_policy != "original" and tts_success and voiceover_duration > video_duration + 1.0:
                 needed = round(voiceover_duration - video_duration, 3)
@@ -9533,13 +9743,21 @@ class PipelineRunner:
                             available = min(available, max(0.0, source_duration - current_end))
                         if available <= 0:
                             continue
-                        clip["source_end"] = seconds_to_timecode(current_end + available, ms=True)
+                        new_source_end = current_end + available
+                        clip["source_end"] = seconds_to_timecode(new_source_end, ms=True)
                         clip["duration_seconds"] = round(float(clip.get("duration_seconds") or 0) + available, 3)
+                        clip["source_end_seconds"] = round(new_source_end, 3)
+                        clip["local_end_seconds"] = round(new_source_end, 3)
+                        clip["local_end"] = seconds_to_timecode(new_source_end, ms=True)
                         clip["auto_extended_for_voiceover_seconds"] = round(available, 3)
                         target += available
                         auto_extended_seconds = round(available, 3)
                         break
                     video_duration = round(target, 3)
+            # L3：开头是主持人/演播室的镜头，把源窗口平移到现场画面(保持时长与时间轴位置不变)，
+            # 解决"配音说现场、画面却是主持人"。
+            if self.options.production_mode == "ai_voiceover" and clips:
+                clips = self._repoint_ai_voiceover_clips_to_scene(clips, source_shot_index)
             evidence_audio_checks_enabled = should_build_evidence_audio_windows(
                 audio_policy=self.options.audio_policy,
                 settings=self.duration_settings,
@@ -9795,6 +10013,15 @@ class PipelineRunner:
             new_clip["target_end_seconds"] = round(cursor + duration, 3)
             new_clip["source_end"] = seconds_to_timecode(source_end, ms=True)
             new_clip["duration_seconds"] = round(duration, 3)
+            # 关键：渲染按 local_start/local_end 裁源视频，压缩后必须同步这些字段，
+            # 否则画面会按压缩前的原长裁切，导致画面比配音长、逐镜头累积错位。
+            new_clip["source_start"] = seconds_to_timecode(source_start, ms=True)
+            new_clip["source_start_seconds"] = round(source_start, 3)
+            new_clip["source_end_seconds"] = round(source_end, 3)
+            new_clip["local_start_seconds"] = round(source_start, 3)
+            new_clip["local_end_seconds"] = round(source_end, 3)
+            new_clip["local_start"] = seconds_to_timecode(source_start, ms=True)
+            new_clip["local_end"] = seconds_to_timecode(source_end, ms=True)
             new_clip["compact_voiceover_timed"] = True
             new_clip["compact_voiceover_duration_reason"] = duration_reason
             new_clip["tts_actual_duration_seconds"] = round(float(segment.get("actual_duration_seconds") or 0), 3)
@@ -9828,6 +10055,119 @@ class PipelineRunner:
         if actual < min_d:
             return min_d, "tts_too_short_clamped"
         return max_d, "tts_too_long_clamped"
+
+    def _source_shot_index(self) -> dict[str, list[dict[str, Any]]]:
+        """按 source_id 汇总逐帧镜头类型(本地秒, 升序)，供选片/裁切判断主持人 vs 现场。
+
+        数据来自 vision 逐帧输出(frame_shots)，经 timeline_digest / source_aggregate 透传。
+        """
+        index: dict[str, list[dict[str, Any]]] = {}
+        digest = self._load_current_timeline_digest()
+        for chunk in digest.get("chunks", []) or []:
+            if not isinstance(chunk, dict):
+                continue
+            sid = str(chunk.get("source_id") or "")
+            for fr in chunk.get("frame_shots") or []:
+                if not isinstance(fr, dict):
+                    continue
+                index.setdefault(sid, []).append({
+                    "t": self._safe_float(fr.get("t"), 0.0),
+                    "shot_type": str(fr.get("shot_type") or ""),
+                })
+        for sid in index:
+            index[sid].sort(key=lambda item: item["t"])
+        return index
+
+    def _repoint_ai_voiceover_clips_to_scene(
+        self,
+        clips: list[dict[str, Any]],
+        shot_index: dict[str, list[dict[str, Any]]],
+    ) -> list[dict[str, Any]]:
+        """AI 配音镜头：把源窗口移到"现场画面"，避免整段都是主持人。
+
+        新闻语法是"主持人念导语 → 切现场画面/人物讲话"，而候选窗口常卡在导语
+        (主持人)上。AI 配音是 TTS、画面可自由取材，所以在原窗口"主要向后、允许
+        小幅回看"的有界半径内，挑主持人帧最少、且离原位最近的等长窗口（向后偏置
+        贴合新闻语法，避免跳到上一条新闻）。只改用源的哪一段，时长与时间轴位置
+        不变，不影响音画对齐；窗口里已没有主持人帧的镜头不动。
+        """
+        anchor_types = {"主持人口播", "演播室", "片头包装"}
+
+        def anchor_scene_counts(
+            frames: list[dict[str, Any]], w_start: float, w_end: float
+        ) -> tuple[int, int]:
+            anchor = scene = 0
+            for fr in frames:
+                t = fr["t"]
+                if t < w_start - 0.001 or t > w_end + 0.001:
+                    continue
+                shot = fr["shot_type"]
+                if not shot:
+                    continue
+                if shot in anchor_types:
+                    anchor += 1
+                else:
+                    scene += 1
+            return anchor, scene
+
+        radius = self._safe_float(
+            getattr(self.duration_settings, "ai_voiceover_scene_search_radius_seconds", None),
+            45.0,
+        )
+        back_tolerance = 5.0
+        for clip in clips:
+            if clip.get("audio_mode") in {"original_sound", "mixed_evidence"}:
+                continue
+            sid = str(clip.get("source_id") or "")
+            frames = shot_index.get(sid) or []
+            if not frames:
+                continue
+            start = self._safe_float(
+                clip.get("local_start_seconds"),
+                default=self._safe_float(timecode_to_seconds(clip.get("source_start")), 0.0),
+            )
+            duration = self._safe_float(clip.get("duration_seconds"), 0.0)
+            if duration <= 0:
+                continue
+            cur_anchor, _ = anchor_scene_counts(frames, start, start + duration)
+            if cur_anchor <= 0:
+                continue  # 窗口里已没有主持人画面，保持不动
+            source_total = max((fr["t"] for fr in frames), default=start + duration)
+            max_start = max(0.0, source_total - duration)
+            lo = max(0.0, start - back_tolerance)
+            hi = min(max_start, start + radius)
+            cand_starts = sorted(
+                {fr["t"] for fr in frames if lo - 0.001 <= fr["t"] <= hi + 0.001} | {start}
+            )
+            best_start = start
+            best_key: tuple[int, float] = (cur_anchor, 0.0)  # (主持人帧数, 离原位距离)，越小越好
+            for cand in cand_starts:
+                cand = min(max(0.0, cand), max_start)
+                anchor, _ = anchor_scene_counts(frames, cand, cand + duration)
+                key = (anchor, abs(cand - start))
+                if key < best_key:
+                    best_key = key
+                    best_start = cand
+            if best_key[0] >= cur_anchor or abs(best_start - start) <= 0.05:
+                continue  # 找不到主持人更少的窗口就不动
+            new_start = round(best_start, 3)
+            new_end = round(new_start + duration, 3)
+            clip["source_start"] = seconds_to_timecode(new_start, ms=True)
+            clip["source_end"] = seconds_to_timecode(new_end, ms=True)
+            clip["source_start_seconds"] = new_start
+            clip["source_end_seconds"] = new_end
+            clip["local_start_seconds"] = new_start
+            clip["local_end_seconds"] = new_end
+            clip["local_start"] = seconds_to_timecode(new_start, ms=True)
+            clip["local_end"] = seconds_to_timecode(new_end, ms=True)
+            clip["source_max_end_seconds"] = round(
+                max(self._safe_float(clip.get("source_max_end_seconds"), 0.0), new_end), 3
+            )
+            clip["scene_repointed"] = True
+            clip["scene_repoint_skipped_seconds"] = round(new_start - start, 3)
+            clip["scene_repoint_anchor_frames_before"] = cur_anchor
+            clip["scene_repoint_anchor_frames_after"] = best_key[0]
+        return clips
 
     def step_reassembly_cut_plan(self) -> None:
         plan = self._load_step_json("highlight_reassembly_plan")
@@ -10293,6 +10633,48 @@ class PipelineRunner:
         print(f"completed: reassembly_render ({status})")
         if status == "failed":
             raise RuntimeError("reassembly_render has no available videos")
+
+    def step_reassembly_commentary(self) -> None:
+        """渲染后用逐段语音文本预生成图文解说。尽力而为：任何失败都不拖垮已渲染成片。"""
+        cmt_cfg = self.config.raw.get("commentary", {}) if hasattr(self, "config") else {}
+        if not cmt_cfg.get("enabled", True) or not cmt_cfg.get("generate_in_pipeline", True):
+            self._mark_skipped("reassembly_commentary", "disabled")
+            return
+        try:
+            input_hash = stable_hash({
+                "reassembly_render": self._step_content_hash("reassembly_render"),
+                "reassembly_cut_plan": self._step_content_hash("reassembly_cut_plan"),
+                "video_understanding": self._step_content_hash("video_understanding"),
+                "candidate_filter": self._step_content_hash("candidate_filter"),
+                "commentary_cfg": cmt_cfg,
+                "prompt_versions": [commentary.COMMENTARY_VERSION],
+            })
+            if self._can_reuse("reassembly_commentary", input_hash):
+                print("reuse cache: reassembly_commentary")
+                return
+            index_path, index = commentary.generate_for_task(self.config, self.task_dir)
+            status = "success" if index.get("outputs") else ("partial_success" if index.get("skipped") else "success")
+            self._write_status(
+                index_path.parent,
+                {
+                    **self._base_status("reassembly_commentary", index.get("version", ""), input_hash, [index_path]),
+                    "status": status,
+                    "skipped": index.get("skipped", []),
+                },
+            )
+            self._record_step(
+                step="reassembly_commentary",
+                version=index.get("version", ""),
+                status=status,
+                output=relpath(index_path, self.task_dir),
+                input_hash=input_hash,
+                output_files=[index_path],
+                extra={"skipped": index.get("skipped", [])} if index.get("skipped") else None,
+            )
+            print(f"completed: reassembly_commentary ({status}, {len(index.get('outputs', []))} videos)")
+        except Exception as exc:  # noqa: BLE001 - 解说失败不致命，仅记为 skipped 不中断任务
+            print(f"reassembly_commentary skipped due to error: {exc}")
+            self._mark_skipped("reassembly_commentary", f"error:{exc}")
 
     def _normalize_reassembly_clip_to_source_boundaries(
         self,
@@ -10842,6 +11224,7 @@ class PipelineRunner:
         start: float,
         end: float,
         index_start: int,
+        respect_max_cue: bool = True,
     ) -> tuple[list[str], int]:
         if not chunks or end <= start:
             return [], index_start
@@ -10850,7 +11233,9 @@ class PipelineRunner:
         weights = [max(1, len(chunk)) for chunk in chunks]
         weight_total = max(1, sum(weights))
         min_cue = max(0.1, self._subtitle_min_cue_seconds())
-        max_cue = max(min_cue, self._subtitle_max_cue_seconds())
+        # 跟随真实/分段配音时，字幕窗口就是这段语音的实际时长，应按字数比例铺满整段；
+        # 此时不能再用 max_cue 上限截断长句——否则长句字幕被提前收掉，后续字幕整段领先音频。
+        max_cue = max(min_cue, self._subtitle_max_cue_seconds()) if respect_max_cue else float("inf")
         blocks: list[str] = []
         cursor = start
         index = index_start
@@ -10885,7 +11270,7 @@ class PipelineRunner:
             end = float(total_duration)
         else:
             total_chars = sum(max(1, len(chunk)) for chunk in chunks)
-            end = max(2.0, total_chars / max(self.duration_settings.chars_per_second, 0.1))
+            end = max(2.0, total_chars / max(self._effective_chars_per_second(), 0.1))
         blocks, _ = self._subtitle_chunks_to_srt_blocks(chunks=chunks, start=0.0, end=end, index_start=1)
         return "\n".join(blocks)
 
@@ -10913,6 +11298,7 @@ class PipelineRunner:
                 start=start,
                 end=end,
                 index_start=index,
+                respect_max_cue=False,
             )
             blocks.extend(new_blocks)
         return "\n".join(blocks)
@@ -10941,6 +11327,7 @@ class PipelineRunner:
                 start=start,
                 end=end,
                 index_start=index,
+                respect_max_cue=False,
             )
             blocks.extend(new_blocks)
         return "\n".join(blocks)

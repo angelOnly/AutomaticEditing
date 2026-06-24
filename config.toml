@@ -33,6 +33,13 @@ text_doubao_fallback_models = ["ep-20260604155430-pt5bq"]
 text_doubao_api_key = "bdddff7f-5bf7-4502-a976-418036e15591"
 text_doubao_base_url = "https://ark.cn-beijing.volces.com/api/v3"
 
+# DeepSeek 文本大模型（腾讯 tokenhub，OpenAI 兼容，纯文本、更便宜）
+# 目前仅图文解说[commentary]在用；如需全局切换，设 text_llm_provider = "deepseek"
+text_deepseek_model_name = "ep-uk0h8uil"
+text_deepseek_fallback_models = []
+text_deepseek_api_key = "sk-WD2338WbHuLFQz1OfhBFiC66zoylD4U4A5RcXp4eRDXIwnAE"
+text_deepseek_base_url = "https://tokenhub.tencentmaas.com/v1"
+
 
 # 文字转语言
 [omnivoice]
@@ -212,6 +219,30 @@ repair_on_script_duration_issues = true
 script_estimated_soft_min_ratio = 0.85
 script_estimated_hard_min_ratio = 0.65
 
+# 图文解说：重组成片渲染后，用逐段语音文本生成新闻解说并把成片单点嵌入正文
+[commentary]
+enabled = true
+# 用哪个文本 provider 生成解说：deepseek / doubao / openai；留空则回退全局 text_llm_provider
+provider = "deepseek"
+# 覆盖模型名；留空则用 text_{provider}_model_name
+model = ""
+temperature = 0.4
+# 注意：deepseek-v4-pro 是"思考型"模型，会先消耗大量 reasoning tokens 再产出正文，
+# max_tokens 必须给足(思考+正文)，否则整段预算被思考吃光、正文被截断为空。按实际用量计费。
+max_tokens = 8000
+# 正文段数区间（调大以产出更充实的解说）
+min_paragraphs = 4
+max_paragraphs = 6
+title_max_chars = 24
+# 每个分镜喂给大模型的 speech 截断长度，以及单次输入总字数上限
+max_speech_chars_per_clip = 600
+max_total_input_chars = 9000
+# 排版判断要稳定，温度用 0；思考型模型同样要给足 token，否则排版结果拿不到只能回退首段
+layout_temperature = 0.0
+layout_max_tokens = 4000
+# 重组渲染后是否在流水线里自动预生成（关掉则只能点按钮按需生成）
+generate_in_pipeline = true
+
 [short_video]
 default_target_seconds = 30
 quick_news_min_seconds = 20
@@ -235,6 +266,9 @@ char_budget_hard_tolerance_ratio = 0.25
 char_budget_under_soft_tolerance_chars = 3
 char_budget_under_soft_tolerance_ratio = 0.12
 char_budget_under_hard_tolerance_ratio = 0.25
+# 说明：文案字数预算的真实播报速率统一由 tts_actual_chars_per_second（实测先验，
+# 会被每轮 TTS 实测自动校准）接管。下面的 voiceover_chars_per_second 仅作为
+# min/max 相对带宽的参考中心；chars_per_second 为历史兜底，正常不再主导预算。
 chars_per_second = 4.2
 default_target_duration_seconds = 60
 voiceover_chars_per_second = 4.8
@@ -273,6 +307,9 @@ inter_sentence_gap_seconds = 0.28
 max_inter_sentence_gap_seconds = 0.8
 max_total_silence_ratio = 0.15
 subtitle_follow_actual_tts = true
+# 真实 TTS 播报速率先验（字/秒）。文案字数预算与时长估算的统一口径；每轮 TTS
+# 结束后会用实测值（实际秒数/实际字数）写回 manifest.tts_calibration 自动校准，
+# 重跑时优先采用校准值，从源头消除“按 4.8 估、实读约 5.x”的系统性偏短。
 tts_actual_chars_per_second = 5.2
 compact_min_target_ratio = 0.65
 compact_duration_tolerance_seconds = 1.0

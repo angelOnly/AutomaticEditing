@@ -51,6 +51,7 @@ const HIGHLIGHT_REASSEMBLY_STEPS = [
   "highlight_reassembly_plan",
   "reassembly_cut_plan",
   "reassembly_render",
+  "reassembly_commentary",
 ];
 
 const UNIFIED_HIGHLIGHT_REASSEMBLY_STEPS = [
@@ -63,6 +64,7 @@ const UNIFIED_HIGHLIGHT_REASSEMBLY_STEPS = [
   "highlight_reassembly_plan",
   "reassembly_cut_plan",
   "reassembly_render",
+  "reassembly_commentary",
 ];
 
 let STEPS = AI_VOICEOVER_STEPS;
@@ -100,6 +102,7 @@ const STEP_LABELS = {
   highlight_reassembly_plan: "规划高光重组",
   reassembly_cut_plan: "生成重组剪辑计划",
   reassembly_render: "渲染原声重组视频",
+  reassembly_commentary: "生成图文解说",
 };
 
 const STATUS_LABELS = {
@@ -137,6 +140,8 @@ const state = {
   latestDraft: null,
   drafts: [],
   previewRequestId: 0,
+  activeSourceItem: null,
+  sourceRecoveryTried: false,
   remoteVideos: [],
   remotePagination: { current: 1, pageSize: 10, total: 0 },
   remotePage: 1,
@@ -464,6 +469,17 @@ function bindEvents() {
     else renderDraftList();
   });
   $("confirmLongVideo").addEventListener("click", confirmLongVideo);
+  $("generateCommentary")?.addEventListener("click", () => openCommentary());
+  $("commentaryRegen")?.addEventListener("click", () => openCommentary({ refresh: true }));
+  $("commentaryCopy")?.addEventListener("click", copyCommentaryMarkdown);
+  document.querySelectorAll("[data-commentary-close]").forEach((el) => {
+    el.addEventListener("click", closeCommentaryModal);
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && !$("commentaryModal")?.classList.contains("hidden")) {
+      closeCommentaryModal();
+    }
+  });
 }
 
 function fillStepSelect() {
@@ -1270,6 +1286,7 @@ async function loadLatestDraft(taskId, options = {}) {
   if (updatePreview && !isCurrentPreviewRequest(requestId)) return;
   state.drafts = drafts;
   state.latestDraft = drafts[0] || { exists: false, file: "", url: "" };
+  syncCommentaryButton();
   if (state.previewMode !== "draft" || (!force && (state.previewIntent === "basket" || state.previewIntent === "user-source"))) return;
   renderDraftList();
   if (!updatePreview) return;
@@ -1334,16 +1351,38 @@ function setVideoPreviewSource(url, options = {}) {
   video.load();
 }
 
+async function recoverSourcePreviewFromLocal() {
+  // When a 原片 preview fails (typically an expired remote signed URL), re-fetch
+  // the source list once: the background download may have finished, so the
+  // backend now returns a durable local URL. Guarded to run at most once per play.
+  if (state.previewMode !== "source" || !state.selectedTask || state.sourceRecoveryTried) return false;
+  const cur = state.activeSourceItem;
+  if (!cur) return false;
+  state.sourceRecoveryTried = true;
+  const sources = await api(`/api/tasks/${state.selectedTask}/source-videos`).catch(() => []);
+  if (!sources.length) return false;
+  const items = renderSourceVideoList(sources);
+  const target =
+    items.find((s) => String(s.source_index) === String(cur.source_index)) || items[0];
+  if (!target) return false;
+  const nextUrl = target.local_url || target.url;
+  if (!nextUrl || nextUrl === cur.url) return false;
+  playSourceItem({ ...target, url: nextUrl });
+  return true;
+}
+
 function bindVideoPreviewErrors() {
   const video = $("videoPreview");
   const viewer = $("fileViewer");
   if (!video || !viewer) return;
 
-  video.addEventListener("error", () => {
+  video.addEventListener("error", async () => {
+    if (await recoverSourcePreviewFromLocal()) return;
     const code = video.error?.code || "";
     viewer.textContent = [
       "原片预览失败。",
       "可能原因：视频地址不可访问、远程素材链接过期、浏览器不支持该编码，或文件路径异常。",
+      "若远程素材正在后台下载，可稍等片刻后重新点击「原片」。",
       `错误码：${code || "-"}`,
     ].join("\n");
   });
@@ -1358,6 +1397,7 @@ function updatePreviewListTitle() {
 async function playSourceVideo(options = {}) {
   const { preferredIndex = null } = options;
   const requestId = beginPreviewRequest();
+  state.sourceRecoveryTried = false;
   setPreviewMode("source");
   if (state.sourceBasket.length) {
     const sources = state.sourceBasket.map(sourceBasketPreviewItem);
@@ -1464,6 +1504,7 @@ function playSourceItem(source, requestId = beginPreviewRequest()) {
     $("fileViewer").textContent = "该原片没有可预览地址。";
     return;
   }
+  state.activeSourceItem = source;
   setPreviewMode("source");
   setVideoPreviewSource(source.url);
   $("fileViewer").textContent = `正在预览原片：\n${source.label || source.file}`;
@@ -1500,12 +1541,157 @@ function playDraft(draft, requestId = beginPreviewRequest()) {
   if (!draft?.url) return;
   if (!isCurrentPreviewRequest(requestId)) return;
   setPreviewMode("draft");
+  state.activeDraftFile = draft.file;
   setVideoPreviewSource(draft.url, { cacheBust: true });
   $("fileViewer").textContent = `正在预览粗剪成片：\n${draft.file}`;
   document.querySelectorAll(".draft-item").forEach((item) => {
     const current = state.drafts[Number(item.dataset.index)];
     item.classList.toggle("active", current?.file === draft.file);
   });
+  syncCommentaryButton();
+}
+
+// ---------------------------------------------------------------------------
+// 图文解说（commentary）：重组任务专属，点开弹窗预览预生成的标题/正文/单点嵌入成片
+// ---------------------------------------------------------------------------
+function currentTaskMode() {
+  const m = state.manifest;
+  return (
+    m?.production_mode ||
+    m?.last_web_run_options?.production_mode ||
+    m?.last_run_options?.production_mode ||
+    ""
+  );
+}
+
+function syncCommentaryButton() {
+  const btn = $("generateCommentary");
+  if (!btn) return;
+  const isReassembly = currentTaskMode() === "highlight_reassembly";
+  const hasDraft = Array.isArray(state.drafts) && state.drafts.length > 0;
+  btn.classList.toggle("hidden", !(isReassembly && hasDraft && state.selectedTask));
+}
+
+function ridFromDraftFile(file) {
+  const byFolder = /reassembly_drafts\/v\d+\/([^/]+)\/highlight_reassembly_/.exec(file || "");
+  if (byFolder) return byFolder[1];
+  const byName = /highlight_reassembly_([A-Za-z0-9_]+?)_draft/.exec(file || "");
+  return byName ? byName[1] : "";
+}
+
+function currentDraftRid() {
+  const file = state.activeDraftFile || state.drafts?.[0]?.file || "";
+  return ridFromDraftFile(file);
+}
+
+async function openCommentary(options = {}) {
+  const { refresh = false } = options;
+  if (!state.selectedTask) return;
+  const rid = currentDraftRid();
+  showCommentaryModal();
+  setCommentaryMessage(refresh ? "正在重新生成图文解说……" : "正在生成图文解说……");
+  $("commentaryRegen")?.setAttribute("disabled", "disabled");
+  try {
+    const qs = new URLSearchParams();
+    if (rid) qs.set("reassembly_id", rid);
+    if (refresh) qs.set("refresh", "1");
+    const data = await api(`/api/tasks/${encodeURIComponent(state.selectedTask)}/commentary?${qs.toString()}`);
+    state.commentary = data;
+    renderCommentaryBody(data);
+  } catch (error) {
+    state.commentary = null;
+    setCommentaryMessage(`生成失败：${cleanError(error)}\n可点「重新生成」重试。`, true);
+  } finally {
+    $("commentaryRegen")?.removeAttribute("disabled");
+  }
+}
+
+function renderCommentaryBody(data) {
+  const body = $("commentaryBody");
+  if (!body) return;
+  body.innerHTML = "";
+  body.classList.remove("commentary-message");
+
+  const title = document.createElement("h1");
+  title.className = "commentary-title";
+  title.textContent = data.title || "图文解说";
+  body.appendChild(title);
+
+  const paragraphs = Array.isArray(data.paragraphs) ? data.paragraphs : [];
+  const idx = Number.isInteger(data.insert_after_index) ? data.insert_after_index : 0;
+  const makeVideo = () => {
+    const url = data.video?.url;
+    if (!url) return null;
+    const wrap = document.createElement("div");
+    wrap.className = "commentary-video";
+    const video = document.createElement("video");
+    video.controls = true;
+    video.src = url;
+    wrap.appendChild(video);
+    return wrap;
+  };
+
+  if (!paragraphs.length) {
+    const video = makeVideo();
+    if (video) body.appendChild(video);
+  }
+  paragraphs.forEach((text, i) => {
+    const p = document.createElement("p");
+    p.textContent = text;
+    body.appendChild(p);
+    if (i === idx) {
+      const video = makeVideo();
+      if (video) body.appendChild(video);
+    }
+  });
+
+  if (Array.isArray(data.warnings) && data.warnings.length) {
+    const note = document.createElement("div");
+    note.className = "commentary-warn";
+    note.textContent = `提示：${data.warnings.join("、")}`;
+    body.appendChild(note);
+  }
+}
+
+function setCommentaryMessage(text, isError = false) {
+  const body = $("commentaryBody");
+  if (!body) return;
+  body.classList.add("commentary-message");
+  body.innerHTML = "";
+  const div = document.createElement("div");
+  div.className = isError ? "commentary-error" : "commentary-loading";
+  div.textContent = text;
+  body.appendChild(div);
+}
+
+function showCommentaryModal() {
+  $("commentaryModal")?.classList.remove("hidden");
+}
+
+function closeCommentaryModal() {
+  const video = $("commentaryBody")?.querySelector("video");
+  if (video) video.pause();
+  $("commentaryModal")?.classList.add("hidden");
+}
+
+async function copyCommentaryMarkdown() {
+  const markdown = state.commentary?.markdown;
+  if (!markdown) {
+    alert("当前没有可复制的图文解说。");
+    return;
+  }
+  try {
+    await navigator.clipboard.writeText(markdown);
+    const button = $("commentaryCopy");
+    const label = button?.querySelector("span");
+    if (label) {
+      const old = label.textContent;
+      label.textContent = "已复制";
+      setTimeout(() => (label.textContent = old), 1500);
+    }
+  } catch (error) {
+    alert(`复制失败：${cleanError(error)}`);
+  }
 }
 
 function restoreRunControls(manifest) {
@@ -2258,6 +2444,8 @@ function clearTaskPanels(options = {}) {
   $("fileViewer").textContent = "选择左侧任务或文件后显示内容。";
   state.latestDraft = null;
   state.drafts = [];
+  state.activeDraftFile = null;
+  syncCommentaryButton();
   if (!keepPreview) {
     state.previewMode = "draft";
     state.previewIntent = "auto";

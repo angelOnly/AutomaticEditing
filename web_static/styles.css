@@ -1274,6 +1274,121 @@ select:focus {
   background: #fff7f6;
 }
 
+/* 图文解说按钮与弹窗 */
+.commentary-btn {
+  margin: 0 9px 10px;
+  width: calc(100% - 18px);
+  justify-content: center;
+}
+
+.commentary-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 1200;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.commentary-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.55);
+  backdrop-filter: blur(2px);
+}
+
+.commentary-card {
+  position: relative;
+  width: min(760px, 100%);
+  max-height: 86vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+  border-radius: var(--radius);
+  box-shadow: 0 24px 60px rgba(15, 23, 42, 0.35);
+  overflow: hidden;
+}
+
+.commentary-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--line);
+}
+
+.commentary-card-header h3 {
+  margin: 0;
+  font-size: 15px;
+  color: var(--text);
+}
+
+.commentary-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.commentary-body {
+  padding: 22px 28px 30px;
+  overflow: auto;
+}
+
+.commentary-title {
+  font-size: 22px;
+  line-height: 1.35;
+  font-weight: 700;
+  color: var(--text);
+  margin: 0 0 18px;
+}
+
+.commentary-body p {
+  font-size: 15px;
+  line-height: 1.9;
+  color: var(--text);
+  margin: 0 0 16px;
+}
+
+.commentary-video {
+  margin: 8px 0 18px;
+}
+
+.commentary-video video {
+  width: 100%;
+  border-radius: 12px;
+  background: #000;
+  display: block;
+}
+
+.commentary-warn {
+  margin-top: 12px;
+  padding: 8px 12px;
+  border-radius: 10px;
+  background: var(--orange-soft);
+  color: var(--orange);
+  font-size: 12px;
+}
+
+.commentary-message {
+  min-height: 160px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.commentary-loading,
+.commentary-error {
+  white-space: pre-line;
+  text-align: center;
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.commentary-error {
+  color: var(--brand);
+}
+
 .draft-item strong {
   overflow-wrap: anywhere;
   font-size: 12px;

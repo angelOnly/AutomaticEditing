@@ -29,11 +29,13 @@ from newsclip_agent.remote_ucms import (
     download_ucms_video,
     list_ucms_videos,
     load_remote_ucms_config,
+    remote_cache_path,
     public_config as remote_ucms_public_config,
 )
 from newsclip_agent.utils import ensure_dir, read_json, relpath, seconds_to_timecode, write_json
 from newsclip_agent.tts_omnivoice import generate_omnivoice_audio
 from newsclip_agent.job_store import JobStore
+from newsclip_agent import commentary
 
 
 ROOT = Path(__file__).resolve().parent
@@ -63,6 +65,11 @@ REMOTE_UCMS_CONFIG = load_remote_ucms_config(PROJECT_CONFIG)
 REMOTE_STATION_COUNTS: dict[str, int] = {}
 REMOTE_STATION_COUNT_ERRORS: dict[str, str] = {}
 REMOTE_STATION_COUNT_LOCK = RLock()
+# Background prefetch of remote sources into the shared download cache so 原片
+# preview can fall back to a local copy once the remote signed URL has expired.
+REMOTE_PREFETCH_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="remote-prefetch")
+REMOTE_PREFETCH_INFLIGHT: set[str] = set()
+REMOTE_PREFETCH_LOCK = RLock()
 WEB_CONCURRENCY = PROJECT_CONFIG.raw.get("web_concurrency", {})
 MAX_RUNNING_JOBS = int(os.environ.get("WEB_MAX_RUNNING_JOBS", WEB_CONCURRENCY.get("max_running_jobs", 2)))
 MAX_PENDING_JOBS = int(os.environ.get("WEB_MAX_PENDING_JOBS", WEB_CONCURRENCY.get("max_pending_jobs", 20)))
@@ -477,6 +484,66 @@ def download_remote_video(payload: dict[str, Any]) -> dict[str, Any]:
         )
     except Exception as exc:
         raise HTTPException(502, f"remote video download failed: {exc}") from exc
+
+
+def _remote_local_preview_url(remote_video: dict[str, Any]) -> str:
+    """Return a local preview URL when the remote source is already cached on disk, else ""."""
+    if not REMOTE_UCMS_CONFIG.enabled or not isinstance(remote_video, dict):
+        return ""
+    try:
+        cached = remote_cache_path(REMOTE_UCMS_CONFIG, remote_video)
+    except Exception:
+        return ""
+    try:
+        if cached.exists() and cached.is_file() and cached.stat().st_size > 0:
+            return f"/api/videos/preview?path={quote(relpath(cached, ROOT), safe='/')}"
+    except OSError:
+        return ""
+    return ""
+
+
+def _prefetch_remote_source(remote_video: dict[str, Any]) -> None:
+    """Best-effort background download of a single remote source into the shared cache."""
+    if not REMOTE_UCMS_CONFIG.enabled or not isinstance(remote_video, dict):
+        return
+    try:
+        key = str(remote_cache_path(REMOTE_UCMS_CONFIG, remote_video))
+    except Exception:
+        return
+    with REMOTE_PREFETCH_LOCK:
+        if key in REMOTE_PREFETCH_INFLIGHT:
+            return
+        try:
+            cached = Path(key)
+            if cached.exists() and cached.stat().st_size > 0:
+                return
+        except OSError:
+            pass
+        REMOTE_PREFETCH_INFLIGHT.add(key)
+
+    def _worker() -> None:
+        try:
+            download_ucms_video(REMOTE_UCMS_CONFIG, remote_video, root_dir=ROOT, force=False)
+        except Exception as exc:  # noqa: BLE001 - prefetch is best-effort
+            print(f"[remote-prefetch] download failed: {exc}", file=sys.stderr)
+        finally:
+            with REMOTE_PREFETCH_LOCK:
+                REMOTE_PREFETCH_INFLIGHT.discard(key)
+
+    REMOTE_PREFETCH_POOL.submit(_worker)
+
+
+def _prefetch_remote_sources(raw_source_items: list[dict[str, Any]]) -> None:
+    """Kick off background downloads for every remote item in a run request."""
+    for item in raw_source_items or []:
+        if not isinstance(item, dict):
+            continue
+        source_type = str(item.get("source_type") or item.get("type") or "local")
+        if source_type not in {"remote", "remote_ucms"}:
+            continue
+        remote_video = item.get("remote_video") or item
+        if isinstance(remote_video, dict):
+            _prefetch_remote_source(remote_video)
 
 
 def _refresh_remote_station_counts() -> None:
@@ -964,7 +1031,8 @@ def list_source_videos(task_id: str) -> list[dict[str, Any]]:
                 url = ""
         remote = item.get("remote_video") or item.get("remote") or {}
         if not url and isinstance(remote, dict):
-            url = (
+            # Prefer the cached local copy over the expiring remote signed URL.
+            url = _remote_local_preview_url(remote) or (
                 remote.get("preview_url")
                 or remote.get("media_low_url")
                 or remote.get("mediaLow")
@@ -1018,6 +1086,46 @@ def list_draft_videos(task_id: str) -> list[dict[str, Any]]:
     ]
 
 
+@app.get("/api/tasks/{task_id}/commentary")
+def get_task_commentary(task_id: str, reassembly_id: str | None = None, refresh: int = 0) -> dict[str, Any]:
+    task_dir = _task_dir(task_id)
+    manifest = read_json(task_dir / "manifest.json", {})
+    mode = (
+        manifest.get("production_mode")
+        or _task_id_production_mode(task_id)
+        or _manifest_production_mode(manifest)
+    )
+    if mode != "highlight_reassembly":
+        raise HTTPException(400, "该任务不是视频重组任务，没有图文解说")
+
+    rids = commentary.renderable_rids(task_dir, manifest)
+    if not rids:
+        raise HTTPException(404, "暂无可解说的成片，请先完成视频重组")
+    rid = reassembly_id or rids[0]
+    if rid not in rids:
+        raise HTTPException(404, f"找不到成片 {rid}")
+
+    artifact = None if refresh else commentary.load_latest_commentary(task_dir, rid)
+    if artifact is None:
+        try:
+            commentary.generate_for_task(PROJECT_CONFIG, task_dir, reassembly_id=rid)
+        except commentary.CommentaryError as exc:
+            raise HTTPException(503, str(exc))
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(503, f"图文解说生成失败：{exc}")
+        artifact = commentary.load_latest_commentary(task_dir, rid)
+    if artifact is None:
+        raise HTTPException(503, "图文解说生成失败，请稍后重试")
+
+    video_file = (artifact.get("video") or {}).get("file")
+    if video_file:
+        video_path = _safe_child(task_dir, video_file)
+        if video_path.exists() and video_path.is_file():
+            artifact.setdefault("video", {})["url"] = _task_file_url(task_id, task_dir, video_path)
+    artifact["available_reassembly_ids"] = rids
+    return artifact
+
+
 @app.post("/api/run")
 def run_pipeline(req: RunRequest) -> dict[str, Any]:
     _normalize_output_options(req)
@@ -1031,6 +1139,10 @@ def run_pipeline(req: RunRequest) -> dict[str, Any]:
         req.allow_original_audio_evidence = False
     _prepare_mode_switched_run(req)
     raw_source_items = _collect_source_items(req)
+    # Start downloading remote sources to the local cache immediately, while the
+    # remote signed URL is still fresh, so 原片 preview can fall back to the local
+    # copy after the URL expires. Reuses the same cache the run pipeline reads from.
+    _prefetch_remote_sources(raw_source_items)
     use_unified_source_pipeline = _use_unified_source_pipeline(PROJECT_CONFIG)
     should_use_source_request = bool(raw_source_items) and (
         use_unified_source_pipeline or len(raw_source_items) > 1
@@ -2080,14 +2192,20 @@ def _source_request_preview_items(task_dir: Path, task_id: str) -> list[dict[str
             remote = item.get("remote_video") or item
             if not isinstance(remote, dict):
                 continue
-            url = (
+            remote_url = (
                 remote.get("preview_url")
                 or remote.get("media_low_url")
                 or remote.get("mediaLow")
                 or remote.get("media_high_url")
                 or remote.get("mediaHigh")
                 or remote.get("download_url")
+                or ""
             )
+            # Prefer the locally cached copy: the remote signed URL expires, the
+            # local file does not. Remote URL is only used while the prefetch
+            # download is still in flight.
+            local_url = _remote_local_preview_url(remote)
+            url = local_url or remote_url
             if not url:
                 continue
             previews.append(
@@ -2099,6 +2217,8 @@ def _source_request_preview_items(task_dir: Path, task_id: str) -> list[dict[str
                     or f"远程素材 {index}",
                     "file": remote.get("name") or remote.get("remote_id") or remote.get("id") or "",
                     "url": url,
+                    "remote_url": remote_url,
+                    "local_url": local_url,
                     "source_index": index,
                     "source_type": "remote_ucms",
                 }

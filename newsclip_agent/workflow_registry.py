@@ -76,6 +76,7 @@ WORKFLOWS: dict[tuple[str, bool], list[str]] = {
         "news_quality_gate",
         "news_quality_ai_review",
         "reassembly_render",
+        "reassembly_commentary",
     ],
     ("ai_voiceover", True): [
         "source_prepare",
@@ -107,6 +108,7 @@ WORKFLOWS: dict[tuple[str, bool], list[str]] = {
         "news_quality_gate",
         "news_quality_ai_review",
         "reassembly_render",
+        "reassembly_commentary",
     ],
 }
 
@@ -148,6 +150,7 @@ DEPENDENCIES: dict[str, list[str]] = {
     "reassembly_cut_plan": ["highlight_reassembly_plan", "candidate_filter"],
     "render": ["cut_plan", "news_quality_gate", "news_quality_ai_review"],
     "reassembly_render": ["reassembly_cut_plan", "news_quality_gate", "news_quality_ai_review"],
+    "reassembly_commentary": ["reassembly_render"],
 }
 
 
