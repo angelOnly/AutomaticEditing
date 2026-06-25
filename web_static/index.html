@@ -173,6 +173,10 @@
                     <span>视频重组</span>
                     <small>保留原声，按新闻逻辑重组高光片段</small>
                   </button>
+                  <button class="mode-option" type="button" data-production-mode="full_concat">
+                    <span>完整版（去广告）</span>
+                    <small>多素材按时间戳排序，自动切掉广告拼成完整版</small>
+                  </button>
                 </div>
               </div>
 
@@ -186,6 +190,7 @@
                   <select id="productionMode">
                     <option value="ai_voiceover" selected>AI 配音解说视频</option>
                     <option value="highlight_reassembly">高光片段原声重组</option>
+                    <option value="full_concat">完整版（去广告拼接）</option>
                   </select>
                 </label>
                 <label class="visually-hidden-control">
@@ -322,6 +327,7 @@
                 <div id="previewListTitle" class="draft-title">成片列表</div>
                 <div id="draftList" class="draft-list">当前任务还没有生成粗剪视频。</div>
                 <button id="generateCommentary" class="button secondary commentary-btn hidden"><i data-lucide="newspaper"></i><span>图文解说</span></button>
+                <button id="showAdReport" class="button secondary commentary-btn hidden"><i data-lucide="scissors"></i><span>移除广告报告</span></button>
               </div>
             </section>
 

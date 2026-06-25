@@ -18,6 +18,7 @@ from .config import ProjectConfig, load_config
 from .llm import OpenAICompatibleClient
 from . import prompts
 from . import commentary
+from . import ad_detection
 from .duration_policy import (
     build_voiceover_timing_contract,
     clean_voiceover_text,
@@ -215,6 +216,9 @@ class PipelineRunner:
                 if self.options.only_analysis and step in {"reassembly_cut_plan", "reassembly_render"}:
                     self._mark_skipped(step, "only_analysis")
                     continue
+                if self.options.only_analysis and step in {"full_concat_plan", "full_concat_render"}:
+                    self._mark_skipped(step, "only_analysis")
+                    continue
                 if self.options.skip_tts and step == "tts":
                     self._mark_skipped(step, "skip_tts")
                     continue
@@ -222,6 +226,9 @@ class PipelineRunner:
                     self._mark_skipped(step, "skip_render")
                     continue
                 if self.options.skip_render and step == "reassembly_render":
+                    self._mark_skipped(step, "skip_render")
+                    continue
+                if self.options.skip_render and step == "full_concat_render":
                     self._mark_skipped(step, "skip_render")
                     continue
                 handler_name = f"step_{step}"
@@ -10676,6 +10683,147 @@ class PipelineRunner:
             print(f"reassembly_commentary skipped due to error: {exc}")
             self._mark_skipped("reassembly_commentary", f"error:{exc}")
 
+    # ------------------------------------------------------------------ #
+    # 完整版·去广告（full_concat）
+    # ------------------------------------------------------------------ #
+    def step_ad_detection(self) -> None:
+        cfg = ad_detection.load_cfg(self.config)
+        if not cfg.get("enabled", True):
+            self._mark_skipped("ad_detection", "disabled in config")
+            return
+        digest = self._load_current_timeline_digest()
+        chunks = digest.get("chunks", []) if isinstance(digest, dict) else []
+        input_hash = stable_hash({
+            "timeline_digest": self._current_timeline_digest_hash() or self._step_content_hash("timeline_digest"),
+            "ad_detection_cfg": cfg,
+            "prompt_version": ad_detection.PROMPT_VERSION,
+        })
+        if self._can_reuse("ad_detection", input_hash):
+            print("复用缓存: ad_detection")
+            return
+        version, vdir = self._version_dir("ad_detection", "edit/ad_detection")
+        ensure_dir(vdir)
+        llm_call = None
+        try:
+            llm_call = ad_detection.build_llm_call(self.config, cfg)
+        except Exception as exc:  # noqa: BLE001 - LLM 构造失败不致命，规则层照常出片
+            print(f"ad_detection: LLM 不可用，仅用规则层 ({exc})")
+        result = ad_detection.detect(chunks, cfg=cfg, llm_call=llm_call)
+        out = write_json(vdir / "ad_detection.json", {
+            "version": ad_detection.PROMPT_VERSION,
+            "production_mode": "full_concat",
+            "segments": result["segments"],
+            "blocks": result["blocks"],
+            "stats": result["stats"],
+        })
+        self._write_status(vdir, self._base_status("ad_detection", version, input_hash, [out]))
+        self._record_step(step="ad_detection", version=version, status="success", output=relpath(out, self.task_dir), input_hash=input_hash, output_files=[out], extra={"summary": result["stats"]})
+        stats = result["stats"]
+        print(f"完成: ad_detection (移除 {stats.get('removed_block_count', 0)} 个广告块 / {stats.get('removed_seconds', 0)}s)")
+
+    def step_full_concat_plan(self) -> None:
+        detection = self._load_step_json("ad_detection")
+        segments = detection.get("segments", []) if isinstance(detection, dict) else []
+        cfg = ad_detection.load_cfg(self.config)
+        input_hash = stable_hash({
+            "ad_detection": self._step_content_hash("ad_detection"),
+            "aspect": self.options.aspect_ratio,
+            "full_concat_cfg": {k: cfg[k] for k in ("safety_margin_seconds", "merge_gap_seconds", "min_clip_seconds")},
+        })
+        if self._can_reuse("full_concat_plan", input_hash):
+            print("复用缓存: full_concat_plan")
+            return
+        version, vdir = self._version_dir("full_concat_plan", "edit/full_concat_cut_plan")
+        ensure_dir(vdir)
+        if self._is_virtual_source_manifest():
+            source_order = ad_detection.order_sources_by_timestamp(self._iter_source_items())
+        else:
+            source_order = []
+            for seg in segments:
+                sid = str(seg.get("source_id") or "source_1")
+                if sid not in source_order:
+                    source_order.append(sid)
+            source_order = source_order or ["source_1"]
+        video = ad_detection.build_plan(
+            segments,
+            source_order=source_order,
+            aspect_ratio=self.options.aspect_ratio,
+            cfg=cfg,
+        )
+        out = write_json(vdir / "full_concat_cut_plan.json", {
+            "project_id": self.task_id,
+            "production_mode": "full_concat",
+            "source_video": self.manifest.get("source_video", ""),
+            "output_videos": [video],
+            "ad_stats": detection.get("stats", {}),
+            "removed_blocks": detection.get("blocks", []),
+        })
+        status = "success" if video.get("duration_status") != "blocked" else "failed"
+        status_doc = self._base_status("full_concat_plan", version, input_hash, [out])
+        status_doc["status"] = status
+        if status == "failed":
+            status_doc["user_error"] = {
+                "title": "生成完整版剪辑计划失败",
+                "message": "去掉广告后没有可用于拼接的新闻片段。",
+                "suggestions": ["检查素材是否几乎全是广告/宣传。", "放宽 ad_detection 配置（min_clip_seconds 等）后重跑。"],
+            }
+        self._write_status(vdir, status_doc)
+        self._record_step(step="full_concat_plan", version=version, status=status, output=relpath(out, self.task_dir), input_hash=input_hash, output_files=[out])
+        print(f"完成: full_concat_plan ({status}, {len(video.get('clips', []))} clips)")
+        if status == "failed":
+            raise UserFacingPipelineError(
+                "full_concat_plan_empty",
+                user_message="生成完整版失败：去掉广告后没有可用于拼接的新闻片段。",
+                suggestions=["检查素材是否几乎全是广告/宣传。", "放宽 ad_detection 配置后从广告检测重跑。"],
+                technical_detail={"blocked_reasons": video.get("blocked_reasons", [])},
+            )
+
+    def step_full_concat_render(self) -> None:
+        render_slots = int(self.config.raw.get("gpu_limits", {}).get("render_slots", 1))
+        with file_slot_lock("render", slots=render_slots):
+            self._step_full_concat_render_impl()
+
+    def _step_full_concat_render_impl(self) -> None:
+        plan = self._load_step_json("full_concat_plan")
+        input_hash = stable_hash({"full_concat_plan": self._step_content_hash("full_concat_plan")})
+        if self._can_reuse("full_concat_render", input_hash):
+            print("复用缓存: full_concat_render")
+            return
+        version, base_dir = self._version_dir("full_concat_render", "edit/full_concat_drafts")
+        outputs = []
+        skipped_outputs = []
+        for video in plan.get("output_videos", []):
+            rid = video.get("reassembly_id") or f"fc_{len(outputs) + 1:03d}"
+            if video.get("duration_status") == "blocked":
+                skipped_outputs.append({
+                    "reassembly_id": rid,
+                    "status": "skipped",
+                    "reason": "full_concat_plan_blocked",
+                    "blocked_reasons": video.get("blocked_reasons", []),
+                })
+                continue
+            vdir = ensure_dir(base_dir / rid)
+            out = vdir / video.get("output_file", f"full_concat_{rid}_draft.mp4")
+            self._render_reassembly_one(video, out)
+            quality_check = self._reassembly_quality_check(video, out)
+            write_json(vdir / "final_quality_check.json", quality_check)
+            self._write_status(vdir, {**self._base_status("full_concat_render", version, stable_hash(video), [out]), "quality_check": quality_check})
+            outputs.append({"reassembly_id": rid, "file": relpath(out, self.task_dir), "quality_check": quality_check})
+        out_index = write_json(base_dir / "full_concat_render_outputs.json", {
+            "version": version,
+            "outputs": outputs,
+            "skipped_outputs": skipped_outputs,
+            "ad_stats": plan.get("ad_stats", {}),
+            "removed_blocks": plan.get("removed_blocks", []),
+        })
+        status = "success" if outputs else "failed"
+        if skipped_outputs and outputs:
+            status = "partial_success"
+        self._record_step(step="full_concat_render", version=version, status=status, output=relpath(out_index, self.task_dir), input_hash=input_hash, output_files=[out_index], extra={"skipped_outputs": skipped_outputs} if skipped_outputs else None)
+        print(f"完成: full_concat_render ({status})")
+        if status == "failed":
+            raise RuntimeError("full_concat_render has no available videos")
+
     def _normalize_reassembly_clip_to_source_boundaries(
         self,
         clip: dict[str, Any],
@@ -11460,7 +11608,7 @@ def parse_args(argv: list[str] | None = None) -> RunOptions:
     parser.add_argument("--voice-id", help="选择服务端内置音色 ID")
     parser.add_argument("--audio-policy", choices=["ai_voiceover", "original", "mixed"], default="ai_voiceover")
     parser.add_argument("--allow-original-audio-evidence", action="store_true")
-    parser.add_argument("--production-mode", choices=["ai_voiceover", "highlight_reassembly"], default="ai_voiceover")
+    parser.add_argument("--production-mode", choices=["ai_voiceover", "highlight_reassembly", "full_concat"], default="ai_voiceover")
     parser.add_argument("--reassembly-output-mode", choices=["single", "multiple", "clips"], default="single")
     parser.add_argument("--reassembly-sort-mode", choices=["editorial", "source_order", "score"], default="editorial")
     parser.add_argument("--reassembly-target-seconds", type=int)
@@ -11479,6 +11627,12 @@ def parse_args(argv: list[str] | None = None) -> RunOptions:
         args.require_tts = False
         args.allow_original_audio_evidence = True
         args.reassembly_output_mode = "multiple" if args.output_mode == "multiple" else "single"
+    if args.production_mode == "full_concat":
+        # 完整版·去广告：保留原声、不配音
+        args.audio_policy = "original"
+        args.skip_tts = True
+        args.require_tts = False
+        args.allow_original_audio_evidence = True
     if args.skip_tts or args.audio_policy == "original":
         args.require_tts = False
     return RunOptions(**vars(args))

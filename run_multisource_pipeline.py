@@ -667,7 +667,12 @@ def _run_mode_specific_pipeline(
     request: dict[str, Any],
 ) -> int:
     production_mode = str(request.get("production_mode") or _production_mode_from_passthrough(passthrough) or "ai_voiceover")
-    start_step = "video_understanding" if production_mode == "highlight_reassembly" else "asr_micro_segment"
+    if production_mode == "highlight_reassembly":
+        start_step = "video_understanding"
+    elif production_mode == "full_concat":
+        start_step = "ad_detection"
+    else:
+        start_step = "asr_micro_segment"
     source_video = _try_resolve_task_manifest_path(task_dir, "source_video")
     source_manifest = _resolve_task_manifest_path(task_dir, "source_manifest")
     rerun = None

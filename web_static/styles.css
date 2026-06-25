@@ -1389,6 +1389,43 @@ select:focus {
   color: var(--brand);
 }
 
+.ad-report-summary {
+  color: var(--muted);
+  font-size: 13px;
+  margin-bottom: 12px;
+}
+
+.ad-report-list {
+  display: grid;
+  gap: 6px;
+}
+
+.ad-report-item {
+  display: grid;
+  grid-template-columns: minmax(150px, auto) 110px 1fr;
+  gap: 10px;
+  align-items: baseline;
+  padding: 8px 10px;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  border-radius: 10px;
+  font-size: 13px;
+}
+
+.ad-report-time {
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+}
+
+.ad-report-tag {
+  color: var(--brand);
+  font-weight: 600;
+}
+
+.ad-report-reason {
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
 .draft-item strong {
   overflow-wrap: anywhere;
   font-size: 12px;

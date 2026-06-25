@@ -1081,7 +1081,11 @@ def list_draft_videos(task_id: str) -> list[dict[str, Any]]:
             "file": relpath(path, task_dir),
             "url": _task_file_url(task_id, task_dir, path),
             "name": path.name,
-            "type": "highlight_reassembly_draft" if "reassembly_drafts" in path.parts else "ai_voiceover_draft",
+            "type": (
+                "full_concat_draft" if "full_concat_drafts" in path.parts
+                else "highlight_reassembly_draft" if "reassembly_drafts" in path.parts
+                else "ai_voiceover_draft"
+            ),
             "size_mb": round(path.stat().st_size / 1024 / 1024, 2),
             "updated_at": datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds"),
         }
@@ -1129,10 +1133,59 @@ def get_task_commentary(task_id: str, reassembly_id: str | None = None, refresh:
     return artifact
 
 
+@app.get("/api/tasks/{task_id}/ad-report")
+def get_task_ad_report(task_id: str) -> dict[str, Any]:
+    """完整版·去广告的移除报告：被切掉的广告块清单 + 统计 + 成片可播放地址。"""
+    task_dir = _task_dir(task_id)
+    manifest = read_json(task_dir / "manifest.json", {})
+    mode = (
+        manifest.get("production_mode")
+        or _task_id_production_mode(task_id)
+        or _manifest_production_mode(manifest)
+    )
+    if mode != "full_concat":
+        raise HTTPException(400, "该任务不是完整版去广告任务，没有广告报告")
+
+    steps = manifest.get("steps", {})
+    render_out = (steps.get("full_concat_render", {}) or {}).get("output")
+    data = read_json(task_dir / render_out, {}) if render_out else {}
+    if not data:
+        plan_out = (steps.get("full_concat_plan", {}) or {}).get("output")
+        plan = read_json(task_dir / plan_out, {}) if plan_out else {}
+        data = {
+            "outputs": [],
+            "removed_blocks": plan.get("removed_blocks", []),
+            "ad_stats": plan.get("ad_stats", {}),
+        }
+
+    videos = []
+    for item in data.get("outputs", []) or []:
+        file_rel = item.get("file")
+        url = None
+        if file_rel:
+            video_path = _safe_child(task_dir, file_rel)
+            if video_path.exists() and video_path.is_file():
+                url = _task_file_url(task_id, task_dir, video_path)
+        videos.append({
+            "reassembly_id": item.get("reassembly_id"),
+            "file": file_rel,
+            "url": url,
+            "quality_check": item.get("quality_check", {}),
+        })
+
+    return {
+        "task_id": task_id,
+        "production_mode": mode,
+        "stats": data.get("ad_stats", {}),
+        "removed_blocks": data.get("removed_blocks", []),
+        "videos": videos,
+    }
+
+
 @app.post("/api/run")
 def run_pipeline(req: RunRequest) -> dict[str, Any]:
     _normalize_output_options(req)
-    if req.production_mode == "highlight_reassembly":
+    if req.production_mode in {"highlight_reassembly", "full_concat"}:
         req.audio_policy = "original"
         req.require_tts = False
         req.skip_tts = True
@@ -1265,7 +1318,7 @@ def run_pipeline(req: RunRequest) -> dict[str, Any]:
         if active_count >= MAX_ACTIVE_JOBS:
             raise HTTPException(
                 429,
-                f"当前已有 {active_count} 个任务在排队/运行（上限 {MAX_ACTIVE_JOBS}），请等已有任务完成后再创建。",
+                f"同时最多只能处理 {MAX_ACTIVE_JOBS} 个视频，现在 {active_count} 个都在忙。等其中一个做完，再来试试吧～",
             )
         pending_count = sum(1 for job in JOBS.values() if job.get("status") == "pending")
         if pending_count >= MAX_PENDING_JOBS:
@@ -1846,7 +1899,8 @@ def _find_latest_draft_video(task_dir: Path) -> Path | None:
 def _list_draft_videos(task_dir: Path) -> list[Path]:
     render_indexes = sorted(
         list((task_dir / "edit" / "drafts").glob("v*/render_outputs.json"))
-        + list((task_dir / "edit" / "reassembly_drafts").glob("v*/reassembly_render_outputs.json")),
+        + list((task_dir / "edit" / "reassembly_drafts").glob("v*/reassembly_render_outputs.json"))
+        + list((task_dir / "edit" / "full_concat_drafts").glob("v*/full_concat_render_outputs.json")),
         key=lambda p: p.stat().st_mtime,
         reverse=True,
     )
@@ -1864,7 +1918,11 @@ def _list_draft_videos(task_dir: Path) -> list[Path]:
                 seen.add(path)
     candidates = [
         p
-        for root in [task_dir / "edit" / "drafts", task_dir / "edit" / "reassembly_drafts"]
+        for root in [
+            task_dir / "edit" / "drafts",
+            task_dir / "edit" / "reassembly_drafts",
+            task_dir / "edit" / "full_concat_drafts",
+        ]
         for p in root.rglob("*.mp4")
         if "_clips" not in p.parts and p.is_file()
     ]
@@ -1923,7 +1981,10 @@ def _is_task_already_completed(manifest: dict[str, Any], production_mode: str) -
     if not manifest:
         return False
     steps = manifest.get("steps", {})
-    final_step = "reassembly_render" if production_mode == "highlight_reassembly" else "render"
+    final_step = {
+        "highlight_reassembly": "reassembly_render",
+        "full_concat": "full_concat_render",
+    }.get(production_mode, "render")
     return steps.get(final_step, {}).get("status") in {"success", "partial_success"}
 
 
@@ -2305,6 +2366,8 @@ def _prepare_mode_switched_run(req: RunRequest) -> None:
 def _task_id_production_mode(task_id: str) -> str | None:
     if any(alias in task_id for alias in _mode_aliases("highlight_reassembly")):
         return "highlight_reassembly"
+    if any(alias in task_id for alias in _mode_aliases("full_concat")):
+        return "full_concat"
     if any(alias in task_id for alias in _mode_aliases("ai_voiceover")):
         return "ai_voiceover"
     return None
@@ -2313,7 +2376,7 @@ def _task_id_production_mode(task_id: str) -> str | None:
 def _manifest_production_mode(manifest: dict[str, Any]) -> str:
     for key in ("last_web_run_options", "last_run_options"):
         mode = (manifest.get(key) or {}).get("production_mode")
-        if mode in {"ai_voiceover", "highlight_reassembly"}:
+        if mode in {"ai_voiceover", "highlight_reassembly", "full_concat"}:
             return mode
     return "ai_voiceover"
 
@@ -2538,14 +2601,24 @@ def _with_mode_suffix(task_id: str, production_mode: str) -> str:
 
 
 def _mode_slug(production_mode: str) -> str:
-    return "视频重组" if production_mode == "highlight_reassembly" else "AI配音解说"
+    if production_mode == "highlight_reassembly":
+        return "视频重组"
+    if production_mode == "full_concat":
+        return "完整版"
+    return "AI配音解说"
 
 
 def _mode_aliases(production_mode: str) -> tuple[str, ...]:
     if production_mode == "highlight_reassembly":
         return ("highlight_reassembly", "视频重组")
+    if production_mode == "full_concat":
+        return ("full_concat", "完整版")
     return ("ai_voiceover", "AI配音解说")
 
 
 def _all_mode_aliases() -> tuple[str, ...]:
-    return _mode_aliases("ai_voiceover") + _mode_aliases("highlight_reassembly")
+    return (
+        _mode_aliases("ai_voiceover")
+        + _mode_aliases("highlight_reassembly")
+        + _mode_aliases("full_concat")
+    )

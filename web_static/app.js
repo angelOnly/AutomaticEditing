@@ -67,6 +67,30 @@ const UNIFIED_HIGHLIGHT_REASSEMBLY_STEPS = [
   "reassembly_commentary",
 ];
 
+const FULL_CONCAT_STEPS = [
+  "source_prepare",
+  "metadata",
+  "audio_extract",
+  "frame_extract",
+  "chunk_build",
+  "asr",
+  "vision",
+  "timeline",
+  "timeline_digest",
+  "ad_detection",
+  "full_concat_plan",
+  "full_concat_render",
+];
+
+const UNIFIED_FULL_CONCAT_STEPS = [
+  "source_prepare",
+  "source_analysis",
+  "source_aggregate",
+  "ad_detection",
+  "full_concat_plan",
+  "full_concat_render",
+];
+
 let STEPS = AI_VOICEOVER_STEPS;
 
 const STEP_LABELS = {
@@ -103,6 +127,9 @@ const STEP_LABELS = {
   reassembly_cut_plan: "生成重组剪辑计划",
   reassembly_render: "渲染原声重组视频",
   reassembly_commentary: "生成图文解说",
+  ad_detection: "识别并标记广告",
+  full_concat_plan: "生成完整版剪辑计划",
+  full_concat_render: "渲染完整版成片",
 };
 
 const STATUS_LABELS = {
@@ -120,6 +147,7 @@ const STATUS_LABELS = {
 const PRODUCTION_MODE_NAMES = {
   ai_voiceover: "AI配音解说",
   highlight_reassembly: "视频重组",
+  full_concat: "完整版（去广告）",
 };
 
 const AUTO_REFRESH_MS = 10 * 1000;
@@ -470,6 +498,7 @@ function bindEvents() {
   });
   $("confirmLongVideo").addEventListener("click", confirmLongVideo);
   $("generateCommentary")?.addEventListener("click", () => openCommentary());
+  $("showAdReport")?.addEventListener("click", () => openAdReport());
   $("commentaryRegen")?.addEventListener("click", () => openCommentary({ refresh: true }));
   $("commentaryCopy")?.addEventListener("click", copyCommentaryMarkdown);
   document.querySelectorAll("[data-commentary-close]").forEach((el) => {
@@ -500,13 +529,27 @@ function fillStepSelect() {
   updateChunkInputState();
 }
 
+function modeUsesOriginalAudio(mode) {
+  return mode === "highlight_reassembly" || mode === "full_concat";
+}
+
 function updateActiveSteps() {
-  STEPS = $("productionMode")?.value === "highlight_reassembly" ? UNIFIED_HIGHLIGHT_REASSEMBLY_STEPS : UNIFIED_AI_VOICEOVER_STEPS;
+  const mode = $("productionMode")?.value;
+  if (mode === "highlight_reassembly") {
+    STEPS = UNIFIED_HIGHLIGHT_REASSEMBLY_STEPS;
+  } else if (mode === "full_concat") {
+    STEPS = UNIFIED_FULL_CONCAT_STEPS;
+  } else {
+    STEPS = UNIFIED_AI_VOICEOVER_STEPS;
+  }
 }
 
 function onProductionModeChange() {
-  const isReassembly = $("productionMode").value === "highlight_reassembly";
+  const mode = $("productionMode").value;
+  const isReassembly = mode === "highlight_reassembly";
+  const isOriginalAudio = modeUsesOriginalAudio(mode);
   syncSuggestedTaskIdForMode();
+  // 重组专属控件（最短片段数）只在视频重组下显示，完整版不用
   ["reassemblyMaxClipCountWrap"].forEach((id) => {
     $(id)?.classList.toggle("hidden", !isReassembly);
   });
@@ -514,17 +557,17 @@ function onProductionModeChange() {
   $("reassemblySortModeWrap")?.classList.add("hidden");
   $("reassemblyOutputMode").value = $("outputMode")?.value === "multiple" ? "multiple" : "single";
   $("reassemblySortMode").value = "editorial";
-  $("audioPolicy").value = isReassembly ? "original" : "ai_voiceover";
-  $("requireTts").checked = !isReassembly && Boolean(state.defaults.tts_required_by_default);
-  $("requireTts").closest("label")?.classList.toggle("hidden", isReassembly);
-  $("allowOriginalAudioEvidence").checked = isReassembly;
-  $("allowOriginalAudioEvidence").closest("label")?.classList.toggle("hidden", !isReassembly);
-  $("requireTtsSelect")?.closest("label")?.classList.toggle("hidden", isReassembly);
+  $("audioPolicy").value = isOriginalAudio ? "original" : "ai_voiceover";
+  $("requireTts").checked = !isOriginalAudio && Boolean(state.defaults.tts_required_by_default);
+  $("requireTts").closest("label")?.classList.toggle("hidden", isOriginalAudio);
+  $("allowOriginalAudioEvidence").checked = isOriginalAudio;
+  $("allowOriginalAudioEvidence").closest("label")?.classList.toggle("hidden", !isOriginalAudio);
+  $("requireTtsSelect")?.closest("label")?.classList.toggle("hidden", isOriginalAudio);
   // removed long video visibility toggles
-  $("voiceSelectWrap")?.classList.toggle("hidden", isReassembly);
-  $("previewVoice")?.classList.toggle("hidden", isReassembly);
+  $("voiceSelectWrap")?.classList.toggle("hidden", isOriginalAudio);
+  $("previewVoice")?.classList.toggle("hidden", isOriginalAudio);
   if (isReassembly && Number($("targetDuration").value || 0) < 60) $("targetDuration").value = 90;
-  if (!isReassembly && Number($("targetDuration").value || 0) > 60) $("targetDuration").value = state.defaults.default_target_seconds || 30;
+  if (!isOriginalAudio && Number($("targetDuration").value || 0) > 60) $("targetDuration").value = state.defaults.default_target_seconds || 30;
   syncFriendlyControls();
   syncOutputModeControls();
   updateSummaryControls();
@@ -1567,10 +1610,76 @@ function currentTaskMode() {
 
 function syncCommentaryButton() {
   const btn = $("generateCommentary");
+  if (btn) {
+    const isReassembly = currentTaskMode() === "highlight_reassembly";
+    const hasDraft = Array.isArray(state.drafts) && state.drafts.length > 0;
+    btn.classList.toggle("hidden", !(isReassembly && hasDraft && state.selectedTask));
+  }
+  syncAdReportButton();
+}
+
+function syncAdReportButton() {
+  const btn = $("showAdReport");
   if (!btn) return;
-  const isReassembly = currentTaskMode() === "highlight_reassembly";
+  const isFullConcat = currentTaskMode() === "full_concat";
   const hasDraft = Array.isArray(state.drafts) && state.drafts.length > 0;
-  btn.classList.toggle("hidden", !(isReassembly && hasDraft && state.selectedTask));
+  btn.classList.toggle("hidden", !(isFullConcat && hasDraft && state.selectedTask));
+}
+
+async function openAdReport() {
+  if (!state.selectedTask) return;
+  showCommentaryModal();
+  setCommentaryMessage("正在加载移除广告报告……");
+  try {
+    const data = await api(`/api/tasks/${encodeURIComponent(state.selectedTask)}/ad-report`);
+    renderAdReportBody(data);
+  } catch (error) {
+    setCommentaryMessage(`加载失败：${cleanError(error)}`, true);
+  }
+}
+
+function renderAdReportBody(data) {
+  const body = $("commentaryBody");
+  if (!body) return;
+  body.classList.remove("commentary-message");
+  body.innerHTML = "";
+
+  const stats = data.stats || {};
+  const blocks = Array.isArray(data.removed_blocks) ? data.removed_blocks : [];
+
+  const title = document.createElement("h1");
+  title.className = "commentary-title";
+  title.textContent = "完整版 · 移除广告报告";
+  body.appendChild(title);
+
+  const summary = document.createElement("p");
+  summary.className = "ad-report-summary";
+  summary.textContent =
+    `共分析 ${stats.segment_count || 0} 段，移除 ${stats.removed_block_count || blocks.length} 个广告块，` +
+    `约 ${Math.round(stats.removed_seconds || 0)} 秒；保留约 ${Math.round(stats.kept_seconds || 0)} 秒。` +
+    (stats.llm_used ? "（含大模型判定）" : "（仅规则判定）");
+  body.appendChild(summary);
+
+  const LABEL_CN = { ad: "商业广告", promo: "频道宣传/预告", trailer: "片头片尾", station_id: "台标/垫片", sponsor: "赞助播报" };
+  if (!blocks.length) {
+    const empty = document.createElement("p");
+    empty.textContent = "没有检测到需要移除的广告片段。";
+    body.appendChild(empty);
+    return;
+  }
+  const list = document.createElement("div");
+  list.className = "ad-report-list";
+  blocks.forEach((b) => {
+    const row = document.createElement("div");
+    row.className = "ad-report-item";
+    const label = LABEL_CN[b.label] || b.label || "广告";
+    row.innerHTML =
+      `<span class="ad-report-time">${escapeHtml(b.start || "")} - ${escapeHtml(b.end || "")}</span>` +
+      `<span class="ad-report-tag">${escapeHtml(label)}</span>` +
+      `<span class="ad-report-reason">${escapeHtml(b.reason || "")}</span>`;
+    list.appendChild(row);
+  });
+  body.appendChild(list);
 }
 
 function ridFromDraftFile(file) {
@@ -1707,15 +1816,15 @@ function restoreRunControls(manifest) {
   $("productionMode").value = opts.production_mode || "ai_voiceover";
   if ($("outputMode")) $("outputMode").value = opts.output_mode || (opts.reassembly_output_mode === "multiple" ? "multiple" : "single");
   if ($("maxOutputVideos")) $("maxOutputVideos").value = (opts.max_output_videos > 1) ? opts.max_output_videos : 5;
-  $("audioPolicy").value = opts.production_mode === "highlight_reassembly" ? "original" : "ai_voiceover";
-  $("allowOriginalAudioEvidence").checked = opts.production_mode === "highlight_reassembly";
+  $("audioPolicy").value = modeUsesOriginalAudio(opts.production_mode) ? "original" : "ai_voiceover";
+  $("allowOriginalAudioEvidence").checked = modeUsesOriginalAudio(opts.production_mode);
   $("reassemblyOutputMode").value = $("outputMode")?.value === "multiple" ? "multiple" : "single";
   $("reassemblySortMode").value = "editorial";
   if (opts.reassembly_max_clip_count) $("reassemblyMaxClipCount").value = opts.reassembly_max_clip_count;
   if (opts.voice_id && $("voiceSelect")) $("voiceSelect").value = opts.voice_id;
   onProductionModeChange();
   if (opts.voice_id && $("voiceSelect")) $("voiceSelect").value = opts.voice_id;
-  if (typeof opts.require_tts === "boolean" && $("productionMode").value !== "highlight_reassembly") $("requireTts").checked = opts.require_tts;
+  if (typeof opts.require_tts === "boolean" && !modeUsesOriginalAudio($("productionMode").value)) $("requireTts").checked = opts.require_tts;
   $("runMode").value = "all";
   syncFriendlyControls();
   syncOutputModeControls();
@@ -1736,11 +1845,15 @@ function stepsForManifest(manifest) {
     const preferred =
       mode === "highlight_reassembly"
         ? UNIFIED_HIGHLIGHT_REASSEMBLY_STEPS
-        : UNIFIED_AI_VOICEOVER_STEPS;
+        : mode === "full_concat"
+          ? UNIFIED_FULL_CONCAT_STEPS
+          : UNIFIED_AI_VOICEOVER_STEPS;
     const known = preferred.filter((step) => step in manifestSteps);
     return known.length ? known : preferred;
   }
-  return mode === "highlight_reassembly" ? HIGHLIGHT_REASSEMBLY_STEPS : AI_VOICEOVER_STEPS;
+  if (mode === "highlight_reassembly") return HIGHLIGHT_REASSEMBLY_STEPS;
+  if (mode === "full_concat") return FULL_CONCAT_STEPS;
+  return AI_VOICEOVER_STEPS;
 }
 
 function renderManifest() {
@@ -2090,7 +2203,12 @@ async function runSelected() {
       return;
     }
     const manifest = await api(`/api/tasks/${existingTaskId}/manifest`).catch(() => null);
-    const cutStepName = req.production_mode === "highlight_reassembly" ? "reassembly_cut_plan" : "cut_plan";
+    const cutStepName =
+      req.production_mode === "highlight_reassembly"
+        ? "reassembly_cut_plan"
+        : req.production_mode === "full_concat"
+          ? "full_concat_plan"
+          : "cut_plan";
     const cutPlan = manifest?.steps?.[cutStepName] || {};
     if (!["success", "partial_success"].includes(cutPlan.status)) {
       alert(`当前任务还不能生成粗剪视频：${cutStepName} 状态是 ${cutPlan.status || "missing"}。请先运行到 ${cutStepName} 成功。`);
@@ -2163,6 +2281,7 @@ function baseRunRequest() {
   const isAiVoiceover = productionMode === "ai_voiceover";
   const allowLongVideo = isAiVoiceover ? Boolean(state.defaults.allow_long_video_default) : false;
   const targetDurationMode = isAiVoiceover ? (state.defaults.ai_voiceover_target_mode || "soft") : "fixed";
+  const isOriginalAudio = modeUsesOriginalAudio(productionMode);
   const outputMode = productionMode === "highlight_reassembly" ? ($("outputMode")?.value || "single") : "single";
   return {
     production_mode: productionMode,
@@ -2179,12 +2298,12 @@ function baseRunRequest() {
     target_duration_mode: targetDurationMode,
     max_output_video_seconds: isAiVoiceover ? Math.max(30, Math.min(Number(state.defaults.ai_voiceover_max_output_seconds || state.defaults.max_long_video_seconds || 180), 180)) : targetDuration,
     allow_long_video: allowLongVideo,
-    require_tts: productionMode === "highlight_reassembly" ? false : $("requireTts").checked,
-    voice_id: productionMode === "highlight_reassembly" ? null : ($("voiceSelect")?.value || null),
-    audio_policy: productionMode === "highlight_reassembly" ? "original" : "ai_voiceover",
-    allow_original_audio_evidence: productionMode === "highlight_reassembly",
+    require_tts: isOriginalAudio ? false : $("requireTts").checked,
+    voice_id: isOriginalAudio ? null : ($("voiceSelect")?.value || null),
+    audio_policy: isOriginalAudio ? "original" : "ai_voiceover",
+    allow_original_audio_evidence: isOriginalAudio,
     only_analysis: mode === "only_analysis",
-    skip_tts: productionMode === "highlight_reassembly",
+    skip_tts: isOriginalAudio,
     skip_render: mode === "skip_render",
     mode: "normal",
     client_id: getClientId(),
@@ -2214,7 +2333,9 @@ function afterJobStarted(job) {
       ? stepsForManifest(state.manifest)
       : ($("productionMode")?.value === "highlight_reassembly"
           ? UNIFIED_HIGHLIGHT_REASSEMBLY_STEPS
-          : UNIFIED_AI_VOICEOVER_STEPS);
+          : $("productionMode")?.value === "full_concat"
+            ? UNIFIED_FULL_CONCAT_STEPS
+            : UNIFIED_AI_VOICEOVER_STEPS);
     updateProgress(0, activeSteps.length, 0, 0, 0);
     if ($("metricCurrentStep")) $("metricCurrentStep").textContent = stepLabel(activeSteps[0]);
     $("logViewer").textContent = "任务已提交，等待日志输出...";

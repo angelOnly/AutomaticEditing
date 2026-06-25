@@ -431,4 +431,34 @@ generate_subtitles_default = false
 export_individual_clips_default = false
 risk_block_threshold = "high"
 
+[full_concat]
+# 完整版·去广告模式（与 ai_voiceover / highlight_reassembly 并列）
+enabled = true
+default_aspect_ratio = "16:9"
+
+[ad_detection]
+# 广告检测（full_concat 专用）。信号：ASR 文案 + 画面（screen_text/visual/scene）
+enabled = true
+use_llm = true
+# 用哪个文本 provider 做模糊段兜底分类：deepseek / doubao / openai；留空回退全局 text_llm_provider
+provider = "deepseek"
+model = ""
+temperature = 0.0
+max_tokens = 2000
+batch_size = 30
+# 保守模式：低置信非新闻段保留并标 suspected，宁可漏广告不误删新闻
+conservative = true
+# 保留段紧贴广告块时各内缩的安全余量（秒），避免广告帧渗入
+safety_margin_seconds = 0.4
+# 相邻保留段间隔 <= 此值则合并为一个 clip（秒）
+merge_gap_seconds = 1.5
+# 安全余量后短于此值的保留 clip 丢弃（秒）
+min_clip_seconds = 3.0
+# 孤立超短广告块（被新闻包夹）短于此值则不单独删，避免成片抖动（秒）
+min_isolated_ad_seconds = 3.0
+# 业务可在不改代码的情况下扩充关键词
+extra_ad_keywords = []
+extra_promo_keywords = []
+extra_news_keywords = []
+
 # conda activate comfy_5090_313_auto
