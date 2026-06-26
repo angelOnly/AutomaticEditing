@@ -1247,6 +1247,12 @@ def run_pipeline(req: RunRequest) -> dict[str, Any]:
     else:
         req.audio_policy = "ai_voiceover"
         req.allow_original_audio_evidence = False
+    if req.production_mode == "full_concat":
+        # 完整版需更细的分段，让短的片头/台标/赞助卡/预告独立成段被精准删。
+        # 强制覆盖（在算指纹/公共池 key 之前），本模式因此使用独立公共分析池。
+        fc = PROJECT_CONFIG.raw.get("full_concat", {}) or {}
+        req.chunk_seconds = int(fc.get("chunk_seconds", 10) or 10)
+        req.frame_interval = int(fc.get("frame_interval", 5) or 5)
     _prepare_mode_switched_run(req)
     raw_source_items = _collect_source_items(req)
     # Start downloading remote sources to the local cache immediately, while the

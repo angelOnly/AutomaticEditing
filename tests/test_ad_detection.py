@@ -11,17 +11,18 @@ from newsclip_agent import ad_detection as ad
 CFG = ad.load_cfg({})
 FC = ad.load_full_concat_cfg({})
 
-# 测试排期：两档都设为每天，避免依赖具体星期
+# 测试排期：各档都设为每天，避免依赖具体星期
 SCHEDULE = ad.load_schedule({
     "enabled": True,
     "entries": [
         {"column": "纪录大时代", "time": "16:30", "days": [0, 1, 2, 3, 4, 5, 6]},
         {"column": "凤凰大视野", "time": "20:00", "days": [0, 1, 2, 3, 4, 5, 6]},
+        {"column": "凤凰全球连线", "time": "21:00", "days": [0, 1, 2, 3, 4, 5, 6]},
     ],
 })
 
 
-def _chunk(cid, src, start, end, speech="", bug="", scene="", screen=None):
+def _chunk(cid, src, start, end, speech="", bug="", scene="", screen=None, footage=None):
     c = {
         "segment_id": cid,
         "source_id": src,
@@ -34,6 +35,8 @@ def _chunk(cid, src, start, end, speech="", bug="", scene="", screen=None):
     }
     if screen is not None:
         c["screen_text"] = screen
+    if footage is not None:
+        c["footage_types"] = footage
     return c
 
 
@@ -46,6 +49,12 @@ def test_column_match():
     assert not ad.column_match("凤凰大视野", "纪录大时代")
 
 
+def test_column_match_traditional_to_simplified():
+    # 凤凰画面是繁体，目标是简体，应繁简不敏感匹配（需 opencc）
+    assert ad.column_match("鳳凰聚焦", "凤凰聚焦")
+    assert ad.column_match("鳳凰全球連線", "凤凰全球连线")
+
+
 def test_parse_source_timestamp():
     assert ad.parse_source_timestamp("20260603_173438") == "20260603173438"
     assert ad.parse_source_timestamp("clip_20260603_173438_high.mp4") == "20260603173438"
@@ -55,8 +64,10 @@ def test_parse_source_timestamp():
 def test_infer_column_from_schedule():
     # 17:00 → 最近一档是 16:30 纪录大时代
     assert ad.infer_column_from_schedule(SCHEDULE, "20260603_170000") == "纪录大时代"
-    # 21:00 → 最近一档是 20:00 凤凰大视野
-    assert ad.infer_column_from_schedule(SCHEDULE, "20260603_210000") == "凤凰大视野"
+    # 20:30 → 最近一档是 20:00 凤凰大视野
+    assert ad.infer_column_from_schedule(SCHEDULE, "20260603_203000") == "凤凰大视野"
+    # 21:00 → 最近一档是 21:00 凤凰全球连线
+    assert ad.infer_column_from_schedule(SCHEDULE, "20260603_210000") == "凤凰全球连线"
 
 
 # --------------------------------------------------------------------------- #
@@ -95,6 +106,51 @@ def test_detect_keeps_target_drops_other_and_ad():
     assert keep["b"] is False and keep["c"] is False
     assert res["target_column"] == "纪录大时代"
     assert res["stats"]["removed_seconds"] == 70  # b(40)+c(30)
+
+
+def test_detect_traditional_bug_kept_as_target():
+    # bug 是繁体"鳳凰聚焦"，目标简体"凤凰聚焦"，应判 target 保留（修复繁简误删）
+    chunks = [_chunk("a", "s", 0, 30, speech="英国首相辞职相关报道", bug="鳳凰聚焦")]
+    res = ad.detect(chunks, cfg={**CFG, "use_llm": False}, fc_cfg=FC, schedule=SCHEDULE, source_items=[], override_column="凤凰聚焦")
+    a = res["segments"][0]
+    assert a["label"] == "target" and a["keep"] is True
+
+
+def test_detect_sponsor_dropped_even_with_target_bug():
+    # 节目自己的赞助卡，即使带目标角标也删
+    chunks = [_chunk("a", "s", 0, 30, speech="本节目由华润集团赞助播出", bug="凤凰聚焦")]
+    res = ad.detect(chunks, cfg={**CFG, "use_llm": False}, fc_cfg=FC, schedule=SCHEDULE, source_items=[], override_column="凤凰聚焦")
+    a = res["segments"][0]
+    assert a["label"] == "sponsor" and a["keep"] is False
+
+
+def test_detect_promo_other_program_dropped_with_target_bug():
+    # 挂着目标角标，但内容是预告其他节目（凤凰全球连线/每日七点）→ 删
+    chunks = [_chunk("a", "s", 0, 30, speech="《凤凰全球连线》每日七点播出，敬请收看", bug="凤凰聚焦")]
+    res = ad.detect(chunks, cfg={**CFG, "use_llm": False}, fc_cfg=FC, schedule=SCHEDULE, source_items=[], override_column="凤凰聚焦")
+    a = res["segments"][0]
+    assert a["label"] == "promo" and a["keep"] is False
+
+
+def test_detect_packaging_footage_dropped():
+    # 片头包装/台标卡（footage_types 含片头包装），非目标 → 删
+    chunks = [_chunk("a", "s", 0, 8, speech="", bug="", footage=["片头包装"])]
+    res = ad.detect(chunks, cfg={**CFG, "use_llm": False}, fc_cfg=FC, schedule=SCHEDULE, source_items=[], override_column="凤凰聚焦")
+    a = res["segments"][0]
+    assert a["keep"] is False and a["label"] == "packaging_other"
+
+
+def test_detect_silent_no_bug_dropped():
+    chunks = [_chunk("a", "s", 0, 6, speech="", bug="")]
+    res = ad.detect(chunks, cfg={**CFG, "use_llm": False}, fc_cfg=FC, schedule=SCHEDULE, source_items=[], override_column="凤凰聚焦")
+    assert res["segments"][0]["keep"] is False
+
+
+def test_detect_program_open_with_target_kept():
+    # 节目自己的开场（提到目标栏目、无其他节目）不应被预告规则误删
+    chunks = [_chunk("a", "s", 0, 30, speech="欢迎收看本期《凤凰聚焦》，本期关注英国政坛", bug="凤凰聚焦")]
+    res = ad.detect(chunks, cfg={**CFG, "use_llm": False}, fc_cfg=FC, schedule=SCHEDULE, source_items=[], override_column="凤凰聚焦")
+    assert res["segments"][0]["keep"] is True
 
 
 def test_detect_bridge_keeps_inner_unknown():

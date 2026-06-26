@@ -21,7 +21,7 @@ from .llm import OpenAICompatibleClient
 from .utils import read_json, seconds_to_timecode
 
 PROMPT_DIR = Path(__file__).resolve().parent / "prompt_texts"
-PROMPT_VERSION = "ad_detection_v2_column"
+PROMPT_VERSION = "ad_detection_v3_column_filter"
 
 # 保留 / 删除标签
 LABEL_TARGET = "target"
@@ -34,14 +34,21 @@ AD_ACTION_KEYWORDS = [
     "办卡", "会员卡", "全国包邮", "货到付款", "厂家直销", "正品保障",
 ]
 SHOPPING_KEYWORDS = ["调理", "养生", "根治", "无副作用", "疗效", "包治", "特效", "祖传秘方", "强身健体"]
-# 频道宣传 / 节目预告（通常预告“其他”栏目）
+# 频道宣传 / 节目预告（通常预告“其他”栏目，即使画面挂着目标角标也要删）
 PROMO_KEYWORDS = [
     "敬请收看", "敬请期待", "即将播出", "稍后播出", "稍后为您播出", "精彩继续", "不要走开",
-    "不要离开", "锁定本台", "锁定资讯台", "锁定凤凰", "下节目", "精彩节目", "更多精彩", "欢迎收看",
+    "不要离开", "锁定本台", "锁定资讯台", "锁定凤凰", "下节目", "更多精彩节目",
+    "节目预告", "片花", "明天此时", "节目宣传", "每[日晚天周].{0,4}[点時點]播出",
+    "每[日晚天].{0,4}[点時點]", "于.{0,8}播出", "敬请关注",
 ]
 TRAILER_KEYWORDS = ["感谢收看", "下期再见", "下次再见", "节目到此结束"]
-SPONSOR_KEYWORDS = ["赞助播出", "特约播出", "独家冠名", "鸣谢", "由.{0,12}赞助", "由.{0,12}特约"]
+# 赞助/冠名（含节目自己的赞助卡，按用户要求也删）
+SPONSOR_KEYWORDS = [
+    "赞助播出", "特约播出", "独家冠名", "鸣谢", "冠名播出", "由.{0,12}赞助", "由.{0,12}特约",
+    "由.{0,12}冠名", ".{0,12}冠名",
+]
 PACKAGING_SCENES = {"片头包装", "片头", "片尾", "包装"}
+PACKAGING_FOOTAGE = {"片头包装", "片头", "片尾", "包装", "台标"}
 
 DEFAULT_VIP_NAMES = ["习近平", "李强", "赵乐际", "王沪宁", "蔡奇", "丁薛祥", "李希"]
 
@@ -175,8 +182,32 @@ def _column_bug(chunk: dict[str, Any]) -> str:
     return str(chunk.get("column_bug") or "").strip()
 
 
+_T2S_CONVERTER = None
+_T2S_TRIED = False
+
+
+def _t2s(text: str) -> str:
+    """繁体→简体归一（凤凰画面是繁体，需与简体排期/目标比对）。opencc 缺失则原样返回。"""
+    global _T2S_CONVERTER, _T2S_TRIED
+    if not text:
+        return text
+    if _T2S_CONVERTER is None and not _T2S_TRIED:
+        _T2S_TRIED = True
+        try:
+            import opencc  # type: ignore
+            _T2S_CONVERTER = opencc.OpenCC("t2s")
+        except Exception:
+            _T2S_CONVERTER = None
+    if _T2S_CONVERTER is None:
+        return text
+    try:
+        return _T2S_CONVERTER.convert(text)
+    except Exception:
+        return text
+
+
 def _norm(text: str) -> str:
-    return re.sub(r"\s+", "", str(text or ""))
+    return _t2s(re.sub(r"\s+", "", str(text or "")))
 
 
 def _hit(text: str, keywords: list[str]) -> str | None:
@@ -280,10 +311,10 @@ def resolve_target_column(
     if mode == "schedule":
         return sched_guess, "schedule" if sched_guess else "unknown"
 
-    # auto：角标多数票为准
+    # auto：角标多数票为准（繁简归一，简繁合并计票）
     bug_votes: dict[str, int] = {}
     for chunk in chunks:
-        bug = _column_bug(chunk)
+        bug = _t2s(_column_bug(chunk))
         if bug:
             bug_votes[bug] = bug_votes.get(bug, 0) + 1
     if bug_votes:
@@ -302,50 +333,81 @@ def _classify_segment(
     screen_text: str,
     bug: str,
     scene: str,
+    footage_types: list[str],
+    has_speech: bool,
     target: str,
     known_columns: list[str],
     cfg: dict[str, Any],
 ) -> tuple[str | None, str, str]:
-    """返回 (label, keep_state, reason)。keep_state ∈ keep/drop/undecided。label 为 None 表示 undecided。"""
-    text = f"{speech} {screen_text}".strip()
-    is_pkg = bool(scene) and any(p in scene for p in PACKAGING_SCENES)
+    """返回 (label, keep_state, reason)。keep_state ∈ keep/drop/undecided。
 
-    # 1) 角标 / 画面里出现的栏目名
-    detected_target = bool(bug and target and column_match(bug, target)) or (target and column_match(text, target))
+    策略：先正向删杂质（赞助/冠名、预告、广告——即使挂着目标角标也删），
+    再保留目标栏目正片，其余（其他栏目/包装台标/静音卡）删，最后模糊段交 LLM/bridge。
+    """
+    text = _t2s(f"{speech} {screen_text}".strip())
+    is_pkg = (bool(scene) and any(p in scene for p in PACKAGING_SCENES)) or any(
+        f in PACKAGING_FOOTAGE for f in (footage_types or [])
+    )
+
+    target_by_bug = bool(bug and target and column_match(bug, target))
+    target_in_text = bool(target and column_match(text, target))
+    detected_target = target_by_bug or target_in_text
+
     detected_other = ""
     if bug and target and not column_match(bug, target):
-        detected_other = bug
+        detected_other = _t2s(bug)
     if not detected_other:
         for col in known_columns:
             if col != target and column_match(text, col):
                 detected_other = col
                 break
+    mentions_other = bool(detected_other)
+    # 《节目名》书名号：出现非目标栏目的《X》，是“在预告/提及别的节目”的强信号
+    #（不依赖排期表是否收录该节目，凤凰全球连线/凤凰早班车等中文台节目也能识别）
+    bracket_titles = [t for t in re.findall(r"《([^》]{2,15})》", text) if not column_match(t, target)]
+    other_title = bracket_titles[0] if bracket_titles else ""
 
-    if detected_target:
-        if is_pkg:
-            return "target_intro_outro", "keep", "目标栏目片头/片尾"
-        return LABEL_TARGET, "keep", f"目标栏目角标/标题：{bug or target}"
-    if detected_other:
-        return "other_column", "drop", f"其他栏目：{detected_other}"
+    # 1) 赞助/冠名：即使带目标角标也删（节目自己的赞助卡也删）
+    sponsor_m = _SPONSOR_RE.search(text)
+    if sponsor_m:
+        return "sponsor", "drop", f"赞助/冠名：{sponsor_m.group(0)[:16]}"
 
-    # 2) 广告 / 赞助 / 预告
+    # 2) 预告/宣传：命中预告话术，且（提到别的节目 / 出现非目标《节目名》/ 当前段不是确凿目标正片）→ 删
+    #    这样能删掉“挂着目标角标却在预告其他节目”的段，又不误删节目自己的开场。
+    promo_kw = _hit(text, PROMO_KEYWORDS + cfg.get("extra_promo_keywords", []))
+    if promo_kw and (mentions_other or other_title or not detected_target):
+        reason_extra = f"《{other_title}》" if other_title else (f"其他栏目:{detected_other}" if mentions_other else "")
+        return "promo", "drop", f"预告/宣传：{promo_kw} {reason_extra}".strip()
+    if _hit(text, TRAILER_KEYWORDS) and not detected_target:
+        return "trailer_other", "drop", "片尾结束语（非目标栏目）"
+
+    # 3) 商业广告：行动号召/购物话术
     ad_kw = _hit(text, AD_ACTION_KEYWORDS + cfg.get("extra_ad_keywords", []))
     if ad_kw:
         return "ad", "drop", f"广告行动号召：{ad_kw}"
-    if _SPONSOR_RE.search(text):
-        return "sponsor", "drop", "赞助播报"
-    promo_kw = _hit(text, PROMO_KEYWORDS + cfg.get("extra_promo_keywords", []))
-    if promo_kw:
-        return "promo", "drop", f"预告/宣传：{promo_kw}"
-    if _hit(text, TRAILER_KEYWORDS):
-        return "trailer_other", "drop", "片尾结束语（非目标栏目）"
+    if _hit(text, SHOPPING_KEYWORDS) and not detected_target:
+        return "ad", "drop", "保健品/夸大话术"
 
-    # 3) 包装镜头但认不出目标名 → 多半是别的栏目片头/台标卡
+    # 4) 目标栏目正片（角标或片头大标题命中目标）
+    if detected_target:
+        if is_pkg:
+            return "target_intro_outro", "keep", "目标栏目片头/片尾"
+        return LABEL_TARGET, "keep", f"目标栏目角标/标题：{_t2s(bug) or target}"
+
+    # 5) 其他栏目
+    if mentions_other:
+        return "other_column", "drop", f"其他栏目：{detected_other}"
+
+    # 6) 包装/台标卡（认不出目标名）
     if is_pkg:
-        return "packaging_other", "drop", f"包装镜头但非目标栏目：{scene}"
+        return "packaging_other", "drop", f"包装/台标镜头（非目标）：{scene or '/'.join(footage_types or [])}"
 
-    # 4) 模糊：交 LLM / bridge 兜底
-    return None, "undecided", "无角标、无强信号，待定"
+    # 7) 静音卡/无实质（无角标且无语音）→ 多半是垫片/台标/包装
+    if not has_speech:
+        return "station_id", "drop", "无角标、无语音（疑似台标/垫片）"
+
+    # 8) 无角标但有连续解说的“正片样”片段 → 交 LLM / bridge 兜底（倾向保留，避免精编误删）
+    return None, "undecided", "无角标、有解说，待判（疑似正片）"
 
 
 def detect(
@@ -384,9 +446,11 @@ def detect(
         screen_text = _screen_text(chunk)
         bug = _column_bug(chunk)
         scene = _scene(chunk)
+        footage_types = chunk.get("footage_types") or []
         segment_id = str(chunk.get("segment_id") or chunk.get("chunk_id") or f"{source_id}_seg_{index:04d}")
         label, keep_state, reason = _classify_segment(
             speech=speech, screen_text=screen_text, bug=bug, scene=scene,
+            footage_types=footage_types, has_speech=bool(speech.strip()),
             target=target, known_columns=known_columns, cfg=cfg,
         )
         rec: dict[str, Any] = {

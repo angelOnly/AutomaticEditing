@@ -437,10 +437,16 @@ enabled = true
 default_aspect_ratio = "16:9"
 # 目标栏目确定方式：auto=角标多数票为主+排期表兜底（推荐）；schedule=只按排期表；manual=只用前端传入
 target_column_mode = "auto"
-# 节目内没角标的模糊镜头（空镜/B-roll）夹在目标栏目段落中间时是否保留（保证连续）
+# 本模式专用的细分粒度：更小的 chunk 让短的片头/台标/赞助卡/预告独立成段、能被精准删。
+# 注意：会让本模式用独立公共分析池（不与 60s 的其它模式共享），分析更慢更贵。
+chunk_seconds = 10
+frame_interval = 5
+# 凤凰画面是繁体，角标/排期/识别统一做繁→简归一后再比对（需 opencc，缺失则原样比对）
+traditional_to_simplified = true
+# 无角标但有连续解说的“正片”镜头，夹在目标栏目段落中间则保留（保证不精编、不切碎正片）
 bridge_keep_within_run = true
-# bridge 兜底允许的相邻间隔（秒），超过则不视为同一段连续节目
-bridge_max_gap_seconds = 90.0
+# bridge 兜底允许的相邻间隔（秒）。杂质已先被正向删除，这里只补正片空隙，可适当放大
+bridge_max_gap_seconds = 120.0
 
 [ad_detection]
 # 广告检测（full_concat 专用）。信号：ASR 文案 + 画面（screen_text/column_bug/scene）
