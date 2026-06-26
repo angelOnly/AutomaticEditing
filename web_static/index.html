@@ -58,6 +58,17 @@
               </select>
             </label>
           </div>
+          <div class="remote-range">
+            <label>
+              <span>起始时间</span>
+              <input id="remoteStartTime" type="datetime-local" step="1" />
+            </label>
+            <label>
+              <span>结束时间</span>
+              <input id="remoteEndTime" type="datetime-local" step="1" />
+            </label>
+            <button id="remoteRangeClear" type="button" class="mini-button">清除时间</button>
+          </div>
           <div class="remote-pager">
             <button class="mini-button" id="remotePrev" type="button">上一页</button>
             <span id="remotePageInfo">1 / -</span>

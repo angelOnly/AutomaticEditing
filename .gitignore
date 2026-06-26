@@ -16,4 +16,6 @@ automatic-editing-latest.tar
 *.pt
 *.pth
 *.onnx
-*.safetensors
+*.safetensors 
+readme/*
+ 

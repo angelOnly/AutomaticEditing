@@ -458,6 +458,8 @@ def list_remote_videos(
     page_size: int | None = None,
     keyword: str | None = None,
     sort_order: str = "desc",
+    start_time: str | None = None,
+    end_time: str | None = None,
 ) -> dict[str, Any]:
     try:
         result = list_ucms_videos(
@@ -467,10 +469,15 @@ def list_remote_videos(
             page_size=page_size,
             keyword=keyword,
             sort_order=sort_order,
+            start_time=start_time,
+            end_time=end_time,
         )
         station = record_station or REMOTE_UCMS_CONFIG.default_record_station
         total = result.get("pagination", {}).get("total")
-        if station and total is not None:
+        # 仅在无过滤条件时刷新信号源总数缓存：带 keyword/时间区间时 total 是过滤后的子集数，
+        # 用它覆盖会让信号源旁边的数量徽标显示成搜索结果数。
+        is_filtered = bool((keyword or "").strip() or (start_time or "").strip() or (end_time or "").strip())
+        if station and total is not None and not is_filtered:
             _set_remote_station_count(station, int(total))
         result["station_counts"] = _remote_station_counts_snapshot()
         result["station_count_errors"] = _remote_station_count_errors_snapshot()

@@ -94,16 +94,20 @@ def list_ucms_videos(
     page_size: int | None = None,
     keyword: str | None = None,
     sort_order: str = "desc",
+    start_time: str | None = None,
+    end_time: str | None = None,
 ) -> dict[str, Any]:
     size = int(page_size or cfg.default_page_size)
     page = max(1, int(current or 1))
     station = record_station or cfg.default_record_station
     order = _normalize_sort_order(sort_order)
     query = str(keyword or "").strip()
+    start = str(start_time or "").strip() or None
+    end = str(end_time or "").strip() or None
     if not cfg.enabled:
         return _empty_response(page, size, cfg)
 
-    if query or order in {"asc", "desc"}:
+    if query or start or end or order in {"asc", "desc"}:
         return _list_ucms_videos_scanned(
             cfg,
             record_station=station,
@@ -111,6 +115,8 @@ def list_ucms_videos(
             page_size=size,
             keyword=query,
             sort_order=order,
+            start_time=start,
+            end_time=end,
         )
 
     raw = _query_ucms(cfg, station, current=page, page_size=size, timeout=cfg.request_timeout_seconds)
@@ -280,6 +286,8 @@ def _list_ucms_videos_scanned(
     page_size: int,
     keyword: str,
     sort_order: str,
+    start_time: str | None = None,
+    end_time: str | None = None,
 ) -> dict[str, Any]:
     scan_size = max(1, min(int(cfg.search_page_size), 200))
     max_items = max(scan_size, int(cfg.max_scan_items))
@@ -287,7 +295,15 @@ def _list_ucms_videos_scanned(
     total = 0
     page = 1
     while len(all_items) < max_items:
-        raw = _query_ucms(cfg, record_station, current=page, page_size=scan_size, timeout=cfg.request_timeout_seconds)
+        raw = _query_ucms(
+            cfg,
+            record_station,
+            current=page,
+            page_size=scan_size,
+            timeout=cfg.request_timeout_seconds,
+            start_time=start_time,
+            end_time=end_time,
+        )
         data = _response_data(raw)
         raw_items = [item for item in _response_items(data) if isinstance(item, dict)]
         if page == 1:
@@ -348,13 +364,22 @@ def _query_ucms(
     current: int,
     page_size: int,
     timeout: int,
+    start_time: str | None = None,
+    end_time: str | None = None,
 ) -> dict[str, Any]:
+    query: list[dict[str, Any]] = [
+        {"key": "from", "type": "=", "value": "record"},
+        {"key": "record_station", "type": "=", "value": record_station},
+    ]
+    # 时间区间在服务端按 create_time 过滤（闭区间），避免把整段素材全拉回本地再筛。
+    # 注意：查询条件的 key 是下划线 create_time，与返回里的驼峰 createTime 不同。
+    if start_time:
+        query.append({"key": "create_time", "type": ">=", "value": start_time})
+    if end_time:
+        query.append({"key": "create_time", "type": "<=", "value": end_time})
     payload = {
         "body": {
-            "query": [
-                {"key": "from", "type": "=", "value": "record"},
-                {"key": "record_station", "type": "=", "value": record_station},
-            ],
+            "query": query,
             "pagination": {"current": int(current), "pageSize": int(page_size)},
         }
     }

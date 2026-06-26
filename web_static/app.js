@@ -444,6 +444,15 @@ function bindEvents() {
     if (state.remoteSearchTimer) clearTimeout(state.remoteSearchTimer);
     loadRemoteVideos(1);
   });
+  $("remoteStartTime")?.addEventListener("change", () => loadRemoteVideos(1));
+  $("remoteEndTime")?.addEventListener("change", () => loadRemoteVideos(1));
+  $("remoteRangeClear")?.addEventListener("click", () => {
+    const start = $("remoteStartTime");
+    const end = $("remoteEndTime");
+    if (start) start.value = "";
+    if (end) end.value = "";
+    loadRemoteVideos(1);
+  });
   $("remotePrev")?.addEventListener("click", () => {
     const current = Number(state.remotePagination.current || 1);
     if (current > 1) loadRemoteVideos(current - 1);
@@ -761,6 +770,11 @@ async function loadRemoteVideos(page = 1) {
   const station = $("remoteRecordStation")?.value || "";
   const keyword = $("remoteSearch")?.value?.trim() || "";
   const sortOrder = $("remoteSortOrder")?.value || "desc";
+  // datetime-local 的值形如 2026-06-25T21:55:00，远程接口要 2026-06-25 21:55:00；
+  // 缺秒时补 :00，把 T 换成空格。
+  const toRemoteTime = (value) => (value ? value.replace("T", " ").slice(0, 19).padEnd(19, ":00") : "");
+  const startTime = toRemoteTime($("remoteStartTime")?.value);
+  const endTime = toRemoteTime($("remoteEndTime")?.value);
   box.innerHTML = `<div class="list-item"><strong>正在加载远程素材...</strong><span>${escapeHtml(station || "-")}</span></div>`;
   const params = new URLSearchParams({
     record_station: station,
@@ -769,6 +783,8 @@ async function loadRemoteVideos(page = 1) {
     sort_order: sortOrder,
   });
   if (keyword) params.set("keyword", keyword);
+  if (startTime) params.set("start_time", startTime);
+  if (endTime) params.set("end_time", endTime);
   const data = await api(`/api/remote-videos?${params.toString()}`);
   state.remoteVideos = data.items || [];
   state.remotePagination = data.pagination || { current: state.remotePage, pageSize: state.remotePageSize || 10, total: state.remoteVideos.length };
