@@ -116,12 +116,21 @@ def test_detect_traditional_bug_kept_as_target():
     assert a["label"] == "target" and a["keep"] is True
 
 
-def test_detect_sponsor_dropped_even_with_target_bug():
-    # 节目自己的赞助卡，即使带目标角标也删
-    chunks = [_chunk("a", "s", 0, 30, speech="本节目由华润集团赞助播出", bug="凤凰聚焦")]
+def test_detect_pure_sponsor_card_dropped():
+    # 基本是纯赞助卡（没什么新闻）→ 删
+    chunks = [_chunk("a", "s", 0, 10, speech="本节目由华润集团赞助播出", bug="凤凰聚焦")]
     res = ad.detect(chunks, cfg={**CFG, "use_llm": False}, fc_cfg=FC, schedule=SCHEDULE, source_items=[], override_column="凤凰聚焦")
     a = res["segments"][0]
     assert a["label"] == "sponsor" and a["keep"] is False
+
+
+def test_detect_sponsor_with_news_kept():
+    # 保新闻为先（修复开头丢失）：赞助语和大段新闻混在一起 → 保留新闻，不当赞助删
+    chunks = [_chunk("a", "s", 0, 60, bug="凤凰聚焦",
+                     speech="凤凰卫视《凤凰聚焦》节目由华润集团赞助播出，斯塔默宣布辞职，这是英国十年里第七次更换首相，英国政坛陷入动荡，工党面临危机")]
+    res = ad.detect(chunks, cfg={**CFG, "use_llm": False}, fc_cfg=FC, schedule=SCHEDULE, source_items=[], override_column="凤凰聚焦")
+    a = res["segments"][0]
+    assert a["keep"] is True and a["label"] == "target"
 
 
 def test_detect_promo_other_program_dropped_with_target_bug():
@@ -164,10 +173,23 @@ def test_detect_bridge_keeps_inner_unknown():
     assert b["keep"] is True and b["label"] == "bridge"
 
 
-def test_detect_unknown_outside_run_dropped():
+def test_detect_trailing_edge_kept():
+    # 结尾紧邻目标段、角标已撤的正片片段 → 向后生长保留（修复结尾丢失）
     chunks = [
         _chunk("a", "s", 0, 30, bug="纪录大时代"),
-        _chunk("b", "s", 30, 60, speech="结尾没有角标的模糊片段"),  # 之后再无目标段
+        _chunk("b", "s", 30, 60, speech="结尾角标已撤但仍是本栏目的收尾报道内容"),
+    ]
+    res = ad.detect(chunks, cfg={**CFG, "use_llm": False}, fc_cfg=FC, schedule=SCHEDULE, source_items=[], override_column="纪录大时代")
+    b = next(s for s in res["segments"] if s["segment_id"] == "b")
+    assert b["keep"] is True and b["label"] == "bridge"
+
+
+def test_detect_undecided_isolated_by_junk_dropped():
+    # 模糊段被杂质段（赞助）和目标段隔开、且自身不挨目标 → 不生长，丢弃
+    chunks = [
+        _chunk("a", "s", 0, 30, bug="纪录大时代"),
+        _chunk("x", "s", 30, 40, speech="本节目由华润集团赞助播出"),  # 纯赞助→drop，成为边界
+        _chunk("b", "s", 40, 70, speech="一段无角标且与目标段被赞助卡隔开的内容"),
     ]
     res = ad.detect(chunks, cfg={**CFG, "use_llm": False}, fc_cfg=FC, schedule=SCHEDULE, source_items=[], override_column="纪录大时代")
     b = next(s for s in res["segments"] if s["segment_id"] == "b")

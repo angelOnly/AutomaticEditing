@@ -21,7 +21,7 @@ from .llm import OpenAICompatibleClient
 from .utils import read_json, seconds_to_timecode
 
 PROMPT_DIR = Path(__file__).resolve().parent / "prompt_texts"
-PROMPT_VERSION = "ad_detection_v3_column_filter"
+PROMPT_VERSION = "ad_detection_v4_news_first"
 
 # 保留 / 删除标签
 LABEL_TARGET = "target"
@@ -49,6 +49,12 @@ SPONSOR_KEYWORDS = [
 ]
 PACKAGING_SCENES = {"片头包装", "片头", "片尾", "包装"}
 PACKAGING_FOOTAGE = {"片头包装", "片头", "片尾", "包装", "台标"}
+
+# 赞助/预告套话词，算“残余新闻量”时连同节目名一起剔除，只数真正的新闻文字
+_BOILERPLATE = [
+    "凤凰卫视", "凤凰", "资讯台", "中文台", "卫视", "节目", "播出", "正在", "本次", "本期", "主题",
+    "相关", "内容", "提及", "为您", "由", "的", "集团", "保险", "冠名", "赞助", "特约",
+]
 
 DEFAULT_VIP_NAMES = ["习近平", "李强", "赵乐际", "王沪宁", "蔡奇", "丁薛祥", "李希"]
 
@@ -86,6 +92,9 @@ def load_cfg(config: Any) -> dict[str, Any]:
         "safety_margin_seconds": float(raw.get("safety_margin_seconds", 0.4) or 0.0),
         "merge_gap_seconds": float(raw.get("merge_gap_seconds", 1.5) or 0.0),
         "min_clip_seconds": float(raw.get("min_clip_seconds", 3.0) or 0.0),
+        # 保新闻为先：赞助/预告/广告话术命中后，仅当“去掉话术+节目名+套话后剩余的新闻文字”
+        # 少于此字数（即基本是纯杂质）才删；和大段新闻混在一起时保留新闻。
+        "min_news_chars": int(raw.get("min_news_chars", 12) or 12),
         "extra_ad_keywords": [str(x) for x in raw.get("extra_ad_keywords", []) or []],
         "extra_promo_keywords": [str(x) for x in raw.get("extra_promo_keywords", []) or []],
     }
@@ -327,6 +336,23 @@ def resolve_target_column(
 # --------------------------------------------------------------------------- #
 # 逐段特征 + 标签
 # --------------------------------------------------------------------------- #
+def _residual_news_len(text: str, target: str, known_columns: list[str]) -> int:
+    """去掉赞助/预告/广告话术 + 节目名 + 套话 + 非中文后，剩下的真正新闻文字字数。
+
+    用来判断一段是“纯杂质（剩很少）”还是“新闻里夹了一句杂质（剩很多）”。
+    """
+    t = re.sub(r"《[^》]{0,15}》", "", text or "")
+    terms = (
+        AD_ACTION_KEYWORDS + SHOPPING_KEYWORDS + PROMO_KEYWORDS + TRAILER_KEYWORDS
+        + SPONSOR_KEYWORDS + _BOILERPLATE + [target] + list(known_columns)
+    )
+    for term in terms:
+        if term and not any(ch in ".^$*+?()[]{}|\\" for ch in term):
+            t = t.replace(term, "")
+    # 只数中文字符，剔除标点/数字/英文/空白
+    return len(re.sub(r"[^一-鿿]", "", t))
+
+
 def _classify_segment(
     *,
     speech: str,
@@ -341,8 +367,8 @@ def _classify_segment(
 ) -> tuple[str | None, str, str]:
     """返回 (label, keep_state, reason)。keep_state ∈ keep/drop/undecided。
 
-    策略：先正向删杂质（赞助/冠名、预告、广告——即使挂着目标角标也删），
-    再保留目标栏目正片，其余（其他栏目/包装台标/静音卡）删，最后模糊段交 LLM/bridge。
+    策略（保新闻为先）：杂质话术（赞助/冠名、预告、广告）只在“基本是纯杂质、没什么新闻”
+    时才删；和大段新闻混在一起就保留新闻。其他栏目（异角标）一律删。
     """
     text = _t2s(f"{speech} {screen_text}".strip())
     is_pkg = (bool(scene) and any(p in scene for p in PACKAGING_SCENES)) or any(
@@ -367,25 +393,28 @@ def _classify_segment(
     bracket_titles = [t for t in re.findall(r"《([^》]{2,15})》", text) if not column_match(t, target)]
     other_title = bracket_titles[0] if bracket_titles else ""
 
-    # 1) 赞助/冠名：即使带目标角标也删（节目自己的赞助卡也删）
-    sponsor_m = _SPONSOR_RE.search(text)
-    if sponsor_m:
-        return "sponsor", "drop", f"赞助/冠名：{sponsor_m.group(0)[:16]}"
+    # 保新闻为先：这段除去杂质话术/节目名/套话后，还剩多少真正的新闻文字
+    residual = _residual_news_len(text, target, known_columns)
+    news_substantial = residual >= int(cfg.get("min_news_chars", 12) or 12)
 
-    # 2) 预告/宣传：命中预告话术，且（提到别的节目 / 出现非目标《节目名》/ 当前段不是确凿目标正片）→ 删
-    #    这样能删掉“挂着目标角标却在预告其他节目”的段，又不误删节目自己的开场。
+    # 1) 赞助/冠名：基本是纯赞助卡才删；夹着大段新闻（如开头“由华润赞助…斯塔默辞职…”）保留新闻
+    sponsor_m = _SPONSOR_RE.search(text)
+    if sponsor_m and not news_substantial:
+        return "sponsor", "drop", f"赞助/冠名卡：{sponsor_m.group(0)[:16]}"
+
+    # 2) 预告/宣传：命中预告话术，且（提到别的节目 / 非目标《节目名》/ 非目标正片），且基本无新闻实质 → 删
     promo_kw = _hit(text, PROMO_KEYWORDS + cfg.get("extra_promo_keywords", []))
-    if promo_kw and (mentions_other or other_title or not detected_target):
+    if promo_kw and (mentions_other or other_title or not detected_target) and not news_substantial:
         reason_extra = f"《{other_title}》" if other_title else (f"其他栏目:{detected_other}" if mentions_other else "")
-        return "promo", "drop", f"预告/宣传：{promo_kw} {reason_extra}".strip()
-    if _hit(text, TRAILER_KEYWORDS) and not detected_target:
+        return "promo", "drop", f"预告/宣传卡：{promo_kw} {reason_extra}".strip()
+    if _hit(text, TRAILER_KEYWORDS) and not detected_target and not news_substantial:
         return "trailer_other", "drop", "片尾结束语（非目标栏目）"
 
-    # 3) 商业广告：行动号召/购物话术
+    # 3) 商业广告：行动号召/购物话术，且基本无新闻实质 → 删（新闻里偶提“扫码/赞助”不误删）
     ad_kw = _hit(text, AD_ACTION_KEYWORDS + cfg.get("extra_ad_keywords", []))
-    if ad_kw:
-        return "ad", "drop", f"广告行动号召：{ad_kw}"
-    if _hit(text, SHOPPING_KEYWORDS) and not detected_target:
+    if ad_kw and not news_substantial:
+        return "ad", "drop", f"广告卡：{ad_kw}"
+    if _hit(text, SHOPPING_KEYWORDS) and not detected_target and not news_substantial:
         return "ad", "drop", "保健品/夸大话术"
 
     # 4) 目标栏目正片（角标或片头大标题命中目标）
@@ -531,7 +560,12 @@ def detect(
 
 
 def _resolve_keep(segments: list[dict[str, Any]], fc_cfg: dict[str, Any]) -> None:
-    """先按 keep_state 定 keep；再对 undecided 做 bridge 兜底（夹在目标栏目段落中间则保留）。"""
+    """先按 keep_state 定 keep；再让目标栏目段“向两侧生长”，把紧邻的、像正片的无角标段纳入。
+
+    与旧版“必须前后两侧都有目标”不同：这里从目标段沿相邻的 undecided 段向前/向后蔓延，
+    一直到碰见杂质(drop)段为止。这样开头第一句、结尾最后一句（角标还没出现/已撤）也能保住，
+    而插播的广告/赞助/片头(都是 drop)会成为边界挡住蔓延、不会被带进来。
+    """
     bridge = bool(fc_cfg.get("bridge_keep_within_run", True))
     max_gap = float(fc_cfg.get("bridge_max_gap_seconds", 90.0) or 0.0)
     for rec in segments:
@@ -540,7 +574,7 @@ def _resolve_keep(segments: list[dict[str, Any]], fc_cfg: dict[str, Any]) -> Non
         elif rec["keep_state"] == "drop":
             rec["keep"] = False
         else:
-            rec["keep"] = None  # 待 bridge 决定
+            rec["keep"] = None  # undecided：待 bridge 蔓延决定
 
     if not bridge:
         for rec in segments:
@@ -555,22 +589,25 @@ def _resolve_keep(segments: list[dict[str, Any]], fc_cfg: dict[str, Any]) -> Non
     for recs in by_source.values():
         recs.sort(key=lambda r: float(r["start_seconds"]))
         n = len(recs)
-        for i, rec in enumerate(recs):
-            if rec["keep"] is not None:
-                continue
-            # 找前后最近的“确定保留(目标栏目)”段
-            prev_keep = next((recs[j] for j in range(i - 1, -1, -1) if recs[j].get("keep") is True), None)
-            nxt_keep = next((recs[j] for j in range(i + 1, n) if recs[j].get("keep") is True), None)
-            gap_ok = True
-            if prev_keep and float(rec["start_seconds"]) - float(prev_keep["end_seconds"]) > max_gap:
-                gap_ok = False
-            if nxt_keep and float(nxt_keep["start_seconds"]) - float(rec["end_seconds"]) > max_gap:
-                gap_ok = False
-            if prev_keep and nxt_keep and gap_ok:
-                rec["keep"] = True
-                rec["label"] = "bridge"
-                rec["reason"] = f"{rec.get('reason', '')}; 夹在目标栏目中间，保留连续"
-            else:
+        # 迭代蔓延：undecided 段若与一个“已保留”相邻（间隔 <= max_gap）则纳入；
+        # drop 段 keep=False 不会蔓延，自然成为边界。直到不再变化。
+        changed = True
+        while changed:
+            changed = False
+            for i, rec in enumerate(recs):
+                if rec.get("keep") is not None:
+                    continue
+                left = recs[i - 1] if i > 0 else None
+                right = recs[i + 1] if i < n - 1 else None
+                attach_left = bool(left and left.get("keep") is True and float(rec["start_seconds"]) - float(left["end_seconds"]) <= max_gap)
+                attach_right = bool(right and right.get("keep") is True and float(right["start_seconds"]) - float(rec["end_seconds"]) <= max_gap)
+                if attach_left or attach_right:
+                    rec["keep"] = True
+                    rec["label"] = "bridge"
+                    rec["reason"] = f"{rec.get('reason', '')}; 紧邻目标栏目正片，保留连续".strip("; ")
+                    changed = True
+        for rec in recs:
+            if rec.get("keep") is None:
                 rec["keep"] = False
                 rec["label"] = "unknown_drop"
 

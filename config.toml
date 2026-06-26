@@ -468,6 +468,9 @@ merge_gap_seconds = 1.5
 min_clip_seconds = 3.0
 # 孤立超短广告块（被新闻包夹）短于此值则不单独删，避免成片抖动（秒）
 min_isolated_ad_seconds = 3.0
+# 保新闻为先：赞助/预告/广告话术命中后，去掉话术+节目名+套话后剩余的新闻文字 >= 此字数就保留新闻
+# （开头“由华润赞助播出…斯塔默辞职…”这类会被保留；纯赞助卡/预告卡剩字很少会被删）
+min_news_chars = 12
 # 业务可在不改代码的情况下扩充关键词
 extra_ad_keywords = []
 extra_promo_keywords = []
