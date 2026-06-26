@@ -167,6 +167,8 @@ const state = {
   contextMenu: null,
   latestDraft: null,
   drafts: [],
+  adReport: null,
+  programColumns: [],
   previewRequestId: 0,
   activeSourceItem: null,
   sourceRecoveryTried: false,
@@ -247,6 +249,8 @@ async function loadConfig() {
     state.remotePagination.pageSize = remote.default_page_size || 10;
     state.remotePageSize = remote.default_page_size || 10;
     fillRemoteStationSelect(remote.default_record_station || "");
+    state.programColumns = config.full_concat?.program_columns || [];
+    fillColumnOptions();
     fillVoiceSelect();
     applyDefaultControls();
   } catch (error) {
@@ -254,6 +258,14 @@ async function loadConfig() {
     fillVoiceSelect();
     applyDefaultControls();
   }
+}
+
+function fillColumnOptions() {
+  const list = $("columnOptions");
+  if (!list) return;
+  list.innerHTML = (state.programColumns || [])
+    .map((c) => `<option value="${escapeAttr(c)}"></option>`)
+    .join("");
 }
 
 function fillRemoteStationSelect(defaultStation) {
@@ -499,6 +511,7 @@ function bindEvents() {
   $("confirmLongVideo").addEventListener("click", confirmLongVideo);
   $("generateCommentary")?.addEventListener("click", () => openCommentary());
   $("showAdReport")?.addEventListener("click", () => openAdReport());
+  $("editVipPersons")?.addEventListener("click", () => openVipEditor());
   $("commentaryRegen")?.addEventListener("click", () => openCommentary({ refresh: true }));
   $("commentaryCopy")?.addEventListener("click", copyCommentaryMarkdown);
   document.querySelectorAll("[data-commentary-close]").forEach((el) => {
@@ -547,7 +560,9 @@ function updateActiveSteps() {
 function onProductionModeChange() {
   const mode = $("productionMode").value;
   const isReassembly = mode === "highlight_reassembly";
+  const isFullConcat = mode === "full_concat";
   const isOriginalAudio = modeUsesOriginalAudio(mode);
+  $("fullConcatControls")?.classList.toggle("hidden", !isFullConcat);
   syncSuggestedTaskIdForMode();
   // 重组专属控件（最短片段数）只在视频重组下显示，完整版不用
   ["reassemblyMaxClipCountWrap"].forEach((id) => {
@@ -1618,12 +1633,50 @@ function syncCommentaryButton() {
   syncAdReportButton();
 }
 
+const AD_LABEL_CN = {
+  other_column: "其他栏目",
+  ad: "商业广告",
+  promo: "频道宣传/预告",
+  sponsor: "赞助播报",
+  trailer_other: "片尾(非目标)",
+  packaging_other: "其他栏目片头/包装",
+  station_id: "台标/垫片",
+  unknown_drop: "无法归属",
+};
+
 function syncAdReportButton() {
   const btn = $("showAdReport");
   if (!btn) return;
   const isFullConcat = currentTaskMode() === "full_concat";
   const hasDraft = Array.isArray(state.drafts) && state.drafts.length > 0;
-  btn.classList.toggle("hidden", !(isFullConcat && hasDraft && state.selectedTask));
+  const show = isFullConcat && hasDraft && state.selectedTask;
+  btn.classList.toggle("hidden", !show);
+  if (show) refreshAdReportBadge();
+  else setVipBadge(null);
+}
+
+async function refreshAdReportBadge() {
+  try {
+    const data = await api(`/api/tasks/${encodeURIComponent(state.selectedTask)}/ad-report`);
+    state.adReport = data;
+    setVipBadge(data.vip);
+  } catch (error) {
+    setVipBadge(null);
+  }
+}
+
+function setVipBadge(vip) {
+  const badge = $("vipBadge");
+  if (!badge) return;
+  if (!vip) {
+    badge.classList.add("hidden");
+    return;
+  }
+  const present = Boolean(vip.present);
+  badge.classList.remove("hidden");
+  badge.textContent = present ? "🔥" : "🍀";
+  badge.classList.toggle("vip-present", present);
+  badge.title = present ? `涉及重点人物：${(vip.names || []).join("、")}` : "未涉及重点人物";
 }
 
 async function openAdReport() {
@@ -1631,7 +1684,11 @@ async function openAdReport() {
   showCommentaryModal();
   setCommentaryMessage("正在加载移除广告报告……");
   try {
-    const data = await api(`/api/tasks/${encodeURIComponent(state.selectedTask)}/ad-report`);
+    const data = state.adReport && state.adReport.task_id === state.selectedTask
+      ? state.adReport
+      : await api(`/api/tasks/${encodeURIComponent(state.selectedTask)}/ad-report`);
+    state.adReport = data;
+    setVipBadge(data.vip);
     renderAdReportBody(data);
   } catch (error) {
     setCommentaryMessage(`加载失败：${cleanError(error)}`, true);
@@ -1646,24 +1703,33 @@ function renderAdReportBody(data) {
 
   const stats = data.stats || {};
   const blocks = Array.isArray(data.removed_blocks) ? data.removed_blocks : [];
+  const vip = data.vip || {};
 
   const title = document.createElement("h1");
   title.className = "commentary-title";
-  title.textContent = "完整版 · 移除广告报告";
+  title.textContent = "完整版 · 移除报告";
   body.appendChild(title);
+
+  const target = document.createElement("p");
+  target.className = "ad-report-summary";
+  const srcCn = { manual: "手动指定", column_bug: "角标识别", schedule: "排期推断", unknown: "未识别" };
+  target.innerHTML =
+    `目标栏目：<strong>${escapeHtml(data.target_column || "未识别")}</strong>` +
+    `（${escapeHtml(srcCn[data.target_column_source] || data.target_column_source || "")}）` +
+    ` ${vip.present ? "🔥 涉及重点人物：" + escapeHtml((vip.names || []).join("、")) : "🍀 未涉及重点人物"}`;
+  body.appendChild(target);
 
   const summary = document.createElement("p");
   summary.className = "ad-report-summary";
   summary.textContent =
-    `共分析 ${stats.segment_count || 0} 段，移除 ${stats.removed_block_count || blocks.length} 个广告块，` +
+    `共分析 ${stats.segment_count || 0} 段，移除 ${stats.removed_block_count || blocks.length} 段非目标内容，` +
     `约 ${Math.round(stats.removed_seconds || 0)} 秒；保留约 ${Math.round(stats.kept_seconds || 0)} 秒。` +
     (stats.llm_used ? "（含大模型判定）" : "（仅规则判定）");
   body.appendChild(summary);
 
-  const LABEL_CN = { ad: "商业广告", promo: "频道宣传/预告", trailer: "片头片尾", station_id: "台标/垫片", sponsor: "赞助播报" };
   if (!blocks.length) {
     const empty = document.createElement("p");
-    empty.textContent = "没有检测到需要移除的广告片段。";
+    empty.textContent = "没有检测到需要移除的片段。";
     body.appendChild(empty);
     return;
   }
@@ -1672,7 +1738,7 @@ function renderAdReportBody(data) {
   blocks.forEach((b) => {
     const row = document.createElement("div");
     row.className = "ad-report-item";
-    const label = LABEL_CN[b.label] || b.label || "广告";
+    const label = AD_LABEL_CN[b.label] || b.label || "非目标";
     row.innerHTML =
       `<span class="ad-report-time">${escapeHtml(b.start || "")} - ${escapeHtml(b.end || "")}</span>` +
       `<span class="ad-report-tag">${escapeHtml(label)}</span>` +
@@ -1680,6 +1746,60 @@ function renderAdReportBody(data) {
     list.appendChild(row);
   });
   body.appendChild(list);
+}
+
+async function openVipEditor() {
+  showCommentaryModal();
+  setCommentaryMessage("正在加载重点人物名单……");
+  let data;
+  try {
+    data = await api("/api/vip-persons");
+  } catch (error) {
+    setCommentaryMessage(`加载失败：${cleanError(error)}`, true);
+    return;
+  }
+  const body = $("commentaryBody");
+  if (!body) return;
+  body.classList.remove("commentary-message");
+  body.innerHTML = "";
+  const title = document.createElement("h1");
+  title.className = "commentary-title";
+  title.textContent = "重点人物配置";
+  body.appendChild(title);
+  const hint = document.createElement("p");
+  hint.className = "ad-report-summary";
+  hint.textContent = "每行一个人名。保留内容里命中任一即在报告旁显示 🔥。保存后即时生效（文件中的打底名单仅作初始值）。";
+  body.appendChild(hint);
+  const ta = document.createElement("textarea");
+  ta.id = "vipNamesInput";
+  ta.className = "vip-names-input";
+  ta.rows = 10;
+  ta.value = (data.names || []).join("\n");
+  body.appendChild(ta);
+  const bar = document.createElement("div");
+  bar.className = "vip-edit-bar";
+  const saveBtn = document.createElement("button");
+  saveBtn.className = "button";
+  saveBtn.textContent = "保存";
+  saveBtn.addEventListener("click", () => saveVipPersons(ta.value));
+  const resetBtn = document.createElement("button");
+  resetBtn.className = "button secondary";
+  resetBtn.textContent = "恢复打底名单";
+  resetBtn.addEventListener("click", () => { ta.value = (data.baseline || []).join("\n"); });
+  bar.appendChild(saveBtn);
+  bar.appendChild(resetBtn);
+  body.appendChild(bar);
+}
+
+async function saveVipPersons(text) {
+  const names = String(text || "").split(/[\n,，、]/).map((s) => s.trim()).filter(Boolean);
+  try {
+    await api("/api/vip-persons", { method: "PUT", body: JSON.stringify({ names }) });
+    alert("已保存重点人物名单。下次运行完整版即按新名单检测。");
+    closeCommentaryModal();
+  } catch (error) {
+    alert(`保存失败：${cleanError(error)}`);
+  }
 }
 
 function ridFromDraftFile(file) {
@@ -1821,6 +1941,7 @@ function restoreRunControls(manifest) {
   $("reassemblyOutputMode").value = $("outputMode")?.value === "multiple" ? "multiple" : "single";
   $("reassemblySortMode").value = "editorial";
   if (opts.reassembly_max_clip_count) $("reassemblyMaxClipCount").value = opts.reassembly_max_clip_count;
+  if ($("targetColumn")) $("targetColumn").value = opts.target_column || "";
   if (opts.voice_id && $("voiceSelect")) $("voiceSelect").value = opts.voice_id;
   onProductionModeChange();
   if (opts.voice_id && $("voiceSelect")) $("voiceSelect").value = opts.voice_id;
@@ -2291,6 +2412,7 @@ function baseRunRequest() {
     reassembly_sort_mode: $("reassemblySortMode").value,
     reassembly_target_seconds: productionMode === "highlight_reassembly" ? targetDuration : null,
     reassembly_max_clip_count: Number($("reassemblyMaxClipCount").value || 8),
+    target_column: productionMode === "full_concat" ? ($("targetColumn")?.value || "").trim() : null,
     chunk_seconds: Number($("chunkSeconds").value || state.defaults.default_chunk_seconds || 60),
     frame_interval: Number($("frameInterval").value || state.defaults.default_frame_interval || 5),
     aspect_ratio: $("aspectRatio").value,

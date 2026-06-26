@@ -435,9 +435,15 @@ risk_block_threshold = "high"
 # 完整版·去广告模式（与 ai_voiceover / highlight_reassembly 并列）
 enabled = true
 default_aspect_ratio = "16:9"
+# 目标栏目确定方式：auto=角标多数票为主+排期表兜底（推荐）；schedule=只按排期表；manual=只用前端传入
+target_column_mode = "auto"
+# 节目内没角标的模糊镜头（空镜/B-roll）夹在目标栏目段落中间时是否保留（保证连续）
+bridge_keep_within_run = true
+# bridge 兜底允许的相邻间隔（秒），超过则不视为同一段连续节目
+bridge_max_gap_seconds = 90.0
 
 [ad_detection]
-# 广告检测（full_concat 专用）。信号：ASR 文案 + 画面（screen_text/visual/scene）
+# 广告检测（full_concat 专用）。信号：ASR 文案 + 画面（screen_text/column_bug/scene）
 enabled = true
 use_llm = true
 # 用哪个文本 provider 做模糊段兜底分类：deepseek / doubao / openai；留空回退全局 text_llm_provider
@@ -460,5 +466,93 @@ min_isolated_ad_seconds = 3.0
 extra_ad_keywords = []
 extra_promo_keywords = []
 extra_news_keywords = []
+
+[vip_persons]
+# 重点人物：保留内容里命中任一即在前端报告旁显示 🔥，否则 🍀。
+# 这里只是“打底”名单；前端可在线编辑并写入 store_file，运行时优先读 store_file。
+names = ["习近平", "李强", "赵乐际", "王沪宁", "蔡奇", "丁薛祥", "李希"]
+store_file = "data/vip_persons.json"
+
+[program_schedule]
+# 凤凰资讯台节目表：按所选素材文件名时间戳(YYYYMMDD_HHMMSS)推断目标栏目（auto 模式做兜底/默认）。
+# days 用 0-6 表示周一~周日；time 为该栏目开播时间。排期变动时改这里即可。
+enabled = true
+
+[[program_schedule.entries]]
+column = "纪录大时代"
+time = "16:30"
+days = [0, 1, 2, 3, 4, 5, 6]
+[[program_schedule.entries]]
+column = "亚洲财经透视"
+time = "19:00"
+days = [0, 1, 2, 3, 4]
+[[program_schedule.entries]]
+column = "凤凰大视野"
+time = "20:00"
+days = [0, 1, 2, 3, 4]
+[[program_schedule.entries]]
+column = "凤凰聚焦"
+time = "22:00"
+days = [0, 1, 2, 3, 4]
+[[program_schedule.entries]]
+column = "问答神州"
+time = "20:30"
+days = [0]
+[[program_schedule.entries]]
+column = "时事亮点"
+time = "20:30"
+days = [1]
+[[program_schedule.entries]]
+column = "军情观察室"
+time = "20:30"
+days = [2]
+[[program_schedule.entries]]
+column = "风云对话"
+time = "20:30"
+days = [3]
+[[program_schedule.entries]]
+column = "空间观策"
+time = "20:30"
+days = [4]
+[[program_schedule.entries]]
+column = "皇牌大放送"
+time = "19:00"
+days = [5]
+[[program_schedule.entries]]
+column = "石评天下"
+time = "19:30"
+days = [5]
+[[program_schedule.entries]]
+column = "冷暖人生"
+time = "20:00"
+days = [5]
+[[program_schedule.entries]]
+column = "文化大观园"
+time = "20:30"
+days = [5]
+[[program_schedule.entries]]
+column = "筑梦天下"
+time = "19:00"
+days = [6]
+[[program_schedule.entries]]
+column = "大新闻大历史"
+time = "19:15"
+days = [6]
+[[program_schedule.entries]]
+column = "凤凰大健康"
+time = "19:30"
+days = [6]
+[[program_schedule.entries]]
+column = "近观中国"
+time = "22:00"
+days = [6]
+[[program_schedule.entries]]
+column = "发现大湾区"
+time = "20:30"
+days = [6]
+[[program_schedule.entries]]
+column = "笑逐言开"
+time = "22:45"
+days = [6]
 
 # conda activate comfy_5090_313_auto

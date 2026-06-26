@@ -173,6 +173,7 @@ class RunOptions:
     reassembly_max_clip_seconds: float = 45.0
     reassembly_max_clip_count: int = 8
     reassembly_export_individual_clips: bool = False
+    target_column: str | None = None
 
 
 class PipelineRunner:
@@ -362,6 +363,7 @@ class PipelineRunner:
             "reassembly_target_seconds": self.options.reassembly_target_seconds,
             "reassembly_max_clip_count": self.options.reassembly_max_clip_count,
             "reassembly_export_individual_clips": self.options.reassembly_export_individual_clips,
+            "target_column": self.options.target_column,
             "updated_at": now_iso(),
         }
         if self.options.allow_long_video and self.manifest.get("action_required", {}).get("type") == "confirm_long_video":
@@ -2242,7 +2244,7 @@ class PipelineRunner:
         provider = llm_cfg.get("vision_llm_provider", "openai")
         model = self.options.model or llm_cfg.get(f"vision_{provider}_model_name")
         fallback = llm_cfg.get(f"vision_{provider}_fallback_models", [])
-        prompt_version = self.options.prompt_version or "vision_chunk_v2"
+        prompt_version = self.options.prompt_version or "vision_chunk_v3_column_bug"
         base_input_hash = stable_hash({
             "chunks": self._step_content_hash("chunk_build"),
             "asr": self._step_content_hash("asr"),
@@ -2422,6 +2424,7 @@ class PipelineRunner:
                 "asr_digest": asr_digest_by_id.get(str(chunk["chunk_id"]), ""),
                 "asr_segments": segs,
                 "scene_type": vr.get("scene_type", ""),
+                "column_bug": vr.get("column_bug", ""),
                 "visual_summary": vr.get("visual_summary") or vr.get("visual", ""),
                 "frame_shots": vr.get("frame_shots", []),
                 "footage_types": vr.get("footage_types", []),
@@ -2476,6 +2479,7 @@ class PipelineRunner:
                 "speech": compact_asr_for_llm(item.get("asr_digest") or item.get("asr_text", ""), max_chars=int(llm_input_cfg.get("max_asr_chars_per_chunk", 320))),
                 "visual": compact_text(item.get("visual_summary", ""), max_chars=int(llm_input_cfg.get("max_visual_chars_per_chunk", 160))),
                 "screen_text": compact_list(item.get("screen_text", []), max_items=int(llm_input_cfg.get("max_screen_text_items", 5))),
+                "column_bug": item.get("column_bug", ""),
                 "people": compact_list(item.get("visible_people", []), max_items=int(llm_input_cfg.get("max_people_items", 5))),
                 "scene": item.get("scene_type", ""),
                 "frame_shots": item.get("frame_shots", []),
@@ -5035,6 +5039,7 @@ class PipelineRunner:
             "visual": visual,
             "visual_summary": visual,
             "scene_type": str(raw.get("scene_type") or ""),
+            "column_bug": str(raw.get("column_bug") or "").strip(),
             "screen_text": screen_text,
             "visible_people": visible_people,
             "location_clues": location_clues,
@@ -10691,11 +10696,20 @@ class PipelineRunner:
         if not cfg.get("enabled", True):
             self._mark_skipped("ad_detection", "disabled in config")
             return
+        fc_cfg = ad_detection.load_full_concat_cfg(self.config)
+        schedule = ad_detection.load_schedule(self.config)
+        vip_names = ad_detection.load_vip_names(self.config)
+        source_items = self._iter_source_items()
+        override_column = (self.options.target_column or "").strip() or None
         digest = self._load_current_timeline_digest()
         chunks = digest.get("chunks", []) if isinstance(digest, dict) else []
         input_hash = stable_hash({
             "timeline_digest": self._current_timeline_digest_hash() or self._step_content_hash("timeline_digest"),
             "ad_detection_cfg": cfg,
+            "full_concat_cfg": fc_cfg,
+            "schedule": schedule,
+            "vip_names": vip_names,
+            "override_column": override_column,
             "prompt_version": ad_detection.PROMPT_VERSION,
         })
         if self._can_reuse("ad_detection", input_hash):
@@ -10708,10 +10722,22 @@ class PipelineRunner:
             llm_call = ad_detection.build_llm_call(self.config, cfg)
         except Exception as exc:  # noqa: BLE001 - LLM 构造失败不致命，规则层照常出片
             print(f"ad_detection: LLM 不可用，仅用规则层 ({exc})")
-        result = ad_detection.detect(chunks, cfg=cfg, llm_call=llm_call)
+        result = ad_detection.detect(
+            chunks,
+            cfg=cfg,
+            fc_cfg=fc_cfg,
+            schedule=schedule,
+            source_items=source_items,
+            override_column=override_column,
+            vip_names=vip_names,
+            llm_call=llm_call,
+        )
         out = write_json(vdir / "ad_detection.json", {
             "version": ad_detection.PROMPT_VERSION,
             "production_mode": "full_concat",
+            "target_column": result["target_column"],
+            "target_column_source": result["target_column_source"],
+            "vip": result["vip"],
             "segments": result["segments"],
             "blocks": result["blocks"],
             "stats": result["stats"],
@@ -10719,7 +10745,11 @@ class PipelineRunner:
         self._write_status(vdir, self._base_status("ad_detection", version, input_hash, [out]))
         self._record_step(step="ad_detection", version=version, status="success", output=relpath(out, self.task_dir), input_hash=input_hash, output_files=[out], extra={"summary": result["stats"]})
         stats = result["stats"]
-        print(f"完成: ad_detection (移除 {stats.get('removed_block_count', 0)} 个广告块 / {stats.get('removed_seconds', 0)}s)")
+        print(
+            f"完成: ad_detection (目标栏目={result['target_column'] or '未识别'}/{result['target_column_source']}, "
+            f"移除 {stats.get('removed_block_count', 0)} 块/{stats.get('removed_seconds', 0)}s, "
+            f"VIP={'有' if result['vip'].get('present') else '无'})"
+        )
 
     def step_full_concat_plan(self) -> None:
         detection = self._load_step_json("ad_detection")
@@ -10754,6 +10784,9 @@ class PipelineRunner:
             "project_id": self.task_id,
             "production_mode": "full_concat",
             "source_video": self.manifest.get("source_video", ""),
+            "target_column": detection.get("target_column", ""),
+            "target_column_source": detection.get("target_column_source", ""),
+            "vip": detection.get("vip", {}),
             "output_videos": [video],
             "ad_stats": detection.get("stats", {}),
             "removed_blocks": detection.get("blocks", []),
@@ -10813,6 +10846,9 @@ class PipelineRunner:
             "version": version,
             "outputs": outputs,
             "skipped_outputs": skipped_outputs,
+            "target_column": plan.get("target_column", ""),
+            "target_column_source": plan.get("target_column_source", ""),
+            "vip": plan.get("vip", {}),
             "ad_stats": plan.get("ad_stats", {}),
             "removed_blocks": plan.get("removed_blocks", []),
         })
@@ -11616,6 +11652,7 @@ def parse_args(argv: list[str] | None = None) -> RunOptions:
     parser.add_argument("--reassembly-max-clip-seconds", type=float, default=45.0)
     parser.add_argument("--reassembly-max-clip-count", type=int, default=8)
     parser.add_argument("--reassembly-export-individual-clips", action="store_true")
+    parser.add_argument("--target-column", default=None, help="完整版目标栏目（留空则自动按角标/排期推断）")
     args = parser.parse_args(argv)
     if args.output_mode == "single":
         args.max_output_videos = 1

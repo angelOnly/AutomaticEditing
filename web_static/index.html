@@ -180,6 +180,15 @@
                 </div>
               </div>
 
+              <div id="fullConcatControls" class="control-strip hidden">
+                <label>
+                  <span>目标栏目（留空自动按角标/排期识别）</span>
+                  <input id="targetColumn" list="columnOptions" placeholder="如：纪录大时代（可不填）" />
+                  <datalist id="columnOptions"></datalist>
+                </label>
+                <button type="button" id="editVipPersons" class="mini-button">重点人物配置</button>
+              </div>
+
               <div class="control-strip">
                 <label class="visually-hidden-control">
                   <span>内部编号</span>
@@ -327,7 +336,7 @@
                 <div id="previewListTitle" class="draft-title">成片列表</div>
                 <div id="draftList" class="draft-list">当前任务还没有生成粗剪视频。</div>
                 <button id="generateCommentary" class="button secondary commentary-btn hidden"><i data-lucide="newspaper"></i><span>图文解说</span></button>
-                <button id="showAdReport" class="button secondary commentary-btn hidden"><i data-lucide="scissors"></i><span>移除广告报告</span></button>
+                <button id="showAdReport" class="button secondary commentary-btn hidden"><i data-lucide="scissors"></i><span>移除广告报告</span><span id="vipBadge" class="vip-badge hidden" title=""></span></button>
               </div>
             </section>
 

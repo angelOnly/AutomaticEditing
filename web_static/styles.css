@@ -1426,6 +1426,31 @@ select:focus {
   overflow-wrap: anywhere;
 }
 
+.vip-badge {
+  margin-left: 6px;
+  font-size: 15px;
+  line-height: 1;
+}
+
+.vip-names-input {
+  width: 100%;
+  box-sizing: border-box;
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  border-radius: 10px;
+  background: rgba(15, 23, 42, 0.35);
+  color: inherit;
+  padding: 10px;
+  font-size: 14px;
+  line-height: 1.8;
+  resize: vertical;
+}
+
+.vip-edit-bar {
+  display: flex;
+  gap: 10px;
+  margin-top: 12px;
+}
+
 .draft-item strong {
   overflow-wrap: anywhere;
   font-size: 12px;

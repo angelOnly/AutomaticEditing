@@ -37,6 +37,7 @@ from newsclip_agent.utils import ensure_dir, read_json, relpath, seconds_to_time
 from newsclip_agent.tts_omnivoice import generate_omnivoice_audio
 from newsclip_agent.job_store import JobStore
 from newsclip_agent import commentary
+from newsclip_agent import ad_detection
 
 
 ROOT = Path(__file__).resolve().parent
@@ -235,6 +236,7 @@ class RunRequest(BaseModel):
     reassembly_target_seconds: int | None = None
     reassembly_max_clip_count: int = 8
     reassembly_export_individual_clips: bool = False
+    target_column: str | None = None
     reuse_from_task_id: str | None = None
     client_id: str | None = None
 
@@ -291,6 +293,10 @@ def get_config() -> dict[str, Any]:
             station_counts=_remote_station_counts_snapshot(),
             station_count_errors=_remote_station_count_errors_snapshot(),
         ),
+        "full_concat": {
+            "enabled": bool((PROJECT_CONFIG.raw.get("full_concat", {}) or {}).get("enabled", True)),
+            "program_columns": ad_detection.schedule_columns(ad_detection.load_schedule(PROJECT_CONFIG)),
+        },
     }
 
 
@@ -1156,6 +1162,9 @@ def get_task_ad_report(task_id: str) -> dict[str, Any]:
             "outputs": [],
             "removed_blocks": plan.get("removed_blocks", []),
             "ad_stats": plan.get("ad_stats", {}),
+            "target_column": plan.get("target_column", ""),
+            "target_column_source": plan.get("target_column_source", ""),
+            "vip": plan.get("vip", {}),
         }
 
     videos = []
@@ -1176,10 +1185,48 @@ def get_task_ad_report(task_id: str) -> dict[str, Any]:
     return {
         "task_id": task_id,
         "production_mode": mode,
+        "target_column": data.get("target_column", ""),
+        "target_column_source": data.get("target_column_source", ""),
+        "vip": data.get("vip", {}),
         "stats": data.get("ad_stats", {}),
         "removed_blocks": data.get("removed_blocks", []),
         "videos": videos,
     }
+
+
+def _vip_store_path() -> Path:
+    raw = (PROJECT_CONFIG.raw.get("vip_persons", {}) or {})
+    store = raw.get("store_file") or "data/vip_persons.json"
+    p = Path(store)
+    return p if p.is_absolute() else ROOT / p
+
+
+@app.get("/api/vip-persons")
+def get_vip_persons() -> dict[str, Any]:
+    """返回当前生效的重点人物名单（store_file 优先，否则 config 打底）+ 打底名单。"""
+    raw = (PROJECT_CONFIG.raw.get("vip_persons", {}) or {})
+    baseline = [str(x).strip() for x in (raw.get("names") or ad_detection.DEFAULT_VIP_NAMES) if str(x).strip()]
+    return {
+        "names": ad_detection.load_vip_names(PROJECT_CONFIG),
+        "baseline": baseline,
+        "store_file": relpath(_vip_store_path(), ROOT),
+    }
+
+
+class VipPersonsRequest(BaseModel):
+    names: list[str]
+
+
+@app.put("/api/vip-persons")
+def put_vip_persons(req: VipPersonsRequest) -> dict[str, Any]:
+    """前端在线编辑重点人物名单，写入 store_file，运行时优先读取。"""
+    names: list[str] = []
+    for raw_name in req.names or []:
+        name = str(raw_name).strip()
+        if name and name not in names:
+            names.append(name)
+    write_json(_vip_store_path(), {"names": names, "updated_at": datetime.now().isoformat(timespec="seconds")})
+    return {"names": names, "store_file": relpath(_vip_store_path(), ROOT)}
 
 
 @app.post("/api/run")
@@ -1410,6 +1457,8 @@ def _build_run_command(
             cmd.extend(["--reassembly-target-seconds", str(req.reassembly_target_seconds)])
         if req.reassembly_export_individual_clips:
             cmd.append("--reassembly-export-individual-clips")
+    if req.production_mode == "full_concat" and (req.target_column or "").strip():
+        cmd.extend(["--target-column", req.target_column.strip()])
     if input_path:
         cmd.extend(["--input", str(input_path)])
     if source_manifest_path:
