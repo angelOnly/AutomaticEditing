@@ -21,7 +21,7 @@ from .llm import OpenAICompatibleClient
 from .utils import read_json, seconds_to_timecode
 
 PROMPT_DIR = Path(__file__).resolve().parent / "prompt_texts"
-PROMPT_VERSION = "ad_detection_v4_news_first"
+PROMPT_VERSION = "ad_detection_v5_frame_junk_split"
 
 # 保留 / 删除标签
 LABEL_TARGET = "target"
@@ -39,13 +39,20 @@ PROMO_KEYWORDS = [
     "敬请收看", "敬请期待", "即将播出", "稍后播出", "稍后为您播出", "精彩继续", "不要走开",
     "不要离开", "锁定本台", "锁定资讯台", "锁定凤凰", "下节目", "更多精彩节目",
     "节目预告", "片花", "明天此时", "节目宣传", "每[日晚天周].{0,4}[点時點]播出",
-    "每[日晚天].{0,4}[点時點]", "于.{0,8}播出", "敬请关注",
+    "每[日晚天].{0,4}[点時點]", "每[日晚天].{0,8}[0-9一二三四五六七八九十:：]{1,8}",
+    "于.{0,8}播出", "敬请关注", "宣传内容", "节目宣传内容", "主打.{0,12}要闻",
 ]
 TRAILER_KEYWORDS = ["感谢收看", "下期再见", "下次再见", "节目到此结束"]
 # 赞助/冠名（含节目自己的赞助卡，按用户要求也删）
 SPONSOR_KEYWORDS = [
     "赞助播出", "特约播出", "独家冠名", "鸣谢", "冠名播出", "由.{0,12}赞助", "由.{0,12}特约",
     "由.{0,12}冠名", ".{0,12}冠名",
+]
+SPONSOR_CARD_KEYWORDS = ["有华润多美好", "有華潤多美好", "What a Wonderful Life"]
+NON_TARGET_PROMO_MARKERS = [
+    "TRAVELOGUE", "CGTN", "PHOENIX MORNING EXPRESS", "凤凰早班车", "鳳凰早班車",
+    "凤凰全球连线", "鳳凰全球連線", "CHIMELONG RESORT", "长隆度假区", "鳳凰資訊",
+    "凤凰资讯", "News that matters",
 ]
 PACKAGING_SCENES = {"片头包装", "片头", "片尾", "包装"}
 PACKAGING_FOOTAGE = {"片头包装", "片头", "片尾", "包装", "台标"}
@@ -191,8 +198,106 @@ def _column_bug(chunk: dict[str, Any]) -> str:
     return str(chunk.get("column_bug") or "").strip()
 
 
+def _expand_visual_subsegments(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """把带 frame_shots 的混杂 chunk 拆成视觉子段。
+
+    旧公共池可能仍是 60s，一个 chunk 内会同时出现目标正片、其他栏目宣传、赞助卡。
+    frame_shots 已经给出关键帧时间和画面描述，先拆成子段再判定，可以避免单个目标角标污染整段。
+    """
+    expanded: list[dict[str, Any]] = []
+    for chunk in chunks:
+        if not isinstance(chunk, dict):
+            continue
+        source_id, start, end = seg_time(chunk)
+        shots = _normalized_frame_shots(chunk, start, end)
+        if len(shots) < 2 or end - start <= 12 or not _should_split_visual_chunk(chunk, shots):
+            expanded.append(chunk)
+            continue
+
+        if chunk.get("segment_id"):
+            original_id = str(chunk["segment_id"])
+        elif chunk.get("chunk_id"):
+            original_id = f"{source_id}_{chunk.get('chunk_id')}"
+        else:
+            original_id = f"{source_id}_{start:g}_{end:g}"
+        raw_bug = _column_bug(chunk)
+        for idx, shot in enumerate(shots):
+            seg_start = max(start, float(shot["t"]))
+            seg_end = end if idx == len(shots) - 1 else min(end, float(shots[idx + 1]["t"]))
+            if seg_end <= seg_start:
+                continue
+            visual = str(shot.get("visual") or "")
+            shot_type = str(shot.get("shot_type") or shot.get("type") or "")
+            sub = dict(chunk)
+            sub["segment_id"] = f"{original_id}_frame_{idx + 1:02d}"
+            sub["parent_segment_id"] = original_id
+            sub["local_start_seconds"] = round(seg_start, 3)
+            sub["local_end_seconds"] = round(seg_end, 3)
+            sub["start_seconds"] = round(seg_start, 3)
+            sub["end_seconds"] = round(seg_end, 3)
+            sub["duration_seconds"] = round(seg_end - seg_start, 3)
+            sub["screen_text"] = visual
+            sub["scene"] = shot_type
+            sub["scene_type"] = shot_type
+            sub["footage_types"] = [shot_type] if shot_type else []
+            sub["frame_shots"] = [shot]
+            sub["column_bug"] = raw_bug if raw_bug and column_match(visual, raw_bug) else ""
+            expanded.append(sub)
+    return expanded
+
+
+def _should_split_visual_chunk(chunk: dict[str, Any], shots: list[dict[str, Any]]) -> bool:
+    visual_text = _t2s(" ".join(
+        [str(chunk.get("visual") or ""), _screen_text(chunk)]
+        + [str(shot.get("visual") or "") for shot in shots]
+    ))
+    if _hit(visual_text, NON_TARGET_PROMO_MARKERS + SPONSOR_CARD_KEYWORDS):
+        return True
+    return any(term in visual_text for term in ("节目宣传", "宣传画面", "广告画面", "赞助宣传", "传播矩阵"))
+
+
+def _normalized_frame_shots(chunk: dict[str, Any], start: float, end: float) -> list[dict[str, Any]]:
+    raw_shots = chunk.get("frame_shots") or []
+    if not isinstance(raw_shots, list):
+        return []
+    duration = max(0.0, end - start)
+    shots: list[dict[str, Any]] = []
+    seen: set[float] = set()
+    for raw in raw_shots:
+        if not isinstance(raw, dict):
+            continue
+        t = _num(raw.get("t"), start)
+        if t < start - 0.5 and t <= duration + 0.5:
+            t = start + t
+        t = min(max(t, start), end)
+        t = round(t, 3)
+        if t in seen:
+            continue
+        seen.add(t)
+        shot = dict(raw)
+        shot["t"] = t
+        shots.append(shot)
+    shots.sort(key=lambda item: float(item.get("t", 0.0)))
+    return shots
+
+
 _T2S_CONVERTER = None
 _T2S_TRIED = False
+_T2S_FALLBACK = str.maketrans({
+    "鳳": "凤",
+    "連": "连",
+    "線": "线",
+    "華": "华",
+    "潤": "润",
+    "資": "资",
+    "訊": "讯",
+    "國": "国",
+    "換": "换",
+    "衛": "卫",
+    "視": "视",
+    "臺": "台",
+    "節": "节",
+})
 
 
 def _t2s(text: str) -> str:
@@ -208,7 +313,7 @@ def _t2s(text: str) -> str:
         except Exception:
             _T2S_CONVERTER = None
     if _T2S_CONVERTER is None:
-        return text
+        return text.translate(_T2S_FALLBACK)
     try:
         return _T2S_CONVERTER.convert(text)
     except Exception:
@@ -370,32 +475,63 @@ def _classify_segment(
     策略（保新闻为先）：杂质话术（赞助/冠名、预告、广告）只在“基本是纯杂质、没什么新闻”
     时才删；和大段新闻混在一起就保留新闻。其他栏目（异角标）一律删。
     """
-    text = _t2s(f"{speech} {screen_text}".strip())
+    speech_text = _t2s(speech)
+    visual_text = _t2s(f"{screen_text} {scene} {' '.join(footage_types or [])}".strip())
+    text = f"{speech_text} {visual_text}".strip()
     is_pkg = (bool(scene) and any(p in scene for p in PACKAGING_SCENES)) or any(
         f in PACKAGING_FOOTAGE for f in (footage_types or [])
     )
 
     target_by_bug = bool(bug and target and column_match(bug, target))
-    target_in_text = bool(target and column_match(text, target))
-    detected_target = target_by_bug or target_in_text
+    target_in_visual = bool(target and column_match(visual_text, target))
+    target_in_speech = bool(target and column_match(speech_text, target))
 
     detected_other = ""
+    visual_other = ""
     if bug and target and not column_match(bug, target):
         detected_other = _t2s(bug)
     if not detected_other:
         for col in known_columns:
-            if col != target and column_match(text, col):
+            if col == target:
+                continue
+            if column_match(visual_text, col):
+                visual_other = col
+                detected_other = col
+                break
+            if column_match(text, col):
                 detected_other = col
                 break
     mentions_other = bool(detected_other)
     # 《节目名》书名号：出现非目标栏目的《X》，是“在预告/提及别的节目”的强信号
     #（不依赖排期表是否收录该节目，凤凰全球连线/凤凰早班车等中文台节目也能识别）
-    bracket_titles = [t for t in re.findall(r"《([^》]{2,15})》", text) if not column_match(t, target)]
+    visual_titles = [t for t in re.findall(r"《([^》]{2,15})》", visual_text) if not column_match(t, target)]
+    speech_titles = [t for t in re.findall(r"《([^》]{2,15})》", speech_text) if not column_match(t, target)]
+    bracket_titles = visual_titles + [t for t in speech_titles if t not in visual_titles]
     other_title = bracket_titles[0] if bracket_titles else ""
+
+    promo_kw = _hit(text, PROMO_KEYWORDS + cfg.get("extra_promo_keywords", []))
+    visual_promo_kw = _hit(visual_text, PROMO_KEYWORDS + cfg.get("extra_promo_keywords", []))
+    visual_non_target_marker = _hit(visual_text, NON_TARGET_PROMO_MARKERS)
+    if visual_non_target_marker and target and column_match(visual_non_target_marker, target):
+        visual_non_target_marker = None
+    visual_sponsor_card = _hit(visual_text, SPONSOR_CARD_KEYWORDS)
+    sponsor_card = visual_sponsor_card or _hit(text, SPONSOR_CARD_KEYWORDS)
+    strong_visual_junk = bool(visual_other or visual_titles or visual_promo_kw or visual_non_target_marker or visual_sponsor_card)
+
+    detected_target = target_by_bug or target_in_visual or (target_in_speech and not strong_visual_junk)
 
     # 保新闻为先：这段除去杂质话术/节目名/套话后，还剩多少真正的新闻文字
     residual = _residual_news_len(text, target, known_columns)
     news_substantial = residual >= int(cfg.get("min_news_chars", 12) or 12)
+
+    # 1) 画面级强杂质：其他节目宣传/跨频道包装/赞助卡。优先级高于目标角标，
+    # 避免“最后一帧目标角标”把整段 CGTN/早班车/华润卡救回来。
+    if sponsor_card and (strong_visual_junk or not news_substantial):
+        return "sponsor", "drop", f"赞助/冠名卡：{sponsor_card[:16]}"
+
+    if strong_visual_junk and (visual_non_target_marker or visual_titles or visual_other or visual_promo_kw):
+        reason_extra = f"《{visual_titles[0]}》" if visual_titles else (visual_other or visual_non_target_marker or visual_promo_kw)
+        return "promo", "drop", f"其他栏目/频道宣传：{reason_extra}".strip()
 
     # 1) 赞助/冠名：基本是纯赞助卡才删；夹着大段新闻（如开头“由华润赞助…斯塔默辞职…”）保留新闻
     sponsor_m = _SPONSOR_RE.search(text)
@@ -403,8 +539,7 @@ def _classify_segment(
         return "sponsor", "drop", f"赞助/冠名卡：{sponsor_m.group(0)[:16]}"
 
     # 2) 预告/宣传：命中预告话术，且（提到别的节目 / 非目标《节目名》/ 非目标正片），且基本无新闻实质 → 删
-    promo_kw = _hit(text, PROMO_KEYWORDS + cfg.get("extra_promo_keywords", []))
-    if promo_kw and (mentions_other or other_title or not detected_target) and not news_substantial:
+    if promo_kw and (mentions_other or other_title or not detected_target) and (not news_substantial or not detected_target):
         reason_extra = f"《{other_title}》" if other_title else (f"其他栏目:{detected_other}" if mentions_other else "")
         return "promo", "drop", f"预告/宣传卡：{promo_kw} {reason_extra}".strip()
     if _hit(text, TRAILER_KEYWORDS) and not detected_target and not news_substantial:
@@ -453,6 +588,7 @@ def detect(
     fc_cfg = fc_cfg or load_full_concat_cfg({})
     schedule = schedule or []
     vip_names = vip_names or DEFAULT_VIP_NAMES
+    chunks = _expand_visual_subsegments(chunks)
     known_columns = schedule_columns(schedule)
 
     target, target_source = resolve_target_column(

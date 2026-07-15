@@ -15,7 +15,7 @@ from newsclip_agent.multisource import MultiSourceItem, build_multi_source_video
 from newsclip_agent.pipeline import main as pipeline_main
 from newsclip_agent.resource_locks import file_slot_lock
 from newsclip_agent.remote_ucms import download_ucms_video, load_remote_ucms_config
-from newsclip_agent.utils import ensure_dir, read_json, relpath, write_json
+from newsclip_agent.utils import ensure_dir, read_json, relpath, stable_hash, write_json
 
 
 ROOT = Path(__file__).resolve().parent
@@ -147,6 +147,8 @@ def main(argv: list[str] | None = None) -> int:
     task_dir = ensure_dir(OUTPUTS_DIR / args.task_id)
     request_path = Path(args.source_request).resolve()
     request = read_json(request_path, {})
+    if _normalize_full_concat_request(request):
+        write_json(request_path, request)
 
     common_task_id = str(request.get("common_task_id") or "").strip()
     if common_task_id:
@@ -219,6 +221,36 @@ def main(argv: list[str] | None = None) -> int:
     if built.get("input_video"):
         pipeline_args.extend(["--input", str(built["input_video"])])
     return pipeline_main(pipeline_args)
+
+
+def _normalize_full_concat_request(request: dict[str, Any]) -> bool:
+    if str(request.get("production_mode") or "") != "full_concat":
+        return False
+    config = load_config(ROOT / "config.toml")
+    fc = config.raw.get("full_concat", {}) or {}
+    desired_chunk = int(fc.get("chunk_seconds", 10) or 10)
+    desired_frame = int(fc.get("frame_interval", 5) or 5)
+    if int(request.get("chunk_seconds") or 0) == desired_chunk and int(request.get("frame_interval") or 0) == desired_frame:
+        return False
+
+    request["chunk_seconds"] = desired_chunk
+    request["frame_interval"] = desired_frame
+    if request.get("common_task_id") or request.get("common_source_key"):
+        key = _request_common_source_key(request)
+        request["common_source_key"] = key
+        request["common_task_id"] = f"common_{key}"
+    return True
+
+
+def _request_common_source_key(request: dict[str, Any]) -> str:
+    payload = {
+        "sources": request.get("source_items") or [],
+        "aspect_ratio": request.get("aspect_ratio") or "16:9",
+        "chunk_seconds": request.get("chunk_seconds") or 60,
+        "frame_interval": request.get("frame_interval") or 10,
+        "mode": request.get("mode") or "normal",
+    }
+    return stable_hash(payload)[:16]
 
 
 def _append_common_log(common_dir: Path, message: str) -> None:

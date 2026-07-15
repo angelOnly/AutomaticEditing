@@ -141,6 +141,62 @@ def test_detect_promo_other_program_dropped_with_target_bug():
     assert a["label"] == "promo" and a["keep"] is False
 
 
+def test_detect_splits_mixed_promo_chunk_and_keeps_target_tail():
+    # 真机残留：60s 内先出现 CGTN/凤凰早班车宣传，最后一帧才回到目标栏目。
+    # 应按 frame_shots 拆开，删除其他栏目宣传，保留最后目标正片。
+    chunks = [_chunk(
+        "mixed",
+        "s",
+        240,
+        300,
+        speech="凤凰卫视相关宣传内容显示，《凤凰全球连线》由中国太平冠名；《凤凰早班车》每日七点播出。内容提及，英国长期以政治稳定为傲。",
+        bug="凤凰聚焦",
+        screen=["TRAVELOGUE", "CGTN", "鳳凰早班車", "華潤 鳳凰聚焦"],
+        footage=["现场画面", "片头包装", "其他B-roll"],
+    )]
+    chunks[0]["frame_shots"] = [
+        {"t": 240, "shot_type": "现场画面", "visual": "高空航拍城市景观"},
+        {"t": 260, "shot_type": "片头包装", "visual": "蓝色背景文字 TRAVELOGUE，底部有 CGTN 标识"},
+        {"t": 280, "shot_type": "片头包装", "visual": "《凤凰早班车》节目宣传画面，显示每天 07:00"},
+        {"t": 290, "shot_type": "现场画面", "visual": "泰晤士河外景，右侧英國換相魔咒，右下角華潤 鳳凰聚焦"},
+    ]
+
+    res = ad.detect(chunks, cfg={**CFG, "use_llm": False}, fc_cfg=FC, schedule=SCHEDULE, source_items=[], override_column="凤凰聚焦")
+    by_id = {s["segment_id"]: s for s in res["segments"]}
+
+    assert by_id["mixed_frame_02"]["keep"] is False
+    assert by_id["mixed_frame_03"]["keep"] is False
+    assert by_id["mixed_frame_04"]["keep"] is True
+
+
+def test_detect_splits_end_sponsor_card_from_target_outro():
+    # 真机残留：目标栏目尾声后接华润卡/凤凰资讯宣传。目标尾声保留，后续宣传删除。
+    chunks = [_chunk(
+        "outro",
+        "s",
+        240,
+        300,
+        speech="评论者认为英国产业外迁是趋势，伯纳姆提出的改革已经引发英国朝野争拗。",
+        bug="鳳凰聚焦",
+        screen=["華潤 鳳凰聚焦", "有華潤多美好 What a Wonderful Life", "鳳凰資訊 News that matters"],
+        footage=["主持人口播", "片头包装", "其他B-roll"],
+    )]
+    chunks[0]["frame_shots"] = [
+        {"t": 240, "shot_type": "主持人口播", "visual": "女主持人在演播室播报，右下角有華潤 鳳凰聚焦"},
+        {"t": 260, "shot_type": "演播室", "visual": "节目片尾职员表，与本台立场无关"},
+        {"t": 280, "shot_type": "其他B-roll", "visual": "白色背景显示有華潤多美好 What a Wonderful Life"},
+        {"t": 290, "shot_type": "其他B-roll", "visual": "鳳凰資訊 News that matters，多平台传播矩阵宣传"},
+    ]
+
+    res = ad.detect(chunks, cfg={**CFG, "use_llm": False}, fc_cfg=FC, schedule=SCHEDULE, source_items=[], override_column="凤凰聚焦")
+    by_id = {s["segment_id"]: s for s in res["segments"]}
+
+    assert by_id["outro_frame_01"]["keep"] is True
+    assert by_id["outro_frame_02"]["keep"] is True
+    assert by_id["outro_frame_03"]["keep"] is False
+    assert by_id["outro_frame_04"]["keep"] is False
+
+
 def test_detect_packaging_footage_dropped():
     # 片头包装/台标卡（footage_types 含片头包装），非目标 → 删
     chunks = [_chunk("a", "s", 0, 8, speech="", bug="", footage=["片头包装"])]

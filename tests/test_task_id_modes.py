@@ -4,6 +4,7 @@ import json
 from collections import deque
 from types import SimpleNamespace
 
+import run_multisource_pipeline
 import web_app
 from web_app import (
     RunRequest,
@@ -102,6 +103,68 @@ def test_existing_task_full_run_forks_when_production_mode_changes(tmp_path, mon
 
     assert req.input_video == str(source.resolve())
     assert req.task_id == "example_视频重组_20260527_161530"
+
+
+def test_mode_switch_to_full_concat_overrides_old_source_request_granularity(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(web_app, "OUTPUTS_DIR", tmp_path)
+    web_app.PROJECT_CONFIG.raw.setdefault("full_concat", {})["chunk_seconds"] = 10
+    web_app.PROJECT_CONFIG.raw.setdefault("full_concat", {})["frame_interval"] = 5
+    task_dir = tmp_path / "example_AI配音解说_20260527_161530"
+    (task_dir / "input").mkdir(parents=True)
+    (task_dir / "manifest.json").write_text(
+        json.dumps({"last_web_run_options": {"production_mode": "ai_voiceover"}}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (task_dir / "input" / "source_request.json").write_text(
+        json.dumps(
+            {
+                "source_items": [
+                    {"source_type": "remote_ucms", "id": 1, "name": "20260625_215934"},
+                    {"source_type": "remote_ucms", "id": 2, "name": "20260625_220434"},
+                ],
+                "aspect_ratio": "16:9",
+                "chunk_seconds": 60,
+                "frame_interval": 10,
+                "mode": "normal",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    req = RunRequest(task_id=task_dir.name, production_mode="full_concat")
+
+    _prepare_mode_switched_run(req)
+
+    assert req.task_id == "example_完整版_20260527_161530"
+    assert req.chunk_seconds == 10
+    assert req.frame_interval == 5
+    assert len(req.source_items) == 2
+
+
+def test_multisource_runner_rekeys_stale_full_concat_source_request(monkeypatch) -> None:
+    monkeypatch.setattr(
+        run_multisource_pipeline,
+        "load_config",
+        lambda _path: SimpleNamespace(raw={"full_concat": {"chunk_seconds": 10, "frame_interval": 5}}),
+    )
+    request = {
+        "production_mode": "full_concat",
+        "source_items": [{"source_type": "remote_ucms", "id": 1}],
+        "aspect_ratio": "16:9",
+        "chunk_seconds": 60,
+        "frame_interval": 10,
+        "mode": "normal",
+        "common_source_key": "old60",
+        "common_task_id": "common_old60",
+    }
+
+    changed = run_multisource_pipeline._normalize_full_concat_request(request)
+
+    assert changed is True
+    assert request["chunk_seconds"] == 10
+    assert request["frame_interval"] == 5
+    assert request["common_source_key"] != "old60"
+    assert request["common_task_id"] == f"common_{request['common_source_key']}"
 
 
 def test_mode_switched_task_seeds_reusable_outputs(tmp_path, monkeypatch) -> None:

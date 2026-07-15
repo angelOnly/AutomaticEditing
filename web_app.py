@@ -1247,13 +1247,8 @@ def run_pipeline(req: RunRequest) -> dict[str, Any]:
     else:
         req.audio_policy = "ai_voiceover"
         req.allow_original_audio_evidence = False
-    if req.production_mode == "full_concat":
-        # 完整版需更细的分段，让短的片头/台标/赞助卡/预告独立成段被精准删。
-        # 强制覆盖（在算指纹/公共池 key 之前），本模式因此使用独立公共分析池。
-        fc = PROJECT_CONFIG.raw.get("full_concat", {}) or {}
-        req.chunk_seconds = int(fc.get("chunk_seconds", 10) or 10)
-        req.frame_interval = int(fc.get("frame_interval", 5) or 5)
     _prepare_mode_switched_run(req)
+    _apply_full_concat_runtime_defaults(req)
     raw_source_items = _collect_source_items(req)
     # Start downloading remote sources to the local cache immediately, while the
     # remote signed URL is still fresh, so 原片 preview can fall back to the local
@@ -2415,6 +2410,7 @@ def _prepare_mode_switched_run(req: RunRequest) -> None:
         if source_request.get("mode"):
             req.mode = str(source_request.get("mode"))
 
+        _apply_full_concat_runtime_defaults(req)
         req.force_remote_download = bool(source_request.get("force_remote_download", req.force_remote_download))
         req.task_id = _with_mode_suffix(source_task_id, req.production_mode)
         req.reuse_from_task_id = source_task_id
@@ -2423,6 +2419,17 @@ def _prepare_mode_switched_run(req: RunRequest) -> None:
     req.input_video = str(_existing_task_source_video(source_task_dir, source_manifest))
     req.task_id = _with_mode_suffix(source_task_id, req.production_mode)
     req.reuse_from_task_id = source_task_id
+    _apply_full_concat_runtime_defaults(req)
+
+
+def _apply_full_concat_runtime_defaults(req: RunRequest) -> None:
+    if req.production_mode != "full_concat":
+        return
+    # 完整版需更细的分段，让短的片头/台标/赞助卡/预告独立成段被精准删。
+    # 这里必须在“从已有任务切换模式”之后再套一次，避免旧 source_request 的 60s 覆盖本模式粒度。
+    fc = PROJECT_CONFIG.raw.get("full_concat", {}) or {}
+    req.chunk_seconds = int(fc.get("chunk_seconds", 10) or 10)
+    req.frame_interval = int(fc.get("frame_interval", 5) or 5)
 
 
 def _task_id_production_mode(task_id: str) -> str | None:
