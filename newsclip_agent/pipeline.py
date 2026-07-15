@@ -19,6 +19,8 @@ from .llm import OpenAICompatibleClient
 from . import prompts
 from . import commentary
 from . import ad_detection
+from . import full_concat_qc
+from .analysis_contracts import analysis_contract_profile
 from .duration_policy import (
     build_voiceover_timing_contract,
     clean_voiceover_text,
@@ -202,6 +204,10 @@ class PipelineRunner:
         self.llm_text = self._make_llm("text")
         self.llm_vision = self._make_llm("vision")
         self._asr_engine = None
+        # _mark_running replaces the manifest entry before a handler can ask
+        # whether its previous artifact is reusable.  Keep a private snapshot
+        # so per-step hash reuse remains functional.
+        self._cache_candidates: dict[str, dict[str, Any]] = {}
 
     def run(self) -> dict[str, Any]:
         selected = self._resolve_selected_steps()
@@ -536,7 +542,7 @@ class PipelineRunner:
         step_order = self._active_step_order()
         if self.options.rerun == step or (self.options.rerun_from and step_order.index(step) >= step_order.index(self.options.rerun_from)):
             return False
-        status = self.manifest.get("steps", {}).get(step, {})
+        status = getattr(self, "_cache_candidates", {}).get(step) or self.manifest.get("steps", {}).get(step, {})
         if status.get("status") != "success":
             return False
         if input_hash and status.get("input_hash") != input_hash:
@@ -549,6 +555,9 @@ class PipelineRunner:
                 self._assert_no_legacy_virtual_time(read_json(self.task_dir / output, {}))
             except Exception:
                 return False
+        if self.options.resume and step in getattr(self, "_cache_candidates", {}):
+            self.manifest.setdefault("steps", {})[step] = copy.deepcopy(status)
+            self._save_manifest()
         return self.options.resume
 
     def _assert_no_legacy_virtual_time(self, obj: Any, *, path: str = "") -> None:
@@ -622,6 +631,10 @@ class PipelineRunner:
     def _mark_running(self, step: str) -> None:
         self.manifest["status"] = "running"
         previous = self.manifest.setdefault("steps", {}).get(step, {})
+        if previous.get("status") in {"success", "partial_success"}:
+            if not hasattr(self, "_cache_candidates"):
+                self._cache_candidates = {}
+            self._cache_candidates[step] = copy.deepcopy(previous)
         started_at = previous.get("started_at") or now_iso()
         self.manifest.setdefault("steps", {})[step] = {
             "step_name": step,
@@ -636,6 +649,7 @@ class PipelineRunner:
         self.manifest["status"] = "failed"
         self.manifest["user_message"] = error
         data = {
+            **dict(self.manifest.setdefault("steps", {}).get(step, {}) or {}),
             "step_name": step,
             "status": "failed",
             "error": error,
@@ -748,23 +762,42 @@ class PipelineRunner:
 
         if chunks:
             windows = []
+            # chunk_build covers the complete source, so the greatest core end is
+            # also the best available duration bound for the final overlap window.
+            duration_by_source: dict[str, float] = {}
             for chunk in chunks:
-                start = float(chunk.get("local_start_seconds", chunk.get("start", 0)) or 0)
-                end = float(chunk.get("local_end_seconds", chunk.get("end", start)) or start)
-                if end <= start:
+                source_key = str(chunk.get("source_id") or "")
+                core_end = float(chunk.get("local_end_seconds", chunk.get("end", 0)) or 0)
+                duration_by_source[source_key] = max(duration_by_source.get(source_key, 0.0), core_end)
+            for chunk in chunks:
+                core_start = float(chunk.get("local_start_seconds", chunk.get("start", 0)) or 0)
+                core_end = float(chunk.get("local_end_seconds", chunk.get("end", core_start)) or core_start)
+                if core_end <= core_start:
                     continue
+                source_key = str(chunk.get("source_id") or "")
+                source_duration = duration_by_source.get(source_key) or audio_duration or core_end
+                decode_start = max(0.0, core_start - overlap)
+                decode_end = min(float(source_duration), core_end + overlap)
+                chunk_id = str(chunk.get("chunk_id") or f"asr_{len(windows)+1:04d}")
                 w = {
-                    "id": chunk.get("chunk_id") or f"asr_{len(windows)+1:04d}",
-                    "start": max(0.0, start - overlap),
-                    "end": end + overlap,
-                    "chunk_id": chunk.get("chunk_id", ""),
+                    "id": chunk_id,
+                    "window_id": chunk_id,
+                    "owner_chunk_id": chunk_id,
+                    "chunk_id": chunk_id,
+                    "core_start": core_start,
+                    "core_end": core_end,
+                    "decode_start": decode_start,
+                    "decode_end": decode_end,
+                    "overlap_before_seconds": max(0.0, core_start - decode_start),
+                    "overlap_after_seconds": max(0.0, decode_end - core_end),
+                    # Compatibility aliases used by the audio cutting path below.
+                    "start": decode_start,
+                    "end": decode_end,
                 }
                 if "source_id" in chunk:
                     w["source_id"] = chunk["source_id"]
-                    local_start = float(chunk.get("local_start_seconds", chunk.get("local_start", 0)))
-                    local_end = float(chunk.get("local_end_seconds", chunk.get("local_end", local_start)))
-                    w["local_start"] = max(0.0, local_start - overlap)
-                    w["local_end"] = local_end + overlap
+                    w["local_start"] = decode_start
+                    w["local_end"] = decode_end
                 windows.append(w)
             return windows
 
@@ -841,6 +874,9 @@ class PipelineRunner:
             "vision": "画面识别",
             "timeline": "合并时间线",
             "timeline_digest": "压缩分析时间线",
+            "full_concat_boundary_refine": "完整版边界精修",
+            "full_concat_plan_qc": "完整版计划语义检查",
+            "full_concat_output_qc": "完整版成片语义检查",
         }.get(step, step)
 
     def step_source_analysis(self) -> None:
@@ -848,7 +884,9 @@ class PipelineRunner:
         sources = self._iter_source_items()
         if not sources:
             raise RuntimeError("source_analysis requires a virtual source manifest with at least 1 source")
+        analysis_profile_hash = stable_hash(analysis_contract_profile())
         input_hash = stable_hash({
+            "analysis_contracts": analysis_contract_profile(),
             "source_manifest": self._step_content_hash("source_prepare") or self.manifest.get("source_manifest", ""),
             "sources": [
                 {
@@ -863,6 +901,7 @@ class PipelineRunner:
             "frame_interval": self.options.frame_interval,
             "mode": self.options.mode,
             "aspect_ratio": self.options.aspect_ratio,
+            "analysis_profile_hash": analysis_profile_hash,
         })
         if self._can_reuse("source_analysis", input_hash):
             print("复用缓存: source_analysis")
@@ -959,24 +998,31 @@ class PipelineRunner:
                 and source_status.get("status") == "success"
             ):
                 summary_doc = read_json(summary_path, {})
-                digest = summary_doc.get("timeline_digest") or {}
-                chunk_count = len(digest.get("chunks") or [])
-                if verbose_source_logs:
-                    print(
-                        f"[source_analysis] reuse {source_id} {source_pos}/{total_sources} "
-                        f"chunks={chunk_count} video={source_path.name}",
-                        flush=True,
-                    )
-                return {
-                    "source_id": source_id,
-                    "status": "success",
-                    "display_name": item.get("display_name") or source_path.name,
-                    "summary": relpath(summary_path, self.task_dir),
-                    "work_task_dir": summary_doc.get("work_task_dir", ""),
-                    "chunk_count": chunk_count,
-                    "elapsed_seconds": 0,
-                    "reused": True,
-                }
+                if source_status.get("analysis_profile_hash") != analysis_profile_hash or summary_doc.get("analysis_profile_hash") != analysis_profile_hash:
+                    # Semantic contract changed: do not silently reuse a stale
+                    # source summary even when the media fingerprint matches.
+                    summary_doc = {}
+                if not summary_doc:
+                    pass
+                else:
+                    digest = summary_doc.get("timeline_digest") or {}
+                    chunk_count = len(digest.get("chunks") or [])
+                    if verbose_source_logs:
+                        print(
+                            f"[source_analysis] reuse {source_id} {source_pos}/{total_sources} "
+                            f"chunks={chunk_count} video={source_path.name}",
+                            flush=True,
+                        )
+                    return {
+                        "source_id": source_id,
+                        "status": "success",
+                        "display_name": item.get("display_name") or source_path.name,
+                        "summary": relpath(summary_path, self.task_dir),
+                        "work_task_dir": summary_doc.get("work_task_dir", ""),
+                        "chunk_count": chunk_count,
+                        "elapsed_seconds": 0,
+                        "reused": True,
+                    }
 
             quality_doc = self._quality_check_source_item(item, source_path)
             quality_path = write_json(source_dir / "source_quality_check.json", quality_doc)
@@ -1086,6 +1132,7 @@ class PipelineRunner:
                     sync_thread.join(timeout=1.0)
                 digest = child_runner._load_step_json("timeline_digest")
                 summary = self._build_source_summary(item, child_runner.task_dir, child_manifest, digest)
+                summary["analysis_profile_hash"] = analysis_profile_hash
                 summary_path = write_json(summary_path, summary)
                 elapsed = round(time.perf_counter() - started_at, 3)
                 chunk_count = len(digest.get("chunks") or [])
@@ -1097,6 +1144,7 @@ class PipelineRunner:
                     "updated_at": now_iso(),
                     "elapsed_seconds": elapsed,
                     "chunk_count": chunk_count,
+                    "analysis_profile_hash": analysis_profile_hash,
                 })
                 if verbose_source_logs:
                     print(
@@ -1121,6 +1169,7 @@ class PipelineRunner:
                     "status": "failed",
                     "failed_stage": source_progress.get(source_id, {}).get("current_stage", ""),
                     "error": str(exc),
+                    "analysis_profile_hash": analysis_profile_hash,
                     "updated_at": now_iso(),
                     "elapsed_seconds": elapsed,
                 })
@@ -1218,7 +1267,8 @@ class PipelineRunner:
             raise RuntimeError("source_analysis failed for all sources")
 
         output_doc = {
-            "version": "source_analysis_v1",
+            "version": "source_analysis_v2_contract_profile",
+            "analysis_profile_hash": analysis_profile_hash,
             "source_count": len(sources),
             "success_count": len(results),
             "failed_count": len(failures),
@@ -1389,12 +1439,18 @@ class PipelineRunner:
             text = raw_text or str(seg.get("text") or "").strip()
             if not text:
                 continue
-            primary_chunk_id, source_chunk_ids, chunk_match_diagnostics = self._source_chunk_ids_for_time_range(
-                source_id=source_id,
-                start=float(start),
-                end=float(end),
-                chunks=chunks,
-            )
+            owner_hint = str(seg.get("owner_chunk_id") or seg.get("chunk_id") or "").strip()
+            if owner_hint and any(str(c.get("chunk_id") or "") == owner_hint for c in chunks if str(c.get("source_id") or "") == source_id):
+                primary_chunk_id = owner_hint
+                source_chunk_ids = [owner_hint]
+                chunk_match_diagnostics = {"attribution": "owner_chunk_hint"}
+            else:
+                primary_chunk_id, source_chunk_ids, chunk_match_diagnostics = self._source_chunk_ids_for_time_range(
+                    source_id=source_id,
+                    start=float(start),
+                    end=float(end),
+                    chunks=chunks,
+                )
             chunk_diagnostics = []
             if not source_chunk_ids:
                 chunk_diagnostics.append({
@@ -1420,6 +1476,8 @@ class PipelineRunner:
                 "primary_chunk_id": primary_chunk_id,
                 "source_chunk_ids": source_chunk_ids,
                 "source_chunk_id_hint": seg.get("chunk_id", ""),
+                "owner_chunk_id": owner_hint,
+                "attribution_policy": "owner_chunk_then_midpoint_legacy_v2" if owner_hint else "legacy_overlap_recovered",
                 "diagnostics": chunk_diagnostics,
                 "removed_tokens": seg.get("removed_tokens", []),
             })
@@ -1428,6 +1486,7 @@ class PipelineRunner:
     def step_source_aggregate(self) -> None:
         analysis = self._load_step_json("source_analysis")
         input_hash = stable_hash({
+            "analysis_contracts": analysis_contract_profile(),
             "source_analysis": self._step_content_hash("source_analysis"),
             "child_asr_outputs": self._source_analysis_child_asr_hashes(analysis),
             "limits": self.config.raw.get("multi_source_analysis", {}),
@@ -1523,19 +1582,20 @@ class PipelineRunner:
             })
         total_source_duration = sum(float(item.get("duration_seconds") or 0) for item in summaries)
         raw_asr_index = {
-            "version": "source_raw_asr_index_v1",
+            "version": "source_raw_asr_index_v2_core_owned",
             "raw_asr_segment_count": len(raw_segments_all),
             "diagnostics": raw_asr_diagnostics,
             "sources": raw_sources,
         }
         aggregate = {
-            "version": "source_aggregate_local_time_v1",
+            "version": "source_aggregate_local_time_v2_owned_asr",
+            "analysis_contracts": analysis_contract_profile(),
             "source_count": len(self._iter_source_items()),
             "successful_source_count": len(summaries),
             "failed_sources": analysis.get("failed_sources", []),
             "sources": summaries,
             "timeline_digest": {
-                "version": "multi_source_local_timeline_digest_v1",
+                "version": "multi_source_local_timeline_digest_v2_owned_asr",
                 "timeline_mode": "source_pool_local_time",
                 "total_source_duration_seconds": round(total_source_duration, 3),
                 "chunks": chunks,
@@ -1989,7 +2049,7 @@ class PipelineRunner:
         input_hash = stable_hash({
             "audio": self._step_content_hash("audio_extract"),
             "funasr": self.config.funasr,
-            "mode": "segmented_asr_v1",
+            "mode": "segmented_asr_v2_core_owned",
             "windows": self._asr_windows_from_chunks(),
         })
         if self._can_reuse("asr", input_hash):
@@ -2073,18 +2133,37 @@ class PipelineRunner:
                     for seg in result.get("segments", []):
                         local_start = float(seg.get("start") or 0)
                         local_end = float(seg.get("end") or 0)
+                        has_model_timestamp = local_end > local_start
                         cleaned = clean_asr_text(str(seg.get("text") or ""))
                         text = cleaned["clean_text"]
                         if not text:
                             continue
+                        absolute_start = start + local_start if has_model_timestamp else start
+                        absolute_end = min(end, start + local_end) if has_model_timestamp else end
+                        if absolute_end <= absolute_start:
+                            absolute_end = end
+                        core_start = float(window.get("core_start", start) or start)
+                        core_end = float(window.get("core_end", end) or end)
+                        midpoint = (absolute_start + absolute_end) / 2.0
                         all_segments.append({
-                            "start": start + local_start,
-                            "end": start + local_end if local_end > 0 else end,
+                            "start": absolute_start,
+                            "end": absolute_end,
                             "text": text,
                             "raw_text": cleaned["raw_text"],
                             "removed_tokens": cleaned["removed_tokens"],
                             "asr_segment_id": wid,
+                            "window_id": window.get("window_id", wid),
+                            "owner_chunk_id": window.get("owner_chunk_id", window.get("chunk_id", "")),
                             "chunk_id": window.get("chunk_id", ""),
+                            "source_id": window.get("source_id", ""),
+                            "core_start": core_start,
+                            "core_end": core_end,
+                            "decode_start": float(window.get("decode_start", start) or start),
+                            "decode_end": float(window.get("decode_end", end) or end),
+                            "timing_quality": "model_timestamp" if has_model_timestamp else "window_coarse",
+                            "text_scope": "model_segment" if has_model_timestamp else "decode_window",
+                            "core_overlap_seconds": max(0.0, min(absolute_end, core_end) - max(absolute_start, core_start)),
+                            "context_only": bool(has_model_timestamp and not (core_start <= midpoint < core_end)),
                         })
 
                     self._update_step_progress("asr", f"FunASR 已完成 {index}/{len(windows)}", {
@@ -2093,15 +2172,31 @@ class PipelineRunner:
                         "total_segments": len(windows),
                     })
 
-            full_text = " ".join(x for x in full_text_parts if x).strip()
-            segments = self._normalize_asr_segments(all_segments, full_text)
+            # Build the canonical text from normalized owned segments.  The
+            # concatenation of decode-window transcripts is retained only as a
+            # diagnostic because overlap windows can repeat the same sentence.
+            provisional_full_text = " ".join(x for x in full_text_parts if x).strip()
+            segments = self._normalize_asr_segments(all_segments, provisional_full_text)
+            owned_parts: list[str] = []
+            previous_text = ""
+            for seg in sorted(segments, key=lambda item: (str(item.get("source_id") or ""), float(item.get("start") or 0), int(item.get("id") or 0))):
+                if bool(seg.get("context_only")):
+                    continue
+                text_value = str(seg.get("text") or "").strip()
+                if text_value and text_value != previous_text:
+                    owned_parts.append(text_value)
+                    previous_text = text_value
+            full_text = " ".join(owned_parts).strip() or provisional_full_text
             asr = {
+                "version": "asr_segments_v2_core_owned",
+                "attribution_policy": "owner_chunk_then_midpoint_legacy_v2",
                 "language": "zh",
                 "segments": segments,
                 "full_text": full_text,
                 "raw_full_text": " ".join(str(x) for x in raw_full_text_parts if x).strip(),
+                "raw_decode_full_text": " ".join(str(x) for x in raw_full_text_parts if x).strip(),
                 "raw_result": {
-                    "mode": "segmented_asr_v1",
+                    "mode": "segmented_asr_v2_core_owned",
                     "segment_count": len(windows),
                     "results": raw_results,
                 },
@@ -2151,6 +2246,7 @@ class PipelineRunner:
         input_hash = stable_hash({
             "chunks": self._step_content_hash("chunk_build"),
             "asr": self._step_content_hash("asr"),
+            "attribution_policy": "owner_chunk_then_midpoint_legacy_v2",
             "model": model,
             "fallback": fallback,
             "cfg": cfg,
@@ -2161,24 +2257,26 @@ class PipelineRunner:
 
         version, vdir = self._version_dir("asr_digest", "asr_digest")
         ensure_dir(vdir)
-        asr_by_chunk_id: dict[str, str] = {}
+        asr_by_chunk_id: dict[str, list[dict[str, Any]]] = {}
         for chunk in chunks:
             chunk_id = str(chunk.get("chunk_id") or "")
-            segs = self._segments_in_range(asr.get("segments", []), float(chunk.get("start") or 0), float(chunk.get("end") or 0))
-            asr_by_chunk_id[chunk_id] = " ".join(str(s.get("text") or "") for s in segs).strip()
+            segs = self._asr_segments_for_chunk(asr.get("segments", []), chunk)
+            asr_by_chunk_id[chunk_id] = segs
 
         def process_one(index: int, chunk: dict[str, Any]) -> tuple[int, dict[str, Any]]:
             chunk_id = str(chunk.get("chunk_id") or f"chunk_{index + 1:04d}")
-            raw_text = asr_by_chunk_id.get(chunk_id, "")
+            owned_segments = asr_by_chunk_id.get(chunk_id, [])
+            raw_text = " ".join(str(s.get("text") or "") for s in owned_segments).strip()
             ts = self._format_chunk_ts(chunk)
             if not raw_text.strip():
-                return index, {"chunk_id": chunk_id, "speech": ""}
+                return index, {"chunk_id": chunk_id, "speech": "", "owned_text": "", "segment_ids": [], "attribution": {"policy": "owner_chunk_then_midpoint_legacy_v2", "segment_count": 0}}
 
             target_chars = int(cfg.get("target_chars_per_chunk", 320) or 320)
             input_data = {
                 "chunk_id": chunk_id,
                 "time_range": ts,
                 "asr_text": raw_text[: int(cfg.get("max_input_chars_per_chunk", 4000) or 4000)],
+                "asr_owned_text": raw_text[: int(cfg.get("max_input_chars_per_chunk", 4000) or 4000)],
                 "source_id": chunk.get("source_id", ""),
                 "language": str(cfg.get("language", "") or "zh"),
             }
@@ -2202,7 +2300,8 @@ class PipelineRunner:
             except Exception as exc:
                 write_json(vdir / "_errors" / f"{chunk_id}.json", {"chunk_id": chunk_id, "error": str(exc), "created_at": now_iso()})
                 speech = compact_asr_for_llm(raw_text, max_chars=target_chars)
-            return index, {"chunk_id": chunk_id, "speech": speech}
+            qualities = sorted({str(s.get("timing_quality") or "unknown") for s in owned_segments})
+            return index, {"chunk_id": chunk_id, "speech": speech, "owned_text": raw_text, "segment_ids": [s.get("id") for s in owned_segments if s.get("id") is not None], "attribution": {"policy": "owner_chunk_then_midpoint_legacy_v2", "segment_count": len(owned_segments), "timing_quality": qualities, "strict_evidence_eligible": not any(q not in {"model_timestamp"} for q in qualities)}}
 
         results: list[tuple[int, dict[str, Any]]] = []
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -2212,7 +2311,8 @@ class PipelineRunner:
 
         results.sort(key=lambda x: x[0])
         output = {
-            "version": "asr_digest_v1",
+            "version": "asr_digest_v2_core_owned",
+            "attribution_policy": "owner_chunk_then_midpoint_legacy_v2",
             "model": model,
             "chunks": [item for _index, item in results],
         }
@@ -2236,7 +2336,7 @@ class PipelineRunner:
         asr = self._load_step_json("asr")
         asr_digest = self._load_optional_step_json("asr_digest", {"chunks": []})
         asr_digest_by_id = {
-            str(item.get("chunk_id")): str(item.get("speech") or "")
+            str(item.get("chunk_id")): item
             for item in asr_digest.get("chunks", [])
             if isinstance(item, dict)
         }
@@ -2249,6 +2349,7 @@ class PipelineRunner:
             "chunks": self._step_content_hash("chunk_build"),
             "asr": self._step_content_hash("asr"),
             "asr_digest": self._step_content_hash("asr_digest"),
+            "asr_attribution_policy": "owner_chunk_then_midpoint_legacy_v2",
             "model": model,
             "fallback": fallback,
             "prompt_version": prompt_version,
@@ -2293,7 +2394,7 @@ class PipelineRunner:
         def process_one_chunk(chunk: dict[str, Any]) -> dict[str, Any]:
             cid = chunk["chunk_id"]
             cdir = ensure_dir(vdir / cid)
-            asr_segments = self._segments_in_range(asr.get("segments", []), chunk["start"], chunk["end"])
+            asr_segments = self._asr_segments_for_chunk(asr.get("segments", []), chunk)
             chunk_frame_files = [f for f in chunk.get("frames", []) if (self.task_dir / f).exists()]
             chunk_frame_files = select_frames_for_vision(chunk_frame_files, max_frames=max(1, int(self.options.vision_max_frames_per_chunk or 1)))
             frame_paths = [str(self.task_dir / f) for f in chunk_frame_files]
@@ -2304,7 +2405,9 @@ class PipelineRunner:
                 "source_id": chunk.get("source_id", ""),
                 "frame_times": frame_times,
                 "frames": f"{len(frame_paths)} key frames attached as images, in chronological order matching frame_times",
-                "asr_text": asr_digest_by_id.get(cid) or compact_asr_for_llm(" ".join(s.get("text", "") for s in asr_segments), max_chars=500),
+                "asr_text": str((asr_digest_by_id.get(cid) or {}).get("speech") or compact_asr_for_llm(" ".join(s.get("text", "") for s in asr_segments), max_chars=500)),
+                "asr_owned_text": str((asr_digest_by_id.get(cid) or {}).get("owned_text") or " ".join(s.get("text", "") for s in asr_segments)),
+                "asr_attribution": (asr_digest_by_id.get(cid) or {}).get("attribution", {}),
             }
             write_json(cdir / "input.json", input_data)
             write_text(cdir / "prompt.txt", prompts.VISION_CHUNK_PROMPT)
@@ -2396,13 +2499,14 @@ class PipelineRunner:
         vision = self._load_step_json("vision")
         chunks = self._load_step_json("chunk_build")
         asr_digest_by_id = {
-            str(item.get("chunk_id")): str(item.get("speech") or "")
+            str(item.get("chunk_id")): item
             for item in asr_digest.get("chunks", [])
             if isinstance(item, dict)
         }
         input_hash = stable_hash({
             "asr": self._step_content_hash("asr"),
             "asr_digest": self._step_content_hash("asr_digest"),
+            "asr_attribution_policy": "owner_chunk_then_midpoint_legacy_v2",
             "vision": self._step_content_hash("vision"),
             "chunks": self._step_content_hash("chunk_build"),
         })
@@ -2417,11 +2521,13 @@ class PipelineRunner:
             vr = self._apply_manual_override(vdir, visual_by_id.get(chunk["chunk_id"], {}), "vision", chunk["chunk_id"])
             chunk_start = float(chunk.get("local_start_seconds", chunk.get("start", 0)) or 0)
             chunk_end = float(chunk.get("local_end_seconds", chunk.get("end", chunk_start)) or chunk_start)
-            segs = self._segments_in_range(asr.get("segments", []), chunk_start, chunk_end)
+            segs = self._asr_segments_for_chunk(asr.get("segments", []), chunk)
             t_entry = {
                 "chunk_id": chunk["chunk_id"],
                 "asr_text": clean_asr_text(" ".join(str(s.get("clean_text") or s.get("text") or "") for s in segs))["clean_text"],
-                "asr_digest": asr_digest_by_id.get(str(chunk["chunk_id"]), ""),
+                "asr_digest": str((asr_digest_by_id.get(str(chunk["chunk_id"])) or {}).get("speech") or ""),
+                "asr_owned_text": str((asr_digest_by_id.get(str(chunk["chunk_id"])) or {}).get("owned_text") or ""),
+                "asr_attribution": (asr_digest_by_id.get(str(chunk["chunk_id"])) or {}).get("attribution", {}),
                 "asr_segments": segs,
                 "scene_type": vr.get("scene_type", ""),
                 "column_bug": vr.get("column_bug", ""),
@@ -2436,6 +2542,10 @@ class PipelineRunner:
                 "hook_score": vr.get("hook_score", 0),
                 "risk_tags": vr.get("risk_tags", []),
                 "notes": vr.get("notes", ""),
+                "content_role": vr.get("content_role", ""),
+                "program_identity": vr.get("program_identity", ""),
+                "program_mentions": vr.get("program_mentions", []),
+                "asr_visual_relation": vr.get("asr_visual_relation") or vr.get("asr_visual_consistency", ""),
             }
             if "source_id" in chunk:
                 t_entry["source_id"] = chunk["source_id"]
@@ -2458,7 +2568,7 @@ class PipelineRunner:
         timeline_data = self._load_step_json("timeline")
         timeline = timeline_data.get("timeline", [])
         llm_input_cfg = self.config.raw.get("llm_input", {})
-        digest_version = "llm_timeline_digest_v2_asr_digest"
+        digest_version = "llm_timeline_digest_v3_owned_asr"
         input_hash = stable_hash({
             "timeline": self._step_content_hash("timeline"),
             "digest_version": digest_version,
@@ -2473,10 +2583,15 @@ class PipelineRunner:
         for item in timeline:
             chunks.append({
                 "chunk_id": item.get("chunk_id", ""),
+                "source_id": item.get("source_id", ""),
                 "time": f"{item.get('start', '')}-{item.get('end', '')}",
                 "start_seconds": item.get("start_seconds", 0),
                 "end_seconds": item.get("end_seconds", 0),
+                "local_start_seconds": item.get("local_start_seconds", item.get("start_seconds", 0)),
+                "local_end_seconds": item.get("local_end_seconds", item.get("end_seconds", 0)),
                 "speech": compact_asr_for_llm(item.get("asr_digest") or item.get("asr_text", ""), max_chars=int(llm_input_cfg.get("max_asr_chars_per_chunk", 320))),
+                "asr_owned_text": compact_text(item.get("asr_owned_text", ""), max_chars=int(llm_input_cfg.get("max_asr_chars_per_chunk", 320))),
+                "asr_attribution": item.get("asr_attribution", {}),
                 "visual": compact_text(item.get("visual_summary", ""), max_chars=int(llm_input_cfg.get("max_visual_chars_per_chunk", 160))),
                 "screen_text": compact_list(item.get("screen_text", []), max_items=int(llm_input_cfg.get("max_screen_text_items", 5))),
                 "column_bug": item.get("column_bug", ""),
@@ -2484,6 +2599,10 @@ class PipelineRunner:
                 "scene": item.get("scene_type", ""),
                 "frame_shots": item.get("frame_shots", []),
                 "footage_types": item.get("footage_types", []),
+                "content_role": item.get("content_role", ""),
+                "program_identity": item.get("program_identity", ""),
+                "program_mentions": item.get("program_mentions", []),
+                "asr_visual_relation": item.get("asr_visual_relation", ""),
                 "visual_score": item.get("visual_value_score", 0),
                 "hook_score": item.get("hook_score", 0),
                 "flags": build_chunk_flags(item),
@@ -5027,6 +5146,12 @@ class PipelineRunner:
                     "t": self._safe_float(t_value, 0.0),
                     "shot_type": str(fr.get("shot_type") or "").strip(),
                     "visual": str(fr.get("visual") or "").strip(),
+                    "content_role": str(fr.get("content_role") or "").strip(),
+                    "program_identity": str(fr.get("program_identity") or "").strip(),
+                    "program_mentions": fr.get("program_mentions") if isinstance(fr.get("program_mentions"), list) else [],
+                    "column_bug": str(fr.get("column_bug") or "").strip(),
+                    "screen_text": fr.get("screen_text") if isinstance(fr.get("screen_text"), list) else [],
+                    "asr_visual_relation": str(fr.get("asr_visual_relation") or "").strip(),
                 })
         footage_types: list[str] = []
         for fr in frame_shots:
@@ -5046,6 +5171,10 @@ class PipelineRunner:
             "footage_type": str(raw.get("footage_type") or ""),
             "frame_shots": frame_shots,
             "footage_types": footage_types,
+            "content_role": str(raw.get("content_role") or "").strip(),
+            "program_identity": str(raw.get("program_identity") or "").strip(),
+            "program_mentions": raw.get("program_mentions") if isinstance(raw.get("program_mentions"), list) else [],
+            "asr_visual_relation": str(raw.get("asr_visual_relation") or raw.get("asr_visual_consistency") or "").strip(),
             "asr_visual_consistency": str(raw.get("asr_visual_consistency") or ""),
             "warnings": warnings,
             "materialized_by_code": True,
@@ -8284,7 +8413,7 @@ class PipelineRunner:
         if hard_issues:
             # 用户策略：AI 配音不强制写满、不强制目标时长。文案偏短只警告不阻断，
             # 画面会向配音收缩；非 AI 配音模式仍按原逻辑阻断。
-            if getattr(self.options, "production_mode", "") == "ai_voiceover":
+            if getattr(getattr(self, "options", None), "production_mode", "") == "ai_voiceover":
                 print(
                     "配音文案时长偏短（AI 配音模式，仅警告不阻断，画面将向配音收缩）：\n"
                     + "\n".join(f"- {issue}" for issue in hard_issues)
@@ -9985,7 +10114,7 @@ class PipelineRunner:
         compacted: list[dict[str, Any]] = []
         cursor = 0.0
         gap = max(0.0, float(self.duration_settings.inter_sentence_gap_seconds or 0))
-        production_mode = getattr(self.options, "production_mode", "normal")
+        production_mode = getattr(getattr(self, "options", None), "production_mode", "normal")
         for clip in clips:
             shot_id = str(clip.get("shot_id") or clip.get("source_shot_id") or "")
             segment = active_by_shot_id.get(shot_id)
@@ -10636,7 +10765,12 @@ class PipelineRunner:
             quality_check = self._reassembly_quality_check(video, out)
             write_json(vdir / "final_quality_check.json", quality_check)
             self._write_status(vdir, {**self._base_status("reassembly_render", version, stable_hash(video), [out]), "quality_check": quality_check})
-            outputs.append({"reassembly_id": rid, "file": relpath(out, self.task_dir), "quality_check": quality_check})
+            try:
+                stat = out.stat()
+                fingerprint = {"size_bytes": int(stat.st_size), "mtime_ns": int(stat.st_mtime_ns)}
+            except OSError:
+                fingerprint = {}
+            outputs.append({"reassembly_id": rid, "file": relpath(out, self.task_dir), "quality_check": quality_check, "media_fingerprint": fingerprint})
         out_index = write_json(base_dir / "reassembly_render_outputs.json", {"version": version, "outputs": outputs, "skipped_outputs": skipped_outputs})
         status = "success"
         if skipped_outputs:
@@ -10751,12 +10885,42 @@ class PipelineRunner:
             f"VIP={'有' if result['vip'].get('present') else '无'})"
         )
 
+    def step_full_concat_boundary_refine(self) -> None:
+        """Materialise auditable keep/drop transitions before building the plan."""
+        detection = self._load_step_json("ad_detection")
+        cfg = dict(self.config.raw.get("full_concat_boundary_refine", {}) or {})
+        input_hash = stable_hash({
+            "ad_detection": self._step_content_hash("ad_detection"),
+            "config": cfg,
+            "contract": full_concat_qc.FULL_CONCAT_PLAN_QC_VERSION,
+        })
+        if self._can_reuse("full_concat_boundary_refine", input_hash):
+            print("复用缓存: full_concat_boundary_refine")
+            return
+        version, vdir = self._version_dir("full_concat_boundary_refine", "edit/full_concat_boundary_refine")
+        ensure_dir(vdir)
+        report = full_concat_qc.refine_detection_boundaries(detection, config=cfg)
+        out = write_json(vdir / "boundary_refinement.json", report)
+        self._write_status(vdir, self._base_status("full_concat_boundary_refine", version, input_hash, [out]))
+        self._record_step(
+            step="full_concat_boundary_refine", version=version, status="success",
+            output=relpath(out, self.task_dir), input_hash=input_hash, output_files=[out],
+            extra={"summary": report.get("stats", {})},
+        )
+        print(f"完成: full_concat_boundary_refine ({len(report.get('boundaries', []))} boundaries)")
+
     def step_full_concat_plan(self) -> None:
         detection = self._load_step_json("ad_detection")
+        boundary = self._load_optional_step_json("full_concat_boundary_refine", {})
+        boundary_segments = boundary.get("segments") if isinstance(boundary, dict) else None
+        if isinstance(boundary_segments, list) and boundary_segments:
+            detection = dict(detection)
+            detection["segments"] = boundary_segments
         segments = detection.get("segments", []) if isinstance(detection, dict) else []
         cfg = ad_detection.load_cfg(self.config)
         input_hash = stable_hash({
             "ad_detection": self._step_content_hash("ad_detection"),
+            "boundary_refinement": self._step_content_hash("full_concat_boundary_refine"),
             "aspect": self.options.aspect_ratio,
             "full_concat_cfg": {k: cfg[k] for k in ("safety_margin_seconds", "merge_gap_seconds", "min_clip_seconds")},
         })
@@ -10811,6 +10975,45 @@ class PipelineRunner:
                 technical_detail={"blocked_reasons": video.get("blocked_reasons", [])},
             )
 
+    def step_full_concat_plan_qc(self) -> None:
+        """Block rendering when a plan overlaps an explicit drop interval."""
+        plan = self._load_step_json("full_concat_plan")
+        detection = self._load_step_json("ad_detection")
+        boundary = self._load_optional_step_json("full_concat_boundary_refine", {})
+        if isinstance(boundary.get("segments"), list) and boundary.get("segments"):
+            detection = dict(detection)
+            detection["segments"] = boundary["segments"]
+        cfg = dict(self.config.raw.get("full_concat_plan_qc", {}) or {})
+        input_hash = stable_hash({
+            "plan": self._step_content_hash("full_concat_plan"),
+            "detection": self._step_content_hash("ad_detection"),
+            "config": cfg,
+        })
+        if self._can_reuse("full_concat_plan_qc", input_hash):
+            print("复用缓存: full_concat_plan_qc")
+            return
+        version, vdir = self._version_dir("full_concat_plan_qc", "edit/full_concat_plan_qc")
+        ensure_dir(vdir)
+        report = full_concat_qc.plan_qc(plan, detection, config=cfg)
+        out = write_json(vdir / "full_concat_plan_qc.json", report)
+        status = "success" if report.get("status") == "pass" else "failed"
+        status_doc = self._base_status("full_concat_plan_qc", version, input_hash, [out])
+        status_doc["status"] = status
+        self._write_status(vdir, status_doc)
+        self._record_step(
+            step="full_concat_plan_qc", version=version, status=status,
+            output=relpath(out, self.task_dir), input_hash=input_hash, output_files=[out],
+            extra={"summary": report.get("metrics", {}), "qc": report},
+        )
+        print(f"完成: full_concat_plan_qc ({report.get('status')})")
+        if status == "failed" and str(cfg.get("mode", "block")) == "block":
+            raise UserFacingPipelineError(
+                "full_concat_plan_qc_failed",
+                user_message="完整版剪辑计划语义检查失败，已阻止渲染。",
+                suggestions=["检查广告检测和边界精修报告后，从 full_concat_boundary_refine 重跑。"],
+                technical_detail={"issues": report.get("issues", [])},
+            )
+
     def step_full_concat_render(self) -> None:
         render_slots = int(self.config.raw.get("gpu_limits", {}).get("render_slots", 1))
         with file_slot_lock("render", slots=render_slots):
@@ -10818,7 +11021,17 @@ class PipelineRunner:
 
     def _step_full_concat_render_impl(self) -> None:
         plan = self._load_step_json("full_concat_plan")
-        input_hash = stable_hash({"full_concat_plan": self._step_content_hash("full_concat_plan")})
+        plan_qc = self._load_optional_step_json("full_concat_plan_qc", {})
+        if plan_qc.get("status") == "fail":
+            raise UserFacingPipelineError(
+                "full_concat_plan_qc_failed",
+                user_message="剪辑计划未通过语义 QC，禁止渲染。",
+                technical_detail={"issues": plan_qc.get("issues", [])},
+            )
+        input_hash = stable_hash({
+            "full_concat_plan": self._step_content_hash("full_concat_plan"),
+            "full_concat_plan_qc": self._step_content_hash("full_concat_plan_qc"),
+        })
         if self._can_reuse("full_concat_render", input_hash):
             print("复用缓存: full_concat_render")
             return
@@ -10859,6 +11072,50 @@ class PipelineRunner:
         print(f"完成: full_concat_render ({status})")
         if status == "failed":
             raise RuntimeError("full_concat_render has no available videos")
+
+    def step_full_concat_output_qc(self) -> None:
+        """Inspect the actual MP4s and quarantine outputs that are not publishable."""
+        render_index = self._load_step_json("full_concat_render")
+        plan_qc = self._load_optional_step_json("full_concat_plan_qc", {})
+        input_hash = stable_hash({
+            "render": self._step_content_hash("full_concat_render"),
+            "plan_qc": self._step_content_hash("full_concat_plan_qc"),
+            "contract": full_concat_qc.FULL_CONCAT_OUTPUT_QC_VERSION,
+        })
+        if self._can_reuse("full_concat_output_qc", input_hash):
+            print("复用缓存: full_concat_output_qc")
+            return
+        version, vdir = self._version_dir("full_concat_output_qc", "edit/full_concat_output_qc")
+        ensure_dir(vdir)
+        report = full_concat_qc.output_qc(render_index, plan_qc, self.task_dir)
+        out = write_json(vdir / "full_concat_output_qc.json", report)
+        status = "success" if report.get("status") == "pass" else "failed"
+        self._write_status(vdir, {**self._base_status("full_concat_output_qc", version, input_hash, [out]), "status": status, "publishable": bool(report.get("publishable")), "quarantined": bool(report.get("quarantined"))})
+        self._record_step(
+            step="full_concat_output_qc", version=version, status=status,
+            output=relpath(out, self.task_dir), input_hash=input_hash, output_files=[out],
+            extra={"publishable": bool(report.get("publishable")), "quarantined": bool(report.get("quarantined")), "summary": {"issue_count": len(report.get("issues", []))}},
+        )
+        # Keep the render artifact for diagnosis, but make publication state
+        # explicit so UI code cannot mistake a quarantined MP4 for latest.
+        render_output = self.manifest.get("steps", {}).get("full_concat_render", {}).get("output")
+        if render_output:
+            render_path = self.task_dir / render_output
+            render_doc = read_json(render_path, {})
+            render_doc["semantic_qc_status"] = report.get("status")
+            render_doc["publishable"] = bool(report.get("publishable"))
+            render_doc["quarantined"] = bool(report.get("quarantined"))
+            render_doc["semantic_qc_output"] = relpath(out, self.task_dir)
+            write_json(render_path, render_doc)
+        print(f"完成: full_concat_output_qc ({report.get('status')})")
+        qc_cfg = dict(self.config.raw.get("full_concat_output_qc", {}) or {})
+        if status == "failed" and str(qc_cfg.get("mode", "block")) == "block":
+            raise UserFacingPipelineError(
+                "full_concat_output_qc_failed",
+                user_message="最终成片未通过语义/技术 QC，已隔离，不能发布。",
+                suggestions=["查看 full_concat_output_qc 报告，从边界精修步骤重跑。"],
+                technical_detail={"issues": report.get("issues", [])},
+            )
 
     def _normalize_reassembly_clip_to_source_boundaries(
         self,
@@ -11559,7 +11816,12 @@ class PipelineRunner:
             end = float(seg.get("end") or 0)
             if end <= start:
                 end = start + max(1.0, len(seg.get("text", "")) / 5.0)
-            out.append({
+            # Preserve ASR window ownership and diagnostics.  Dropping chunk_id
+            # here previously forced every downstream consumer to recover
+            # ownership from broad overlap ranges, expanding a 10s chunk to
+            # roughly 32s of text when 1s ASR window overlap was enabled.
+            normalized = dict(seg)
+            normalized.update({
                 "id": idx,
                 "start": start,
                 "end": end,
@@ -11568,16 +11830,69 @@ class PipelineRunner:
                 "speaker": seg.get("speaker", ""),
                 "text": clean_asr_text(str(seg.get("text", "")))["clean_text"],
             })
+            out.append(normalized)
         if not out and full_text:
             out.append({"id": 1, "start": 0, "end": 0, "start_time": "00:00:00.000", "end_time": "00:00:00.000", "speaker": "", "text": clean_asr_text(full_text)["clean_text"]})
         return out
+
+    def _asr_segments_for_chunk(
+        self,
+        segments: list[dict[str, Any]],
+        chunk: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Return ASR evidence owned by exactly one analysis chunk.
+
+        New ASR artifacts carry owner_chunk_id from the window that produced the
+        transcript.  Legacy normalized artifacts lost that field; for them a
+        midpoint fallback provides a deterministic, single-chunk attribution
+        instead of the former any-intersection rule.
+        """
+        chunk_id = str(chunk.get("chunk_id") or "")
+        source_id = str(chunk.get("source_id") or "")
+        owned_contract = any(
+            str(seg.get("owner_chunk_id") or seg.get("chunk_id") or "")
+            for seg in segments
+            if isinstance(seg, dict)
+        )
+
+        if owned_contract and chunk_id:
+            selected = []
+            for seg in segments:
+                if not isinstance(seg, dict):
+                    continue
+                owner_chunk_id = str(seg.get("owner_chunk_id") or seg.get("chunk_id") or "")
+                if owner_chunk_id != chunk_id or bool(seg.get("context_only", False)):
+                    continue
+                segment_source_id = str(seg.get("source_id") or "")
+                if source_id and segment_source_id and segment_source_id != source_id:
+                    continue
+                selected.append(seg)
+            return sorted(selected, key=lambda item: (float(item.get("start") or 0), str(item.get("id") or "")))
+
+        start = float(chunk.get("local_start_seconds", chunk.get("start", 0)) or 0)
+        end = float(chunk.get("local_end_seconds", chunk.get("end", start)) or start)
+        selected = []
+        for seg in segments:
+            if not isinstance(seg, dict):
+                continue
+            segment_source_id = str(seg.get("source_id") or "")
+            if source_id and segment_source_id and segment_source_id != source_id:
+                continue
+            seg_start = float(seg.get("start") or 0)
+            seg_end = float(seg.get("end") or seg_start)
+            midpoint = (seg_start + seg_end) / 2.0 if seg_end > seg_start else seg_start
+            if start <= midpoint < end:
+                selected.append(seg)
+        return sorted(selected, key=lambda item: (float(item.get("start") or 0), str(item.get("id") or "")))
 
     def _segments_in_range(self, segments: list[dict[str, Any]], start: float, end: float) -> list[dict[str, Any]]:
         selected = []
         for seg in segments:
             s = float(seg.get("start") or 0)
             e = float(seg.get("end") or s)
-            if e >= start and s <= end:
+            # Use half-open ranges with a positive overlap.  The old inclusive
+            # check duplicated segments exactly touching a chunk boundary.
+            if min(e, end) - max(s, start) > 0.001:
                 selected.append(seg)
         return selected
 

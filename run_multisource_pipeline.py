@@ -16,6 +16,7 @@ from newsclip_agent.pipeline import main as pipeline_main
 from newsclip_agent.resource_locks import file_slot_lock
 from newsclip_agent.remote_ucms import download_ucms_video, load_remote_ucms_config
 from newsclip_agent.utils import ensure_dir, read_json, relpath, stable_hash, write_json
+from newsclip_agent.common_cache import build_common_analysis_profile, build_common_source_key
 
 
 ROOT = Path(__file__).resolve().parent
@@ -230,27 +231,30 @@ def _normalize_full_concat_request(request: dict[str, Any]) -> bool:
     fc = config.raw.get("full_concat", {}) or {}
     desired_chunk = int(fc.get("chunk_seconds", 10) or 10)
     desired_frame = int(fc.get("frame_interval", 5) or 5)
-    if int(request.get("chunk_seconds") or 0) == desired_chunk and int(request.get("frame_interval") or 0) == desired_frame:
-        return False
+    changed = False
+    if int(request.get("chunk_seconds") or 0) != desired_chunk:
+        request["chunk_seconds"] = desired_chunk
+        changed = True
+    if int(request.get("frame_interval") or 0) != desired_frame:
+        request["frame_interval"] = desired_frame
+        changed = True
 
-    request["chunk_seconds"] = desired_chunk
-    request["frame_interval"] = desired_frame
-    if request.get("common_task_id") or request.get("common_source_key"):
+    # Always recompute the key.  The semantic contract may have changed even
+    # when the visible 10s/5s runtime options did not.
+    # Requests without a source pool (legacy single-input invocation) must not
+    # be silently converted into a common-analysis job.
+    if request.get("source_items") or request.get("common_source_key") or request.get("common_task_id"):
         key = _request_common_source_key(request)
-        request["common_source_key"] = key
-        request["common_task_id"] = f"common_{key}"
-    return True
+        if request.get("common_source_key") != key or request.get("common_task_id") != f"common_{key}":
+            request["common_source_key"] = key
+            request["common_task_id"] = f"common_{key}"
+            changed = True
+    return changed
 
 
 def _request_common_source_key(request: dict[str, Any]) -> str:
-    payload = {
-        "sources": request.get("source_items") or [],
-        "aspect_ratio": request.get("aspect_ratio") or "16:9",
-        "chunk_seconds": request.get("chunk_seconds") or 60,
-        "frame_interval": request.get("frame_interval") or 10,
-        "mode": request.get("mode") or "normal",
-    }
-    return stable_hash(payload)[:16]
+    profile = build_common_analysis_profile(request, config=load_config(ROOT / "config.toml"))
+    return build_common_source_key(request.get("source_items") or [], profile, root=ROOT)
 
 
 def _append_common_log(common_dir: Path, message: str) -> None:
@@ -270,10 +274,10 @@ def _write_common_state(common_dir: Path, data: dict[str, Any]) -> None:
     write_json(common_dir / "common_state.json", data)
 
 
-def _wait_for_common_ready(common_dir: Path, timeout_seconds: int = 7200, poll_seconds: float = 3.0) -> bool:
+def _wait_for_common_ready(common_dir: Path, timeout_seconds: int = 7200, poll_seconds: float = 3.0, expected_profile_hash: str | None = None) -> bool:
     started = time.time()
     while time.time() - started < timeout_seconds:
-        if _common_analysis_ready(common_dir):
+        if _common_analysis_ready(common_dir, expected_profile_hash):
             return True
         manifest = read_json(common_dir / "manifest.json", {})
         if manifest.get("status") == "failed":
@@ -286,6 +290,7 @@ def _ensure_common_analysis(*, common_dir: Path, request: dict[str, Any], args: 
     ensure_dir(common_dir)
     ensure_dir(common_dir / "web_jobs")
     lock_name = f"common_source_{common_dir.name}"
+    profile_hash = stable_hash(build_common_analysis_profile(request, config=load_config(ROOT / "config.toml")))
     
     rerun = ""
     rerun_from = ""
@@ -297,26 +302,26 @@ def _ensure_common_analysis(*, common_dir: Path, request: dict[str, Any], args: 
             
     force_rerun_common = bool(_is_common_rerun_step(rerun) or _is_common_rerun_step(rerun_from))
     
-    if not force_rerun_common and _common_analysis_ready(common_dir):
-        _write_common_state(common_dir, {"common_task_id": common_dir.name, "status": "success"})
+    if not force_rerun_common and _common_analysis_ready(common_dir, profile_hash):
+        _write_common_state(common_dir, {"common_task_id": common_dir.name, "status": "success", "analysis_profile_hash": profile_hash})
         return
 
     state = _read_common_state(common_dir)
     if not force_rerun_common and state.get("status") == "running":
         _append_common_log(common_dir, f"wait existing common analysis")
-        _wait_for_common_ready(common_dir)
+        _wait_for_common_ready(common_dir, expected_profile_hash=profile_hash)
         return
 
     with file_slot_lock(lock_name, slots=1, enable_pid_stale_check=False):
-        if not force_rerun_common and _common_analysis_ready(common_dir):
+        if not force_rerun_common and _common_analysis_ready(common_dir, profile_hash):
             print(f"Reuse common analysis outputs: {common_dir}")
             _append_common_log(common_dir, "reuse common analysis outputs after lock")
-            _write_common_state(common_dir, {"common_task_id": common_dir.name, "status": "success"})
+            _write_common_state(common_dir, {"common_task_id": common_dir.name, "status": "success", "analysis_profile_hash": profile_hash})
             return
 
         state = _read_common_state(common_dir)
         if not force_rerun_common and state.get("status") == "running":
-            _wait_for_common_ready(common_dir)
+            _wait_for_common_ready(common_dir, expected_profile_hash=profile_hash)
             return
 
         source_count = len(_request_source_items(request))
@@ -332,6 +337,7 @@ def _ensure_common_analysis(*, common_dir: Path, request: dict[str, Any], args: 
             "owner_pid": os.getpid(),
             "owner_task_id": request.get("task_id") or "",
             "started_at": datetime.now().isoformat(timespec="seconds"),
+            "analysis_profile_hash": profile_hash,
         })
         try:
             config = load_config(ROOT / "config.toml")
@@ -389,10 +395,17 @@ def _ensure_common_analysis(*, common_dir: Path, request: dict[str, Any], args: 
                 _mark_common_failed(common_dir, detail, failed_step=failed_step)
                 raise RuntimeError(f"common analysis failed at {failed_step}: {detail}")
 
-            if not _common_analysis_ready(common_dir):
+            # This invocation just rebuilt the common pool, so stamp the
+            # profile before validating readiness.  An old pool that was not
+            # rebuilt is never stamped here and therefore cannot be reused.
+            rebuilt_manifest = read_json(common_dir / "manifest.json", {})
+            rebuilt_manifest["analysis_profile_hash"] = profile_hash
+            rebuilt_manifest["analysis_contract_version"] = build_common_analysis_profile(request, config=load_config(ROOT / "config.toml")).get("contracts", {}).get("common", "")
+            write_json(common_dir / "manifest.json", rebuilt_manifest)
+            if not _common_analysis_ready(common_dir, profile_hash):
                 _repair_common_manifest_from_outputs(common_dir)
 
-            if not _common_analysis_ready(common_dir):
+            if not _common_analysis_ready(common_dir, profile_hash):
                 manifest = read_json(common_dir / "manifest.json", {})
                 steps = manifest.get("steps", {}) or {}
                 not_ready_steps = [
@@ -418,12 +431,17 @@ def _ensure_common_analysis(*, common_dir: Path, request: dict[str, Any], args: 
                 _mark_common_failed(common_dir, message, failed_step=failed_step)
                 raise RuntimeError(message)
             _append_common_log(common_dir, "common analysis ready")
+            common_manifest = read_json(common_dir / "manifest.json", {})
+            common_manifest["analysis_profile_hash"] = profile_hash
+            common_manifest["analysis_contract_version"] = build_common_analysis_profile(request, config=load_config(ROOT / "config.toml")).get("contracts", {}).get("common", "")
+            write_json(common_dir / "manifest.json", common_manifest)
             _write_common_state(common_dir, {
                 "common_task_id": common_dir.name,
                 "status": "success",
                 "owner_pid": os.getpid(),
                 "owner_task_id": request.get("task_id") or "",
                 "finished_at": datetime.now().isoformat(timespec="seconds"),
+                "analysis_profile_hash": profile_hash,
             })
         except Exception as exc:
             _append_common_log(common_dir, f"common analysis failed: {exc}")
@@ -495,7 +513,12 @@ def _common_step_ready(common_dir: Path, step: str) -> bool:
     return _common_step_output_exists(common_dir, step)
 
 
-def _common_analysis_ready(common_dir: Path) -> bool:
+def _common_analysis_ready(common_dir: Path, expected_profile_hash: str | None = None) -> bool:
+    if expected_profile_hash:
+        manifest = read_json(common_dir / "manifest.json", {})
+        state = read_json(common_dir / "common_state.json", {})
+        if manifest.get("analysis_profile_hash") != expected_profile_hash or state.get("analysis_profile_hash") != expected_profile_hash:
+            return False
     return all(_common_step_ready(common_dir, step) for step in COMMON_REUSABLE_STEPS)
 
 
@@ -665,6 +688,8 @@ def _copy_common_outputs_to_task(*, common_dir: Path, task_dir: Path, request: d
     manifest["updated_at"] = now
     manifest["common_task_id"] = common_dir.name
     manifest["common_source_key"] = request.get("common_source_key", "")
+    manifest["analysis_profile_hash"] = common_manifest.get("analysis_profile_hash", stable_hash(build_common_analysis_profile(request)))
+    manifest["analysis_contract_version"] = common_manifest.get("analysis_contract_version", "")
     manifest["production_mode"] = request.get("production_mode", manifest.get("production_mode", "ai_voiceover"))
 
     for key in ("source_video", "source_mode", "source_manifest", "source_videos"):

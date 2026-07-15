@@ -1,0 +1,252 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>完整版精剪 · 凤凰智剪</title>
+    <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
+    <link rel="stylesheet" href="/static/editor.css?v=20260715_editor_v4" />
+  </head>
+  <body>
+    <div class="editor-shell">
+      <header class="editor-topbar">
+        <div class="editor-brand">
+          <a class="back-button" href="/" title="返回主页面"><i data-lucide="arrow-left"></i></a>
+          <div class="brand-mark">F</div>
+          <div>
+            <div class="eyebrow">PHOENIX MANUAL EDITOR</div>
+            <h1>完整版精剪</h1>
+            <p id="taskTitle">正在读取任务…</p>
+          </div>
+        </div>
+        <div class="top-actions">
+          <span id="saveState" class="save-state">尚未修改</span>
+          <button id="undoBtn" class="button secondary" disabled><i data-lucide="undo-2"></i><span>撤销</span></button>
+          <button id="redoBtn" class="button secondary" disabled><i data-lucide="redo-2"></i><span>重做</span></button>
+          <button id="saveProjectBtn" class="button secondary"><i data-lucide="save"></i><span>保存工程</span></button>
+          <button id="exportVideoBtn" class="button primary"><i data-lucide="clapperboard"></i><span>导出视频</span></button>
+        </div>
+      </header>
+
+      <nav class="editor-tabs" aria-label="编辑模块">
+        <button class="editor-tab active" data-tab="timeline"><i data-lucide="film"></i><span>视频精剪</span></button>
+        <button class="editor-tab" data-tab="cover"><i data-lucide="image"></i><span>封面制作</span></button>
+      </nav>
+
+      <main>
+        <section id="timelineTab" class="tab-page active">
+          <div class="work-grid">
+            <aside class="asset-panel panel">
+              <div class="panel-heading">
+                <div><h2>素材箱</h2><p>远程素材为主，本地上传仅作补充</p></div>
+              </div>
+              <div class="asset-source-actions">
+                <button id="openRemoteAssetLibraryBtn" class="button primary full"><i data-lucide="cloud-download"></i><span>选择远程素材</span></button>
+                <button id="uploadAssetBtn" class="button secondary full"><i data-lucide="upload"></i><span>上传本地补充素材</span></button>
+                <input id="assetUploadInput" class="sr-only" type="file" accept="video/mp4,video/quicktime,video/x-matroska,video/x-m4v,video/x-msvideo" />
+              </div>
+              <div id="assetList" class="asset-list"></div>
+              <div class="source-range">
+                <div class="range-heading"><strong>素材入点 / 出点</strong><span id="sourceDuration">-</span></div>
+                <label><span>入点（秒）</span><input id="sourceIn" type="number" min="0" step="0.04" value="0" /></label>
+                <label><span>出点（秒）</span><input id="sourceOut" type="number" min="0" step="0.04" value="0" /></label>
+                <div class="inline-buttons">
+                  <button id="markInBtn" class="button secondary compact">当前帧设入点</button>
+                  <button id="markOutBtn" class="button secondary compact">当前帧设出点</button>
+                </div>
+                <button id="insertClipBtn" class="button primary full"><i data-lucide="plus"></i><span>插入到播放头</span></button>
+              </div>
+            </aside>
+
+            <section class="preview-panel panel">
+              <div class="panel-heading preview-heading">
+                <div><h2>画面预览</h2><p id="previewLabel">成片时间 00:00:00.000</p></div>
+                <div class="preview-modes">
+                  <button id="previewTimelineBtn" class="mini-toggle active">成片</button>
+                  <button id="previewSourceBtn" class="mini-toggle">素材</button>
+                </div>
+              </div>
+              <div id="videoStage" class="video-stage">
+                <video id="editorVideo" controls preload="metadata"></video>
+                <div id="mosaicOverlay" class="mosaic-overlay hidden"></div>
+              </div>
+              <div class="transport">
+                <button id="playPauseBtn" class="transport-button"><i data-lucide="play"></i></button>
+                <code id="timeReadout">00:00:00.000 / 00:00:00.000</code>
+                <label class="zoom-control"><span>时间轴缩放</span><input id="timelineZoom" type="range" min="4" max="80" value="16" /></label>
+              </div>
+            </section>
+
+            <aside class="inspector-panel panel">
+              <div class="panel-heading"><div><h2>检查器</h2><p>选区、片段与固定马赛克</p></div></div>
+              <section class="inspector-section">
+                <h3>时间选区</h3>
+                <div class="field-grid two">
+                  <label><span>开始</span><input id="selectionStart" type="number" min="0" step="0.04" value="0" /></label>
+                  <label><span>结束</span><input id="selectionEnd" type="number" min="0" step="0.04" value="0" /></label>
+                </div>
+                <div class="inline-buttons">
+                  <button id="selectionFromPlayhead" class="button secondary compact">从播放头</button>
+                  <button id="deleteRangeBtn" class="button danger compact"><i data-lucide="scissors"></i><span>删除选区</span></button>
+                </div>
+              </section>
+
+              <section class="inspector-section">
+                <div class="section-row"><h3>片段</h3><span id="selectedClipLabel">未选择</span></div>
+                <div class="field-grid two">
+                  <label><span>源入点</span><input id="clipSourceIn" type="number" min="0" step="0.04" /></label>
+                  <label><span>源出点</span><input id="clipSourceOut" type="number" min="0" step="0.04" /></label>
+                </div>
+                <div class="inline-buttons">
+                  <button id="applyTrimBtn" class="button secondary compact">应用裁剪</button>
+                  <button id="splitClipBtn" class="button secondary compact">播放头拆分</button>
+                  <button id="removeClipBtn" class="button danger compact">删除片段</button>
+                </div>
+              </section>
+
+              <section class="inspector-section mosaic-section">
+                <div class="section-row"><h3>固定区域马赛克</h3><button id="addMosaicBtn" class="button secondary compact">添加</button></div>
+                <p class="help">马赛克固定在选中片段的指定区域和时间段，不做关键帧移动或自动跟踪。</p>
+                <div class="field-grid four">
+                  <label><span>X %</span><input id="mosaicX" type="number" min="0" max="100" value="60" /></label>
+                  <label><span>Y %</span><input id="mosaicY" type="number" min="0" max="100" value="10" /></label>
+                  <label><span>宽 %</span><input id="mosaicW" type="number" min="1" max="100" value="25" /></label>
+                  <label><span>高 %</span><input id="mosaicH" type="number" min="1" max="100" value="25" /></label>
+                </div>
+                <div class="field-grid two">
+                  <label><span>片段内开始</span><input id="mosaicStart" type="number" min="0" step="0.04" value="0" /></label>
+                  <label><span>片段内结束</span><input id="mosaicEnd" type="number" min="0" step="0.04" value="1" /></label>
+                </div>
+                <div id="mosaicList" class="effect-list"></div>
+              </section>
+            </aside>
+          </div>
+
+          <section class="timeline-panel panel">
+            <div class="timeline-toolbar">
+              <div><h2>主视频轨</h2><p>单轨硬切 · 拖动片段重排 · 拖动空白区域框选</p></div>
+              <div class="timeline-summary"><span id="clipCount">0 个片段</span><strong id="totalDuration">00:00:00.000</strong></div>
+            </div>
+            <div id="timelineViewport" class="timeline-viewport">
+              <div id="timelineContent" class="timeline-content">
+                <div id="timelineRuler" class="timeline-ruler"></div>
+                <div id="videoTrack" class="video-track"></div>
+                <div id="effectTrack" class="effect-track"></div>
+                <div id="timelineSelection" class="timeline-selection hidden"></div>
+                <div id="playhead" class="playhead"><span></span></div>
+              </div>
+            </div>
+          </section>
+        </section>
+
+        <section id="coverTab" class="tab-page">
+          <div class="cover-grid">
+            <aside class="cover-controls panel">
+              <div class="panel-heading"><div><h2>AI 封面背景</h2><p>豆包注入 Seedream Skill 后生成提示词</p></div></div>
+              <label><span>封面标题</span><input id="coverTitle" maxlength="120" placeholder="输入新闻封面标题" /></label>
+              <label><span>新闻摘要</span><textarea id="coverSummary" rows="4" placeholder="提供事实摘要，避免模型虚构"></textarea></label>
+              <label><span>画面要求</span><textarea id="coverRequirements" rows="3" placeholder="例如：纪实、主体靠右、冷色调"></textarea></label>
+              <div class="field-grid two">
+                <label><span>比例</span><select id="coverRatio"><option>16:9</option><option>9:16</option><option>1:1</option></select></label>
+                <label><span>清晰度</span><select id="coverSize"><option>2K</option><option>4K</option><option>1K</option></select></label>
+                <label><span>标题留白</span><select id="coverSafeArea"><option value="left">左侧</option><option value="right">右侧</option><option value="top">顶部</option><option value="bottom">底部</option></select></label>
+                <label><span>候选数量</span><select id="coverCount"><option>1</option><option selected>2</option><option>3</option><option>4</option></select></label>
+              </div>
+              <button id="generateCoverBtn" class="button primary full"><i data-lucide="sparkles"></i><span>生成候选封面</span></button>
+              <button id="uploadCoverBtn" class="button secondary full"><i data-lucide="image-up"></i><span>上传已有图片</span></button>
+              <input id="coverUploadInput" class="sr-only" type="file" accept="image/png,image/jpeg,image/webp" />
+              <details class="prompt-details"><summary>查看 / 调整 Seedream 提示词</summary><textarea id="seedreamPrompt" rows="7"></textarea></details>
+              <div id="coverCandidates" class="cover-candidates"></div>
+            </aside>
+
+            <section class="cover-canvas-panel panel">
+              <div class="panel-heading">
+                <div><h2>封面预览</h2><p>裁剪、高清处理和文字图层均为非破坏式</p></div>
+                <div class="inline-buttons">
+                  <button id="aiRestoreBtn" class="button secondary"><i data-lucide="wand-sparkles"></i><span>AI 高清修复</span></button>
+                  <button id="exportCoverBtn" class="button primary"><i data-lucide="download"></i><span>导出封面</span></button>
+                </div>
+              </div>
+              <div class="cover-stage-wrap"><canvas id="coverCanvas" width="960" height="540"></canvas></div>
+              <div class="cover-stage-note" id="coverStatus">请先生成或上传一张背景图</div>
+            </section>
+
+            <aside class="cover-inspector panel">
+              <div class="panel-heading"><div><h2>封面检查器</h2><p>裁剪、增强、文字和字体</p></div></div>
+              <section class="inspector-section">
+                <h3>裁剪区域（%）</h3>
+                <div class="field-grid four">
+                  <label><span>X</span><input id="cropX" type="number" min="0" max="100" value="0" /></label>
+                  <label><span>Y</span><input id="cropY" type="number" min="0" max="100" value="0" /></label>
+                  <label><span>宽</span><input id="cropW" type="number" min="1" max="100" value="100" /></label>
+                  <label><span>高</span><input id="cropH" type="number" min="1" max="100" value="100" /></label>
+                </div>
+                <label><span>普通高清处理</span><select id="coverEnhance"><option value="standard">放大 + 去噪锐化</option><option value="light">轻度锐化</option><option value="none">不处理</option></select></label>
+              </section>
+              <section class="inspector-section">
+                <div class="section-row"><h3>文字图层</h3><div><button id="addTextLayerBtn" class="button secondary compact">添加</button><button id="removeTextLayerBtn" class="button danger compact">删除</button></div></div>
+                <select id="textLayerSelect"></select>
+                <label><span>文字</span><textarea id="coverText" rows="3"></textarea></label>
+                <div class="field-grid two">
+                  <label><span>字体</span><select id="coverFont"><option value="">系统默认</option></select></label>
+                  <label><span>字号</span><input id="coverFontSize" type="number" min="12" max="300" value="76" /></label>
+                  <label><span>颜色</span><input id="coverTextColor" type="color" value="#ffffff" /></label>
+                  <label><span>描边</span><input id="coverStrokeColor" type="color" value="#000000" /></label>
+                  <label><span>X %</span><input id="coverTextX" type="number" min="0" max="100" value="8" /></label>
+                  <label><span>Y %</span><input id="coverTextY" type="number" min="0" max="100" value="68" /></label>
+                  <label><span>最大宽 %</span><input id="coverTextWidth" type="number" min="10" max="100" value="80" /></label>
+                  <label><span>描边宽度</span><input id="coverStrokeWidth" type="number" min="0" max="20" value="3" /></label>
+                </div>
+                <div class="inline-buttons">
+                  <button id="uploadFontBtn" class="button secondary compact"><i data-lucide="type"></i><span>上传 TTF/OTF</span></button>
+                  <input id="fontUploadInput" class="sr-only" type="file" accept=".ttf,.otf,font/ttf,font/otf" />
+                </div>
+              </section>
+            </aside>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <div id="remoteAssetDialog" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="remoteAssetDialogTitle" aria-hidden="true">
+      <section class="remote-asset-dialog">
+        <header class="remote-dialog-header">
+          <div>
+            <div class="eyebrow">UCMS REMOTE LIBRARY</div>
+            <h2 id="remoteAssetDialogTitle">选择远程视频素材</h2>
+            <p>加入后由服务端写入共享缓存，并通过精剪工程预览。</p>
+          </div>
+          <button id="closeRemoteAssetLibraryBtn" class="icon-button" type="button" title="关闭"><i data-lucide="x"></i></button>
+        </header>
+
+        <div class="remote-filter-grid">
+          <label><span>信号源</span><select id="editorRemoteStation"></select></label>
+          <label class="remote-search-field"><span>搜索</span><input id="editorRemoteSearch" type="search" placeholder="名称 / 时间 / ID" /></label>
+          <label><span>排序</span><select id="editorRemoteSort"><option value="desc" selected>时间倒序</option><option value="asc">时间正序</option></select></label>
+          <label><span>起始时间</span><input id="editorRemoteStart" type="datetime-local" step="1" /></label>
+          <label><span>结束时间</span><input id="editorRemoteEnd" type="datetime-local" step="1" /></label>
+          <div class="remote-filter-actions">
+            <button id="editorRemoteClearBtn" class="button secondary" type="button">清除时间</button>
+            <button id="editorRemoteSearchBtn" class="button primary" type="button"><i data-lucide="search"></i><span>查询素材</span></button>
+          </div>
+        </div>
+
+        <div id="editorRemoteStatus" class="remote-status" aria-live="polite">打开素材库后加载远程素材。</div>
+        <div id="editorRemoteList" class="remote-asset-list"></div>
+
+        <footer class="remote-dialog-footer">
+          <span id="editorRemotePageInfo">第 1 / 1 页 · 共 0 条</span>
+          <div class="remote-pager-controls">
+            <button id="editorRemotePrevBtn" class="button secondary compact" type="button">上一页</button>
+            <label class="remote-page-jump"><span>跳至</span><input id="editorRemotePageInput" type="number" min="1" value="1" /><span>页</span></label>
+            <button id="editorRemoteJumpBtn" class="button secondary compact" type="button">跳转</button>
+            <button id="editorRemoteNextBtn" class="button secondary compact" type="button">下一页</button>
+          </div>
+        </footer>
+      </section>
+    </div>
+
+    <div id="toast" class="toast hidden"></div>
+    <script src="/static/editor.js?v=20260715_editor_v4"></script>
+  </body>
+</html>

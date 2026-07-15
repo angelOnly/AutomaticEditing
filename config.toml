@@ -413,6 +413,23 @@ asr_slots = 1
 tts_slots = 1
 render_slots = 1
 
+[cover_generation]
+# 封面链路：豆包按项目内 Seedream Skill 规范生成提示词，再调用 Seedream 生图。
+# 密钥优先从 ARK_API_KEY 环境变量读取；服务端兼容现有豆包密钥配置，但不会暴露给前端。
+base_url = "https://ark.cn-beijing.volces.com/api/v3"
+chat_model = "ep-20260714134756-2xsr6"
+image_model = "ep-20260714111139-jddtc"
+skill_id = "seedream-news-cover"
+skill_version = "2026-07-15.v1"
+skill_path = "newsclip_agent/seedream-skills/SKILL.md"
+timeout_seconds = 180
+allowed_image_hosts = [".volces.com", ".volccdn.com", ".byteimg.com"]
+max_image_bytes = 33554432
+max_image_pixels = 80000000
+supported_ratios = ["16:9", "9:16", "1:1"]
+supported_sizes = ["1K", "2K", "4K"]
+safe_areas = ["left", "right", "top", "bottom"]
+
 # python环境
 [reassembly]
 default_output_mode = "single"
@@ -447,6 +464,37 @@ traditional_to_simplified = true
 bridge_keep_within_run = true
 # bridge 兜底允许的相邻间隔（秒）。杂质已先被正向删除，这里只补正片空隙，可适当放大
 bridge_max_gap_seconds = 120.0
+bridge_max_total_seconds = 30.0
+bridge_edge_max_seconds = 30.0
+boundary_candidate_max_seconds = 30.0
+# 风险边界精修和语义质量门禁。shadow 模式只产出报告，不改变旧计划；
+# apply/block 模式用于逐步灰度上线。
+[full_concat_boundary_refine]
+enabled = true
+mode = "apply"
+risk_edge_seconds = 15.0
+scan_window_seconds = 6.0
+sample_interval_seconds = 0.5
+stable_run_seconds = 1.0
+boundary_guard_seconds = 0.2
+min_confidence = 0.80
+max_risk_windows = 80
+
+[full_concat_plan_qc]
+enabled = true
+mode = "block"
+edge_seconds = 15.0
+join_window_seconds = 2.0
+block_on_unresolved_boundary = true
+
+[full_concat_output_qc]
+enabled = true
+mode = "block"
+edge_seconds = 15.0
+join_window_seconds = 2.0
+base_sample_interval_seconds = 1.0
+dense_sample_interval_seconds = 0.25
+publish_requires_pass = true
 
 [ad_detection]
 # 广告检测（full_concat 专用）。信号：ASR 文案 + 画面（screen_text/column_bug/scene）

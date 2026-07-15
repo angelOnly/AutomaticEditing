@@ -21,11 +21,16 @@ from .llm import OpenAICompatibleClient
 from .utils import read_json, seconds_to_timecode
 
 PROMPT_DIR = Path(__file__).resolve().parent / "prompt_texts"
-PROMPT_VERSION = "ad_detection_v5_frame_junk_split"
+PROMPT_VERSION = "ad_detection_v6_visual_ownership"
 
 # 保留 / 删除标签
 LABEL_TARGET = "target"
 KEEP_LABELS = {LABEL_TARGET, "target_intro_outro", "bridge"}
+
+STATE_HARD_DROP = "hard_drop"
+STATE_STRONG_KEEP = "strong_keep"
+STATE_BOUNDARY_CANDIDATE = "boundary_candidate"
+STATE_AMBIGUOUS = "ambiguous"
 
 # 广告/促销行动号召（面向观众的购买引导）
 AD_ACTION_KEYWORDS = [
@@ -54,6 +59,22 @@ NON_TARGET_PROMO_MARKERS = [
     "凤凰全球连线", "鳳凰全球連線", "CHIMELONG RESORT", "长隆度假区", "鳳凰資訊",
     "凤凰资讯", "News that matters",
 ]
+PLATFORM_PROMO_KEYWORDS = [
+    "传播矩阵", "传播平台", "平台宣传", "频道宣传", "宣传类片头", "多平台", "社交平台",
+    "手机端", "平板电脑", "内容列表", "节目列表", "短视频列表", "帖文界面", "关注我们",
+    "下载客户端", "News that matters", "拉近全球华人距离",
+    "港人港事港你知",
+]
+COPYRIGHT_SLATE_KEYWORDS = [
+    "版权声明", "版权所有", "是凤凰卫视有限公司的商标", "©2026凤凰卫视", "IFENG.COM",
+]
+CREDITS_KEYWORDS = [
+    "节目片尾职员表", "片尾职员表", "演职人员", "职员表", "制作人", "总制作人", "总策划",
+]
+HARD_DROP_CONTENT_ROLES = {
+    "sponsor_card", "commercial_ad", "other_program_promo", "channel_promo", "platform_promo",
+    "station_id", "copyright_slate",
+}
 PACKAGING_SCENES = {"片头包装", "片头", "片尾", "包装"}
 PACKAGING_FOOTAGE = {"片头包装", "片头", "片尾", "包装", "台标"}
 
@@ -113,6 +134,9 @@ def load_full_concat_cfg(config: Any) -> dict[str, Any]:
         "target_column_mode": str(raw.get("target_column_mode", "auto") or "auto"),
         "bridge_keep_within_run": bool(raw.get("bridge_keep_within_run", True)),
         "bridge_max_gap_seconds": float(raw.get("bridge_max_gap_seconds", 90.0) or 0.0),
+        "bridge_max_total_seconds": float(raw.get("bridge_max_total_seconds", 30.0) or 0.0),
+        "bridge_edge_max_seconds": float(raw.get("bridge_edge_max_seconds", 30.0) or 0.0),
+        "boundary_candidate_max_seconds": float(raw.get("boundary_candidate_max_seconds", 30.0) or 0.0),
     }
 
 
@@ -194,6 +218,18 @@ def _speech(chunk: dict[str, Any]) -> str:
     return str(chunk.get("speech") or chunk.get("asr_text") or chunk.get("asr_digest") or "").strip()
 
 
+def _speech_context(chunk: dict[str, Any]) -> str:
+    return str(chunk.get("speech_context") or "").strip()
+
+
+def _visual_summary(chunk: dict[str, Any]) -> str:
+    return str(chunk.get("visual_summary") or chunk.get("visual") or "").strip()
+
+
+def _content_role(chunk: dict[str, Any]) -> str:
+    return str(chunk.get("content_role") or "").strip().lower()
+
+
 def _column_bug(chunk: dict[str, Any]) -> str:
     return str(chunk.get("column_bug") or "").strip()
 
@@ -210,7 +246,7 @@ def _expand_visual_subsegments(chunks: list[dict[str, Any]]) -> list[dict[str, A
             continue
         source_id, start, end = seg_time(chunk)
         shots = _normalized_frame_shots(chunk, start, end)
-        if len(shots) < 2 or end - start <= 12 or not _should_split_visual_chunk(chunk, shots):
+        if len(shots) < 2 or not _should_split_visual_chunk(chunk, shots):
             expanded.append(chunk)
             continue
 
@@ -221,6 +257,7 @@ def _expand_visual_subsegments(chunks: list[dict[str, Any]]) -> list[dict[str, A
         else:
             original_id = f"{source_id}_{start:g}_{end:g}"
         raw_bug = _column_bug(chunk)
+        parent_speech = _speech(chunk)
         for idx, shot in enumerate(shots):
             seg_start = max(start, float(shot["t"]))
             seg_end = end if idx == len(shots) - 1 else min(end, float(shots[idx + 1]["t"]))
@@ -236,12 +273,42 @@ def _expand_visual_subsegments(chunks: list[dict[str, Any]]) -> list[dict[str, A
             sub["start_seconds"] = round(seg_start, 3)
             sub["end_seconds"] = round(seg_end, 3)
             sub["duration_seconds"] = round(seg_end - seg_start, 3)
-            sub["screen_text"] = visual
+            sub["visual"] = visual
+            sub["visual_summary"] = visual
+            shot_screen_text = shot.get("screen_text")
+            sub["screen_text"] = shot_screen_text if isinstance(shot_screen_text, list) else visual
             sub["scene"] = shot_type
             sub["scene_type"] = shot_type
             sub["footage_types"] = [shot_type] if shot_type else []
             sub["frame_shots"] = [shot]
-            sub["column_bug"] = raw_bug if raw_bug and column_match(visual, raw_bug) else ""
+            sub["content_role"] = str(shot.get("content_role") or "")
+            sub["program_identity"] = str(shot.get("program_identity") or "")
+            sub["program_mentions"] = shot.get("program_mentions") if isinstance(shot.get("program_mentions"), list) else []
+            shot_bug = str(shot.get("column_bug") or "").strip()
+            # 父 chunk 的角标不能无条件复制到每个视觉子段。旧 schema 没有逐帧 column_bug 时，
+            # 仅在逐帧描述明确写出角落/栏目角标时做兼容回填；菜单/节目列表中的同名不算角标。
+            corner_words = ("右下角", "右上角", "左下角", "左上角", "画面角落", "栏目角标")
+            legacy_local_bug = bool(
+                raw_bug and column_match(visual, raw_bug) and any(word in visual for word in corner_words)
+            )
+            sub["column_bug"] = shot_bug or (raw_bug if legacy_local_bug else "")
+            # frame_shots 只有视觉时间点，父段 ASR 通常跨越整个 chunk，不能复制为每个子段的
+            # 本地语音证据。父语音仅作为上下文保存，规则层不会用它证明栏目归属。
+            sub["speech_context"] = parent_speech
+            precise_asr = chunk.get("asr_segments") if isinstance(chunk.get("asr_segments"), list) else []
+            local_speech_parts = []
+            for asr_seg in precise_asr:
+                if not isinstance(asr_seg, dict):
+                    continue
+                asr_start = _num(asr_seg.get("start"), _num(asr_seg.get("start_seconds"), seg_start))
+                asr_end = _num(asr_seg.get("end"), _num(asr_seg.get("end_seconds"), asr_start))
+                if min(asr_end, seg_end) - max(asr_start, seg_start) > 0.001:
+                    text_value = str(asr_seg.get("text") or asr_seg.get("clean_text") or "").strip()
+                    if text_value:
+                        local_speech_parts.append(text_value)
+            sub["speech"] = " ".join(local_speech_parts)
+            sub["asr_text"] = sub["speech"]
+            sub["asr_digest"] = sub["speech"]
             expanded.append(sub)
     return expanded
 
@@ -253,7 +320,13 @@ def _should_split_visual_chunk(chunk: dict[str, Any], shots: list[dict[str, Any]
     ))
     if _hit(visual_text, NON_TARGET_PROMO_MARKERS + SPONSOR_CARD_KEYWORDS):
         return True
-    return any(term in visual_text for term in ("节目宣传", "宣传画面", "广告画面", "赞助宣传", "传播矩阵"))
+    if any(term in visual_text for term in ("节目宣传", "宣传画面", "广告画面", "赞助宣传", "传播矩阵")):
+        return True
+    roles = {str(shot.get("content_role") or "").strip().lower() for shot in shots if shot.get("content_role")}
+    identities = {str(shot.get("program_identity") or "").strip() for shot in shots if shot.get("program_identity")}
+    # 主持人→现场等普通新闻镜头变化不能触发拆分；旧 frame schema 没有逐帧 speech/bug，
+    # 把所有异质新闻镜头都拆开会丢掉语音归属。P0 只拆明确杂质或结构化角色/节目身份变化。
+    return len(roles) > 1 or len(identities) > 1
 
 
 def _normalized_frame_shots(chunk: dict[str, Any], start: float, end: float) -> list[dict[str, Any]]:
@@ -462,29 +535,57 @@ def _classify_segment(
     *,
     speech: str,
     screen_text: str,
+    visual_summary: str,
     bug: str,
     scene: str,
     footage_types: list[str],
+    content_role: str,
+    program_identity: str,
+    program_mentions: list[dict[str, Any]],
     has_speech: bool,
     target: str,
     known_columns: list[str],
     cfg: dict[str, Any],
-) -> tuple[str | None, str, str]:
-    """返回 (label, keep_state, reason)。keep_state ∈ keep/drop/undecided。
+) -> tuple[str | None, str, str, str]:
+    """返回 (label, keep_state, reason, decision_state)。
 
-    策略（保新闻为先）：杂质话术（赞助/冠名、预告、广告）只在“基本是纯杂质、没什么新闻”
-    时才删；和大段新闻混在一起就保留新闻。其他栏目（异角标）一律删。
+    目标栏目“归属证据”和“名称提及”严格分开：角标、独占片头标题、结构化
+    program_identity 可以证明归属；ASR、手机菜单、传播矩阵里的栏目名只能算提及。
+    当前画面的强杂质证据优先于任何栏目名提及。
     """
     speech_text = _t2s(speech)
-    visual_text = _t2s(f"{screen_text} {scene} {' '.join(footage_types or [])}".strip())
-    text = f"{speech_text} {visual_text}".strip()
+    # screen_text/frame visual 是画面表层事实；visual_summary 是模型语义说明，可能包含
+    # “ASR提及X但画面未出现”这类否定句，不能把摘要中的每个栏目名/预告词都当成OCR命中。
+    visual_surface_text = _t2s(f"{screen_text} {scene} {' '.join(footage_types or [])}".strip())
+    visual_semantic_text = _t2s(visual_summary)
+    visual_text = f"{visual_surface_text} {visual_semantic_text}".strip()
+    text = f"{speech_text} {visual_surface_text}".strip()
+    role = str(content_role or "").strip().lower()
+    identity = _t2s(str(program_identity or "").strip())
     is_pkg = (bool(scene) and any(p in scene for p in PACKAGING_SCENES)) or any(
         f in PACKAGING_FOOTAGE for f in (footage_types or [])
     )
 
     target_by_bug = bool(bug and target and column_match(bug, target))
-    target_in_visual = bool(target and column_match(visual_text, target))
+    target_in_visual = bool(target and column_match(visual_surface_text, target))
     target_in_speech = bool(target and column_match(speech_text, target))
+    target_by_identity = bool(identity and target and column_match(identity, target))
+
+    mention_roles = {
+        str(item.get("role") or "").strip().lower()
+        for item in (program_mentions or [])
+        if isinstance(item, dict) and target and column_match(str(item.get("name") or ""), target)
+    }
+    weak_mention_roles = {"menu_item", "list_item", "caption", "other", "spoken_reference"}
+    platform_kw = _hit(visual_text, PLATFORM_PROMO_KEYWORDS)
+    copyright_kw = _hit(visual_text, COPYRIGHT_SLATE_KEYWORDS)
+    weak_target_mention = bool(
+        target_in_visual
+        and (platform_kw or role in {"platform_promo", "channel_promo", "other_program_promo"}
+             or bool(mention_roles & weak_mention_roles))
+    )
+    # 视觉中的目标名只有在不是菜单/列表/平台宣传时才可作为节目自身标题；speech 命中永不单独保留。
+    target_visual_ownership = target_by_identity or (target_in_visual and not weak_target_mention)
 
     detected_other = ""
     visual_other = ""
@@ -494,7 +595,7 @@ def _classify_segment(
         for col in known_columns:
             if col == target:
                 continue
-            if column_match(visual_text, col):
+            if column_match(visual_surface_text, col):
                 visual_other = col
                 detected_other = col
                 break
@@ -504,74 +605,95 @@ def _classify_segment(
     mentions_other = bool(detected_other)
     # 《节目名》书名号：出现非目标栏目的《X》，是“在预告/提及别的节目”的强信号
     #（不依赖排期表是否收录该节目，凤凰全球连线/凤凰早班车等中文台节目也能识别）
-    visual_titles = [t for t in re.findall(r"《([^》]{2,15})》", visual_text) if not column_match(t, target)]
+    visual_titles = [t for t in re.findall(r"《([^》]{2,15})》", visual_surface_text) if not column_match(t, target)]
     speech_titles = [t for t in re.findall(r"《([^》]{2,15})》", speech_text) if not column_match(t, target)]
     bracket_titles = visual_titles + [t for t in speech_titles if t not in visual_titles]
     other_title = bracket_titles[0] if bracket_titles else ""
 
     promo_kw = _hit(text, PROMO_KEYWORDS + cfg.get("extra_promo_keywords", []))
-    visual_promo_kw = _hit(visual_text, PROMO_KEYWORDS + cfg.get("extra_promo_keywords", []))
-    visual_non_target_marker = _hit(visual_text, NON_TARGET_PROMO_MARKERS)
+    visual_promo_kw = _hit(visual_surface_text, PROMO_KEYWORDS + cfg.get("extra_promo_keywords", []))
+    visual_non_target_marker = _hit(visual_surface_text, NON_TARGET_PROMO_MARKERS)
     if visual_non_target_marker and target and column_match(visual_non_target_marker, target):
         visual_non_target_marker = None
-    visual_sponsor_card = _hit(visual_text, SPONSOR_CARD_KEYWORDS)
+    visual_sponsor_card = _hit(visual_surface_text, SPONSOR_CARD_KEYWORDS)
     sponsor_card = visual_sponsor_card or _hit(text, SPONSOR_CARD_KEYWORDS)
-    strong_visual_junk = bool(visual_other or visual_titles or visual_promo_kw or visual_non_target_marker or visual_sponsor_card)
+    strong_visual_junk = bool(
+        visual_other or visual_titles or visual_promo_kw or visual_non_target_marker
+        or visual_sponsor_card or platform_kw or copyright_kw or role in HARD_DROP_CONTENT_ROLES
+    )
 
-    detected_target = target_by_bug or target_in_visual or (target_in_speech and not strong_visual_junk)
+    detected_target = target_by_bug or target_visual_ownership
 
-    # 保新闻为先：这段除去杂质话术/节目名/套话后，还剩多少真正的新闻文字
-    residual = _residual_news_len(text, target, known_columns)
+    # “新闻量”只能来自当前段自己的 speech。视觉描述和父段 speech_context 不能冒充新闻正文。
+    residual = _residual_news_len(speech_text, target, known_columns)
     news_substantial = residual >= int(cfg.get("min_news_chars", 12) or 12)
 
-    # 1) 画面级强杂质：其他节目宣传/跨频道包装/赞助卡。优先级高于目标角标，
-    # 避免“最后一帧目标角标”把整段 CGTN/早班车/华润卡救回来。
-    if sponsor_card and (strong_visual_junk or not news_substantial):
-        return "sponsor", "drop", f"赞助/冠名卡：{sponsor_card[:16]}"
+    # 1) 结构化/画面级强杂质。优先级高于目标角标或名称提及。
+    if role in {"platform_promo", "channel_promo", "other_program_promo"} or platform_kw:
+        return "promo", "drop", f"频道/平台宣传：{platform_kw or role}", STATE_HARD_DROP
+    if role == "copyright_slate" or copyright_kw:
+        return "packaging_other", "drop", f"频道版权/台标卡：{copyright_kw or role}", STATE_HARD_DROP
+    if role in {"sponsor_card", "commercial_ad", "station_id"}:
+        label = "sponsor" if role == "sponsor_card" else ("ad" if role == "commercial_ad" else "station_id")
+        return label, "drop", f"画面内容角色：{role}", STATE_HARD_DROP
+    if sponsor_card and (visual_sponsor_card or not news_substantial):
+        return "sponsor", "drop", f"赞助/冠名卡：{sponsor_card[:16]}", STATE_HARD_DROP
 
     if strong_visual_junk and (visual_non_target_marker or visual_titles or visual_other or visual_promo_kw):
         reason_extra = f"《{visual_titles[0]}》" if visual_titles else (visual_other or visual_non_target_marker or visual_promo_kw)
-        return "promo", "drop", f"其他栏目/频道宣传：{reason_extra}".strip()
+        return "promo", "drop", f"其他栏目/频道宣传：{reason_extra}".strip(), STATE_HARD_DROP
 
-    # 1) 赞助/冠名：基本是纯赞助卡才删；夹着大段新闻（如开头“由华润赞助…斯塔默辞职…”）保留新闻
+    # 2) 语音赞助：当前 speech 内确有大量新闻时不直接删正文，但它也不能成为目标栏目证据。
     sponsor_m = _SPONSOR_RE.search(text)
     if sponsor_m and not news_substantial:
-        return "sponsor", "drop", f"赞助/冠名卡：{sponsor_m.group(0)[:16]}"
+        return "sponsor", "drop", f"赞助/冠名卡：{sponsor_m.group(0)[:16]}", STATE_HARD_DROP
 
-    # 2) 预告/宣传：命中预告话术，且（提到别的节目 / 非目标《节目名》/ 非目标正片），且基本无新闻实质 → 删
+    # 3) 预告/宣传。
     if promo_kw and (mentions_other or other_title or not detected_target) and (not news_substantial or not detected_target):
         reason_extra = f"《{other_title}》" if other_title else (f"其他栏目:{detected_other}" if mentions_other else "")
-        return "promo", "drop", f"预告/宣传卡：{promo_kw} {reason_extra}".strip()
+        return "promo", "drop", f"预告/宣传卡：{promo_kw} {reason_extra}".strip(), STATE_HARD_DROP
     if _hit(text, TRAILER_KEYWORDS) and not detected_target and not news_substantial:
-        return "trailer_other", "drop", "片尾结束语（非目标栏目）"
+        return "trailer_other", "drop", "片尾结束语（非目标栏目）", STATE_HARD_DROP
 
-    # 3) 商业广告：行动号召/购物话术，且基本无新闻实质 → 删（新闻里偶提“扫码/赞助”不误删）
+    # 4) 商业广告。
     ad_kw = _hit(text, AD_ACTION_KEYWORDS + cfg.get("extra_ad_keywords", []))
     if ad_kw and not news_substantial:
-        return "ad", "drop", f"广告卡：{ad_kw}"
+        return "ad", "drop", f"广告卡：{ad_kw}", STATE_HARD_DROP
     if _hit(text, SHOPPING_KEYWORDS) and not detected_target and not news_substantial:
-        return "ad", "drop", "保健品/夸大话术"
+        return "ad", "drop", "保健品/夸大话术", STATE_HARD_DROP
 
-    # 4) 目标栏目正片（角标或片头大标题命中目标）
+    # 5) 目标栏目强归属：本地角标 / program_identity / 非菜单式独占标题。
     if detected_target:
         if is_pkg:
-            return "target_intro_outro", "keep", "目标栏目片头/片尾"
-        return LABEL_TARGET, "keep", f"目标栏目角标/标题：{_t2s(bug) or target}"
+            return "target_intro_outro", "keep", "目标栏目片头/片尾（本地视觉归属）", STATE_STRONG_KEEP
+        return LABEL_TARGET, "keep", f"目标栏目角标/标题：{_t2s(bug) or target}", STATE_STRONG_KEEP
 
-    # 5) 其他栏目
+    # 6) 其他栏目。
     if mentions_other:
-        return "other_column", "drop", f"其他栏目：{detected_other}"
+        return "other_column", "drop", f"其他栏目：{detected_other}", STATE_HARD_DROP
 
-    # 6) 包装/台标卡（认不出目标名）
+    # 7) 片尾职员表没有栏目名时只作为边界候选，需由紧邻强目标段确认，不能自行保留。
+    credits_kw = _hit(visual_text, CREDITS_KEYWORDS)
+    if credits_kw:
+        return "target_intro_outro", "boundary_candidate", f"片尾职员表候选：{credits_kw}", STATE_BOUNDARY_CANDIDATE
+
+    # 8) 通用包装/台标卡，没有节目归属即删。target_in_speech 只记录为提及，不会救回。
     if is_pkg:
-        return "packaging_other", "drop", f"包装/台标镜头（非目标）：{scene or '/'.join(footage_types or [])}"
+        mention = "；语音仅提及目标栏目" if target_in_speech else ""
+        return "packaging_other", "drop", f"包装/台标镜头（无目标视觉归属）：{scene or '/'.join(footage_types or [])}{mention}", STATE_HARD_DROP
 
-    # 7) 静音卡/无实质（无角标且无语音）→ 多半是垫片/台标/包装
+    # 9) 静音卡/无实质。
     if not has_speech:
-        return "station_id", "drop", "无角标、无语音（疑似台标/垫片）"
+        event_types = {"主持人口播", "演播室", "记者连线", "人物讲话", "发布会", "现场画面", "资料画面", "图表地图", "其他B-roll"}
+        if scene in event_types or any(f in event_types for f in (footage_types or [])):
+            return None, "undecided", "无本地语音但画面像正片，待上下文确认", STATE_AMBIGUOUS
+        return "station_id", "drop", "无角标、无语音（疑似台标/垫片）", STATE_HARD_DROP
 
-    # 8) 无角标但有连续解说的“正片样”片段 → 交 LLM / bridge 兜底（倾向保留，避免精编误删）
-    return None, "undecided", "无角标、有解说，待判（疑似正片）"
+    # 10) 无角标但有本地连续解说：交 LLM / 有界 bridge。语音提到目标名仍只是辅助。
+    reason = "无目标视觉归属、有解说，待判"
+    if target_in_speech:
+        reason += "（语音提及目标栏目）"
+    return None, "undecided", reason, STATE_AMBIGUOUS
 
 
 def detect(
@@ -588,9 +710,10 @@ def detect(
     fc_cfg = fc_cfg or load_full_concat_cfg({})
     schedule = schedule or []
     vip_names = vip_names or DEFAULT_VIP_NAMES
-    chunks = _expand_visual_subsegments(chunks)
     known_columns = schedule_columns(schedule)
 
+    # 目标栏目先按父 chunk 的持续角标解析；视觉拆分会把 chunk 角标收窄到本地帧，
+    # 若先拆再投票会因子段数/角标清空而改变目标栏目。
     target, target_source = resolve_target_column(
         chunks=chunks,
         schedule=schedule,
@@ -598,6 +721,8 @@ def detect(
         override=override_column,
         mode=fc_cfg.get("target_column_mode", "auto"),
     )
+    input_chunk_count = len(chunks)
+    chunks = _expand_visual_subsegments(chunks)
 
     segments: list[dict[str, Any]] = []
     ambiguous: list[dict[str, Any]] = []
@@ -608,14 +733,20 @@ def detect(
         if end <= start:
             continue
         speech = _speech(chunk)
+        speech_context = _speech_context(chunk)
         screen_text = _screen_text(chunk)
+        visual_summary = _visual_summary(chunk)
         bug = _column_bug(chunk)
         scene = _scene(chunk)
         footage_types = chunk.get("footage_types") or []
+        content_role = _content_role(chunk)
+        program_identity = str(chunk.get("program_identity") or "").strip()
+        program_mentions = chunk.get("program_mentions") if isinstance(chunk.get("program_mentions"), list) else []
         segment_id = str(chunk.get("segment_id") or chunk.get("chunk_id") or f"{source_id}_seg_{index:04d}")
-        label, keep_state, reason = _classify_segment(
-            speech=speech, screen_text=screen_text, bug=bug, scene=scene,
-            footage_types=footage_types, has_speech=bool(speech.strip()),
+        label, keep_state, reason, decision_state = _classify_segment(
+            speech=speech, screen_text=screen_text, visual_summary=visual_summary, bug=bug, scene=scene,
+            footage_types=footage_types, content_role=content_role, program_identity=program_identity,
+            program_mentions=program_mentions, has_speech=bool(speech.strip()),
             target=target, known_columns=known_columns, cfg=cfg,
         )
         rec: dict[str, Any] = {
@@ -626,13 +757,20 @@ def detect(
             "end_seconds": end,
             "duration_seconds": round(end - start, 3),
             "speech": speech[:200],
+            "speech_context": speech_context[:200],
+            "target_mention": bool(target and (column_match(speech, target) or column_match(speech_context, target))),
             "screen_text": screen_text[:200],
+            "visual_summary": visual_summary[:400],
             "column_bug": bug,
             "scene": scene,
+            "content_role": content_role,
+            "program_identity": program_identity,
+            "parent_segment_id": chunk.get("parent_segment_id", ""),
             "label": label or "unknown",
             "keep_state": keep_state,
+            "decision_state": decision_state,
             "reason": reason,
-            "decided_by": "rule" if label is not None else "pending",
+            "decided_by": "rule" if decision_state in {STATE_HARD_DROP, STATE_STRONG_KEEP} else "pending",
         }
         segments.append(rec)
         if keep_state == "undecided":
@@ -648,7 +786,9 @@ def detect(
                     {
                         "segment_id": r["segment_id"],
                         "speech": r["speech"],
+                        "speech_context": r.get("speech_context", ""),
                         "screen_text": r["screen_text"],
+                        "visual_summary": r.get("visual_summary", ""),
                         "column_bug": r["column_bug"],
                         "scene": r["scene"],
                     }
@@ -681,10 +821,16 @@ def detect(
                     rec["label"], rec["keep_state"] = "promo", "drop"
                 # 其它/无效返回：保持 undecided 交给 bridge
 
+    _resolve_boundary_candidates(segments, fc_cfg)
     _resolve_keep(segments, fc_cfg)
     vip = detect_vip(segments, vip_names)
     blocks = _merge_drop_blocks(segments)
     stats = _build_stats(segments, blocks, llm_used=llm_used, target=target)
+    stats.update({
+        "input_chunk_count": input_chunk_count,
+        "expanded_segment_count": len(segments),
+        "split_parent_count": len({r.get("parent_segment_id") for r in segments if r.get("parent_segment_id")}),
+    })
     return {
         "segments": segments,
         "blocks": blocks,
@@ -695,15 +841,67 @@ def detect(
     }
 
 
-def _resolve_keep(segments: list[dict[str, Any]], fc_cfg: dict[str, Any]) -> None:
-    """先按 keep_state 定 keep；再让目标栏目段“向两侧生长”，把紧邻的、像正片的无角标段纳入。
+def _resolve_boundary_candidates(segments: list[dict[str, Any]], fc_cfg: dict[str, Any]) -> None:
+    """用紧邻的强目标段确认无栏目名的片头/职员表候选。
 
-    与旧版“必须前后两侧都有目标”不同：这里从目标段沿相邻的 undecided 段向前/向后蔓延，
-    一直到碰见杂质(drop)段为止。这样开头第一句、结尾最后一句（角标还没出现/已撤）也能保住，
-    而插播的广告/赞助/片头(都是 drop)会成为边界挡住蔓延、不会被带进来。
+    generic packaging / sponsor / platform promo 已在本地分类阶段 hard-drop，不会进入这里。
+    候选链必须同源、连续、总时长有上限，避免“片尾”标签向频道包装无限延伸。
+    """
+    max_total = float(fc_cfg.get("boundary_candidate_max_seconds", 30.0) or 0.0)
+    max_gap = min(float(fc_cfg.get("bridge_max_gap_seconds", 1.0) or 0.0), 1.0)
+    by_source: dict[str, list[dict[str, Any]]] = {}
+    for rec in segments:
+        by_source.setdefault(str(rec["source_id"]), []).append(rec)
+    for recs in by_source.values():
+        recs.sort(key=lambda r: float(r["start_seconds"]))
+        i = 0
+        while i < len(recs):
+            if recs[i].get("keep_state") != "boundary_candidate":
+                i += 1
+                continue
+            j = i + 1
+            while j < len(recs) and recs[j].get("keep_state") == "boundary_candidate":
+                if float(recs[j]["start_seconds"]) - float(recs[j - 1]["end_seconds"]) > max_gap:
+                    break
+                j += 1
+            chain = recs[i:j]
+            total = sum(float(r.get("duration_seconds", 0)) for r in chain)
+            left = recs[i - 1] if i > 0 else None
+            right = recs[j] if j < len(recs) else None
+            left_anchor = bool(
+                left and left.get("decision_state") == STATE_STRONG_KEEP
+                and float(chain[0]["start_seconds"]) - float(left["end_seconds"]) <= max_gap
+            )
+            right_anchor = bool(
+                right and right.get("decision_state") == STATE_STRONG_KEEP
+                and float(right["start_seconds"]) - float(chain[-1]["end_seconds"]) <= max_gap
+            )
+            keep_chain = bool((left_anchor or right_anchor) and total <= max_total)
+            for rec in chain:
+                if keep_chain:
+                    rec["keep_state"] = "keep"
+                    rec["decision_state"] = STATE_STRONG_KEEP
+                    rec["decided_by"] = "context_rule"
+                    rec["reason"] = f"{rec.get('reason', '')}; 紧邻目标栏目强归属段，确认为目标片头/片尾".strip("; ")
+                else:
+                    rec["keep_state"] = "drop"
+                    rec["decision_state"] = STATE_HARD_DROP
+                    rec["label"] = "packaging_other"
+                    rec["decided_by"] = "context_rule"
+                    rec["reason"] = f"{rec.get('reason', '')}; 缺少相邻目标归属或候选链过长".strip("; ")
+            i = j
+
+
+def _resolve_keep(segments: list[dict[str, Any]], fc_cfg: dict[str, Any]) -> None:
+    """解析有界 bridge。
+
+    undecided 只按“整条候选链”处理：双侧目标 anchor 的内部链可保留；素材边缘允许
+    一侧 anchor，但有独立的总时长上限。hard-drop、source boundary、时间断裂都会阻断。
     """
     bridge = bool(fc_cfg.get("bridge_keep_within_run", True))
     max_gap = float(fc_cfg.get("bridge_max_gap_seconds", 90.0) or 0.0)
+    max_total = float(fc_cfg.get("bridge_max_total_seconds", 30.0) or 0.0)
+    edge_max = float(fc_cfg.get("bridge_edge_max_seconds", 30.0) or 0.0)
     for rec in segments:
         if rec["keep_state"] == "keep":
             rec["keep"] = True
@@ -724,28 +922,50 @@ def _resolve_keep(segments: list[dict[str, Any]], fc_cfg: dict[str, Any]) -> Non
         by_source.setdefault(str(rec["source_id"]), []).append(rec)
     for recs in by_source.values():
         recs.sort(key=lambda r: float(r["start_seconds"]))
-        n = len(recs)
-        # 迭代蔓延：undecided 段若与一个“已保留”相邻（间隔 <= max_gap）则纳入；
-        # drop 段 keep=False 不会蔓延，自然成为边界。直到不再变化。
-        changed = True
-        while changed:
-            changed = False
-            for i, rec in enumerate(recs):
-                if rec.get("keep") is not None:
-                    continue
-                left = recs[i - 1] if i > 0 else None
-                right = recs[i + 1] if i < n - 1 else None
-                attach_left = bool(left and left.get("keep") is True and float(rec["start_seconds"]) - float(left["end_seconds"]) <= max_gap)
-                attach_right = bool(right and right.get("keep") is True and float(right["start_seconds"]) - float(rec["end_seconds"]) <= max_gap)
-                if attach_left or attach_right:
+        i = 0
+        while i < len(recs):
+            if recs[i].get("keep") is not None:
+                i += 1
+                continue
+            j = i + 1
+            while j < len(recs) and recs[j].get("keep") is None:
+                if float(recs[j]["start_seconds"]) - float(recs[j - 1]["end_seconds"]) > max_gap:
+                    break
+                j += 1
+            chain = recs[i:j]
+            total = sum(float(r.get("duration_seconds", 0)) for r in chain)
+            left = recs[i - 1] if i > 0 else None
+            right = recs[j] if j < len(recs) else None
+            attach_left = bool(
+                left and left.get("keep") is True
+                and float(chain[0]["start_seconds"]) - float(left["end_seconds"]) <= max_gap
+            )
+            attach_right = bool(
+                right and right.get("keep") is True
+                and float(right["start_seconds"]) - float(chain[-1]["end_seconds"]) <= max_gap
+            )
+            interior = attach_left and attach_right and total <= max_total
+            at_source_edge = i == 0 or j == len(recs)
+            edge_extension = at_source_edge and (attach_left or attach_right) and total <= edge_max
+            # 赞助卡/包装刚结束后，目标角标可能晚几秒出现。允许“整链都有目标语音提示”的
+            # 正片样画面向单侧强 anchor 收口，但目标名提及本身仍不能在无 anchor 时直接 keep。
+            contextual_one_sided = bool(
+                (attach_left ^ attach_right)
+                and total <= edge_max
+                and all(bool(r.get("target_mention")) for r in chain)
+            )
+            keep_chain = bool(interior or edge_extension or contextual_one_sided)
+            for rec in chain:
+                if keep_chain:
                     rec["keep"] = True
                     rec["label"] = "bridge"
-                    rec["reason"] = f"{rec.get('reason', '')}; 紧邻目标栏目正片，保留连续".strip("; ")
-                    changed = True
-        for rec in recs:
-            if rec.get("keep") is None:
-                rec["keep"] = False
-                rec["label"] = "unknown_drop"
+                    rec["reason"] = f"{rec.get('reason', '')}; 有界连续段（总长{total:.1f}s）紧邻目标栏目".strip("; ")
+                else:
+                    rec["keep"] = False
+                    rec["label"] = "unknown_drop"
+                    if total > (edge_max if at_source_edge else max_total):
+                        rec["reason"] = f"{rec.get('reason', '')}; bridge候选链过长({total:.1f}s)".strip("; ")
+            i = j
 
 
 def detect_vip(segments: list[dict[str, Any]], vip_names: list[str]) -> dict[str, Any]:
@@ -870,18 +1090,23 @@ def build_plan(
     for source_id in sorted(by_source, key=lambda s: (order_index.get(s, 10**9), s)):
         recs = sorted(by_source[source_id], key=lambda r: float(r["start_seconds"]))
         source_index = next((r.get("source_index") for r in recs if r.get("source_index") not in (None, "")), None)
+        drops = dropped_by_source.get(source_id, [])
         merged: list[list[float]] = []
         reasons: list[list[str]] = []
         for r in recs:
             s, e = float(r["start_seconds"]), float(r["end_seconds"])
-            if merged and s - merged[-1][1] <= merge_gap:
+            gap_start = merged[-1][1] if merged else s
+            explicit_drop_in_gap = any(
+                d_start < s - 1e-6 and d_end > gap_start + 1e-6
+                for d_start, d_end in drops
+            )
+            if merged and s - merged[-1][1] <= merge_gap and not explicit_drop_in_gap:
                 merged[-1][1] = max(merged[-1][1], e)
                 reasons[-1].append(str(r.get("segment_id")))
             else:
                 merged.append([s, e])
                 reasons.append([str(r.get("segment_id"))])
 
-        drops = dropped_by_source.get(source_id, [])
         for (s, e), seg_ids in zip(merged, reasons):
             s, e = _apply_safety_margin(s, e, drops, margin)
             duration = round(e - s, 3)

@@ -263,7 +263,8 @@ def test_delete_task_removes_directory_and_job_records(tmp_path, monkeypatch) ->
     assert not task_dir.exists()
     assert web_app.JOBS == {}
     assert list(web_app.PENDING_JOB_IDS) == []
-    assert deleted_jobs == ["task_done"]
+    # 新格式按 job_id 持久化，同时清理旧版本按 task_id 命名的兼容文件。
+    assert deleted_jobs == ["job_001", "task_done"]
 
 
 def test_refresh_job_marks_orphaned_running_job_failed(tmp_path, monkeypatch) -> None:

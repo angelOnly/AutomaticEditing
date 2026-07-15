@@ -78,8 +78,11 @@ const FULL_CONCAT_STEPS = [
   "timeline",
   "timeline_digest",
   "ad_detection",
+  "full_concat_boundary_refine",
   "full_concat_plan",
+  "full_concat_plan_qc",
   "full_concat_render",
+  "full_concat_output_qc",
 ];
 
 const UNIFIED_FULL_CONCAT_STEPS = [
@@ -87,8 +90,11 @@ const UNIFIED_FULL_CONCAT_STEPS = [
   "source_analysis",
   "source_aggregate",
   "ad_detection",
+  "full_concat_boundary_refine",
   "full_concat_plan",
+  "full_concat_plan_qc",
   "full_concat_render",
+  "full_concat_output_qc",
 ];
 
 let STEPS = AI_VOICEOVER_STEPS;
@@ -130,6 +136,9 @@ const STEP_LABELS = {
   ad_detection: "识别并标记广告",
   full_concat_plan: "生成完整版剪辑计划",
   full_concat_render: "渲染完整版成片",
+  full_concat_boundary_refine: "完整版边界精修",
+  full_concat_plan_qc: "完整版计划语义检查",
+  full_concat_output_qc: "完整版成片语义检查",
 };
 
 const STATUS_LABELS = {
@@ -520,6 +529,10 @@ function bindEvents() {
   $("confirmLongVideo").addEventListener("click", confirmLongVideo);
   $("generateCommentary")?.addEventListener("click", () => openCommentary());
   $("showAdReport")?.addEventListener("click", () => openAdReport());
+  $("openManualEditor")?.addEventListener("click", () => {
+    if (!state.selectedTask) return;
+    window.location.href = `/editor?task_id=${encodeURIComponent(state.selectedTask)}`;
+  });
   $("editVipPersons")?.addEventListener("click", () => openVipEditor());
   $("commentaryRegen")?.addEventListener("click", () => openCommentary({ refresh: true }));
   $("commentaryCopy")?.addEventListener("click", copyCommentaryMarkdown);
@@ -1662,11 +1675,13 @@ const AD_LABEL_CN = {
 
 function syncAdReportButton() {
   const btn = $("showAdReport");
-  if (!btn) return;
+  const editorBtn = $("openManualEditor");
+  if (!btn && !editorBtn) return;
   const isFullConcat = currentTaskMode() === "full_concat";
   const hasDraft = Array.isArray(state.drafts) && state.drafts.length > 0;
   const show = isFullConcat && hasDraft && state.selectedTask;
-  btn.classList.toggle("hidden", !show);
+  btn?.classList.toggle("hidden", !show);
+  editorBtn?.classList.toggle("hidden", !show);
   if (show) refreshAdReportBadge();
   else setVipBadge(null);
 }

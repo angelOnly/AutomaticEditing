@@ -123,16 +123,22 @@ WORKFLOWS: dict[tuple[str, bool], list[str]] = {
         "timeline",
         "timeline_digest",
         "ad_detection",
+        "full_concat_boundary_refine",
         "full_concat_plan",
+        "full_concat_plan_qc",
         "full_concat_render",
+        "full_concat_output_qc",
     ],
     ("full_concat", True): [
         "source_prepare",
         "source_analysis",
         "source_aggregate",
         "ad_detection",
+        "full_concat_boundary_refine",
         "full_concat_plan",
+        "full_concat_plan_qc",
         "full_concat_render",
+        "full_concat_output_qc",
     ],
 }
 
@@ -177,8 +183,11 @@ DEPENDENCIES: dict[str, list[str]] = {
     "reassembly_commentary": ["reassembly_render"],
 
     "ad_detection": ["timeline_digest", "source_aggregate"],
-    "full_concat_plan": ["ad_detection"],
-    "full_concat_render": ["full_concat_plan"],
+    "full_concat_boundary_refine": ["ad_detection"],
+    "full_concat_plan": ["full_concat_boundary_refine"],
+    "full_concat_plan_qc": ["full_concat_plan", "full_concat_boundary_refine"],
+    "full_concat_render": ["full_concat_plan", "full_concat_plan_qc"],
+    "full_concat_output_qc": ["full_concat_render", "full_concat_plan"],
 }
 
 

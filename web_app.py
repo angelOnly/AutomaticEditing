@@ -21,6 +21,7 @@ from urllib.parse import quote
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
+from PIL import Image
 from pydantic import BaseModel, Field
 
 from newsclip_agent.config import load_config
@@ -33,11 +34,30 @@ from newsclip_agent.remote_ucms import (
     remote_cache_path,
     public_config as remote_ucms_public_config,
 )
-from newsclip_agent.utils import ensure_dir, read_json, relpath, seconds_to_timecode, write_json
+from newsclip_agent.utils import ensure_dir, ffprobe_json, read_json, relpath, seconds_to_timecode, write_json
+from newsclip_agent.common_cache import build_common_analysis_profile, build_common_source_key
 from newsclip_agent.tts_omnivoice import generate_omnivoice_audio
 from newsclip_agent.job_store import JobStore
 from newsclip_agent import commentary
 from newsclip_agent import ad_detection
+from newsclip_agent.cover_service import (
+    CoverService,
+    CoverServiceError,
+    compose_cover,
+    public_provider_config,
+    validate_font_file,
+)
+from newsclip_agent.manual_editor import (
+    ManualEditorError,
+    ProjectConflictError,
+    ProjectValidationError,
+    add_asset,
+    apply_frontend_project,
+    initialize_project,
+    load_project,
+    save_project_revision,
+    to_frontend_project,
+)
 
 
 ROOT = Path(__file__).resolve().parent
@@ -47,12 +67,14 @@ VIDEOS_DIR = ROOT / "videos"
 STATIC_DIR = ROOT / "web_static"
 RUNNER = ROOT / "run_pipeline.py"
 MULTI_SOURCE_RUNNER = ROOT / "run_multisource_pipeline.py"
+MANUAL_EDITOR_RUNNER = ROOT / "run_manual_editor.py"
 
 app = FastAPI(title="凤凰新闻视频智能拆条工作台")
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 JOBS: dict[str, dict[str, Any]] = {}
 JOB_LOCK = RLock()
+EDITOR_PROJECT_LOCK = RLock()
 PENDING_JOB_IDS: deque[str] = deque()
 JOB_STORE = JobStore(OUTPUTS_DIR / ".jobs")
 for job_id, job in JOB_STORE.load_jobs().items():
@@ -60,6 +82,12 @@ for job_id, job in JOB_STORE.load_jobs().items():
     if job.get("status") == "pending":
         PENDING_JOB_IDS.append(job_id)
 PROJECT_CONFIG = load_config(ROOT / "config.toml")
+COVER_SERVICE = CoverService(PROJECT_CONFIG)
+COVER_CONFIG = COVER_SERVICE.config
+COVER_DEFAULT_ASPECT_RATIO = COVER_CONFIG.allowed_ratios[0]
+COVER_DEFAULT_SIZE = COVER_CONFIG.allowed_sizes[0]
+COVER_DEFAULT_RESTORE_SIZE = COVER_CONFIG.allowed_sizes[-1]
+COVER_DEFAULT_SAFE_AREA = COVER_CONFIG.allowed_safe_areas[0]
 WORKFLOW_DEFAULTS = PROJECT_CONFIG.workflow
 SHORT_VIDEO_DEFAULTS = PROJECT_CONFIG.short_video
 VOICEOVER_DEFAULTS = PROJECT_CONFIG.voiceover
@@ -245,6 +273,14 @@ class RunRequest(BaseModel):
 def index() -> HTMLResponse:
     return HTMLResponse(
         (STATIC_DIR / "index.html").read_text(encoding="utf-8"),
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.get("/editor", response_class=HTMLResponse)
+def editor_page() -> HTMLResponse:
+    return HTMLResponse(
+        (STATIC_DIR / "editor.html").read_text(encoding="utf-8"),
         headers={"Cache-Control": "no-store"},
     )
 
@@ -883,6 +919,8 @@ def delete_task(task_id: str) -> dict[str, Any]:
                 PENDING_JOB_IDS.remove(job_id)
             except ValueError:
                 pass
+            JOB_STORE.delete_job(job_id)
+        # 兼容旧版本按 task_id 持久化的单文件。
         JOB_STORE.delete_job(task_id)
     try:
         _rmtree_task_dir(task_dir)
@@ -990,7 +1028,7 @@ def get_task_file(task_id: str, path: str):
         return JSONResponse(read_json(file_path, {}))
     if suffix in {".txt", ".srt", ".log", ".md"}:
         return PlainTextResponse(file_path.read_text(encoding="utf-8", errors="replace"))
-    if suffix in {".mp4", ".mov", ".mkv", ".wav", ".mp3", ".jpg", ".jpeg", ".png"}:
+    if suffix in {".mp4", ".mov", ".mkv", ".wav", ".mp3", ".jpg", ".jpeg", ".png", ".webp", ".ttf", ".otf"}:
         return FileResponse(str(file_path))
     return PlainTextResponse(file_path.read_text(encoding="utf-8", errors="replace"))
 
@@ -1095,7 +1133,8 @@ def list_draft_videos(task_id: str) -> list[dict[str, Any]]:
             "url": _task_file_url(task_id, task_dir, path),
             "name": path.name,
             "type": (
-                "full_concat_draft" if "full_concat_drafts" in path.parts
+                "manual_editor_export" if "manual_editor" in path.parts and "exports" in path.parts
+                else "full_concat_draft" if "full_concat_drafts" in path.parts
                 else "highlight_reassembly_draft" if "reassembly_drafts" in path.parts
                 else "ai_voiceover_draft"
             ),
@@ -1187,7 +1226,12 @@ def get_task_ad_report(task_id: str) -> dict[str, Any]:
             "file": file_rel,
             "url": url,
             "quality_check": item.get("quality_check", {}),
+            "publishable": bool(data.get("publishable", item.get("publishable", False))),
+            "quarantined": bool(data.get("quarantined", item.get("quarantined", False))),
         })
+
+    qc_step = (steps.get("full_concat_output_qc", {}) or {})
+    qc_doc = read_json(task_dir / qc_step.get("output", ""), {}) if qc_step.get("output") else {}
 
     return {
         "task_id": task_id,
@@ -1198,7 +1242,17 @@ def get_task_ad_report(task_id: str) -> dict[str, Any]:
         "stats": data.get("ad_stats", {}),
         "removed_blocks": data.get("removed_blocks", []),
         "videos": videos,
+        "boundary_refinement": _manifest_step_json(task_dir, steps, "full_concat_boundary_refine"),
+        "plan_qc": _manifest_step_json(task_dir, steps, "full_concat_plan_qc"),
+        "output_qc": qc_doc,
+        "publishable": bool(qc_doc.get("publishable", data.get("publishable", False))),
+        "quarantined": bool(qc_doc.get("quarantined", data.get("quarantined", False))),
     }
+
+
+def _manifest_step_json(task_dir: Path, steps: dict[str, Any], step: str) -> dict[str, Any]:
+    output = (steps.get(step, {}) or {}).get("output")
+    return read_json(task_dir / output, {}) if output else {}
 
 
 def _vip_store_path() -> Path:
@@ -1234,6 +1288,846 @@ def put_vip_persons(req: VipPersonsRequest) -> dict[str, Any]:
             names.append(name)
     write_json(_vip_store_path(), {"names": names, "updated_at": datetime.now().isoformat(timespec="seconds")})
     return {"names": names, "store_file": relpath(_vip_store_path(), ROOT)}
+
+
+class CoverPromptRequest(BaseModel):
+    title: str
+    summary: str = ""
+    requirements: str = ""
+    aspect_ratio: str = COVER_DEFAULT_ASPECT_RATIO
+    size: str = COVER_DEFAULT_SIZE
+    safe_area: str = COVER_DEFAULT_SAFE_AREA
+
+
+class CoverGenerateRequest(BaseModel):
+    prompt_doc: dict[str, Any]
+    max_images: int = 1
+    watermark: bool = False
+    reference_file: str | None = None
+    edit_instruction: str = ""
+
+
+class CoverComposeRequest(BaseModel):
+    source_file: str
+    width: int = 1920
+    height: int = 1080
+    crop: dict[str, Any] = Field(default_factory=dict)
+    text_layers: list[dict[str, Any]] = Field(default_factory=list)
+    enhance: str = "standard"
+    output_format: str = "png"
+
+
+class CoverRestoreRequest(BaseModel):
+    source_file: str
+    requirements: str = ""
+    size: str = COVER_DEFAULT_RESTORE_SIZE
+
+
+class RemoteEditorAssetRequest(BaseModel):
+    remote_video: dict[str, Any]
+    force_remote_download: bool = False
+
+
+def _full_concat_editor_task(task_id: str) -> tuple[Path, dict[str, Any]]:
+    task_dir = _task_dir(task_id)
+    manifest = read_json(task_dir / "manifest.json", {})
+    mode = (
+        manifest.get("production_mode")
+        or _task_id_production_mode(task_id)
+        or _manifest_production_mode(manifest)
+    )
+    if mode != "full_concat":
+        raise HTTPException(400, "当前仅支持编辑完整版任务")
+    return task_dir, manifest
+
+
+def _manual_editor_root(task_dir: Path) -> Path:
+    return task_dir / "edit" / "manual_editor"
+
+
+def _full_concat_plan_path(task_dir: Path, manifest: dict[str, Any]) -> Path:
+    candidates: list[Path] = []
+    step = (manifest.get("steps") or {}).get("full_concat_plan") or {}
+    for value in [step.get("output"), *(step.get("output_files") or [])]:
+        if not value:
+            continue
+        try:
+            candidate = _safe_child(task_dir, str(value))
+        except HTTPException:
+            continue
+        if candidate.name == "full_concat_cut_plan.json":
+            candidates.append(candidate)
+
+    version = str((manifest.get("current_versions") or {}).get("full_concat_plan") or "").strip()
+    if version:
+        candidates.append(task_dir / "edit" / "full_concat_cut_plan" / version / "full_concat_cut_plan.json")
+    candidates.extend((task_dir / "edit" / "full_concat_cut_plan").glob("v*/full_concat_cut_plan.json"))
+    existing = [path.resolve() for path in candidates if path.is_file()]
+    if not existing:
+        raise HTTPException(409, "完整版剪辑计划尚未生成，暂时不能进入精剪")
+    return max(existing, key=lambda path: path.stat().st_mtime_ns)
+
+
+def _fill_editor_asset_durations(project: dict[str, Any]) -> bool:
+    changed = False
+    for asset in project.get("assets") or []:
+        try:
+            current_duration = float(asset.get("duration_seconds") or 0)
+        except (TypeError, ValueError):
+            current_duration = 0.0
+        if current_duration > 0:
+            continue
+        path = Path(str(asset.get("path") or "")).expanduser().resolve()
+        if not path.is_file():
+            raise ManualEditorError(f"素材文件不存在：{asset.get('display_name') or asset.get('asset_id')}")
+        try:
+            duration = float(ffprobe_json(path).get("duration_seconds") or 0)
+        except Exception as exc:  # noqa: BLE001 - normalize ffprobe failures for the editor boundary
+            raise ManualEditorError(f"无法读取素材时长：{path.name}（{exc}）") from exc
+        if duration <= 0:
+            raise ManualEditorError(f"素材没有有效视频时长：{path.name}")
+        asset["duration_seconds"] = round(duration, 6)
+        changed = True
+    return changed
+
+
+def _load_or_initialize_editor_project(task_dir: Path, manifest: dict[str, Any]) -> dict[str, Any]:
+    editor_root = _manual_editor_root(task_dir)
+    project_path = editor_root / "project.json"
+    with EDITOR_PROJECT_LOCK:
+        if project_path.is_file():
+            project = load_project(project_path)
+            if _fill_editor_asset_durations(project):
+                project["revision"] = int(project.get("revision", 0)) + 1
+                project["updated_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+                save_project_revision(project, editor_root)
+            return project
+
+        plan_path = _full_concat_plan_path(task_dir, manifest)
+        plan = read_json(plan_path, {})
+        videos = plan.get("output_videos") or []
+        reassembly_id = ""
+        if len(videos) > 1 and isinstance(videos[0], dict):
+            reassembly_id = str(videos[0].get("reassembly_id") or "")
+        project = initialize_project(
+            plan_path,
+            reassembly_id=reassembly_id or None,
+            task_root=task_dir,
+        )
+        _fill_editor_asset_durations(project)
+        save_project_revision(project, editor_root)
+        return project
+
+
+def _editor_asset_url(task_id: str, asset_id: str) -> str:
+    return (
+        f"/api/editor/tasks/{quote(task_id, safe='')}/assets/"
+        f"{quote(asset_id, safe='')}/preview"
+    )
+
+
+def _editor_public_project(task_id: str, project: dict[str, Any]) -> dict[str, Any]:
+    urls = {
+        str(asset.get("asset_id")): _editor_asset_url(task_id, str(asset.get("asset_id")))
+        for asset in project.get("assets") or []
+        if asset.get("asset_id")
+    }
+    return to_frontend_project(project, asset_urls=urls)
+
+
+def _remote_editor_identity_values(document: Any) -> set[str]:
+    """Collect stable UCMS identifiers without retaining signed media URLs."""
+
+    if not isinstance(document, dict):
+        return set()
+    values: set[str] = set()
+    for key in ("remote_id", "id", "guid"):
+        value = document.get(key)
+        if value not in (None, ""):
+            values.add(str(value).strip())
+    for key in ("raw", "remote_video"):
+        nested = document.get(key)
+        if isinstance(nested, dict):
+            values.update(_remote_editor_identity_values(nested))
+    return {value for value in values if value}
+
+
+def _remote_editor_value(document: Any, keys: tuple[str, ...]) -> str:
+    if not isinstance(document, dict):
+        return ""
+    for key in keys:
+        value = document.get(key)
+        if value not in (None, ""):
+            return str(value).strip()
+    for key in ("raw", "remote_video"):
+        value = _remote_editor_value(document.get(key), keys)
+        if value:
+            return value
+    return ""
+
+
+def _remote_editor_stable_key(remote_video: dict[str, Any], cache_path: Path) -> str:
+    station = _remote_editor_value(remote_video, ("record_station", "recordStation"))
+    identifier_type = "cache"
+    identifier = ""
+    for key in ("guid", "remote_id", "id"):
+        identifier = _remote_editor_value(remote_video, (key,))
+        if identifier:
+            identifier_type = key
+            break
+    if not identifier:
+        identifier = str(cache_path.expanduser().resolve()).casefold()
+    digest = hashlib.sha256(
+        f"{station.casefold()}|{identifier_type}|{identifier}".encode("utf-8")
+    ).hexdigest()[:24]
+    return f"ucms_{digest}"
+
+
+def _find_remote_editor_asset(
+    project: dict[str, Any],
+    remote_video: dict[str, Any],
+    *,
+    cache_path: Path | None = None,
+) -> dict[str, Any] | None:
+    identities = _remote_editor_identity_values(remote_video)
+    expected_path = cache_path.expanduser().resolve() if cache_path else None
+    remote_key = _remote_editor_stable_key(remote_video, expected_path) if expected_path else ""
+    incoming_station = _remote_editor_value(remote_video, ("record_station", "recordStation"))
+    for asset in project.get("assets") or []:
+        asset_path_text = str(asset.get("path") or "").strip()
+        if expected_path and asset_path_text:
+            try:
+                if Path(asset_path_text).expanduser().resolve() == expected_path:
+                    return asset
+            except OSError:
+                pass
+        if str(asset.get("source_type") or "") != "remote_ucms":
+            continue
+        if remote_key and str(asset.get("remote_key") or "") == remote_key:
+            return asset
+        asset_identities = _remote_editor_identity_values(asset)
+        asset_identities.update(
+            _remote_editor_identity_values((asset.get("metadata") or {}).get("remote_ucms"))
+        )
+        asset_station = _remote_editor_value(asset, ("record_station", "recordStation"))
+        if (
+            identities
+            and identities.intersection(asset_identities)
+            and (not incoming_station or not asset_station or incoming_station == asset_station)
+        ):
+            return asset
+    return None
+
+
+def _remote_editor_public_metadata(
+    remote_video: dict[str, Any],
+    download_result: dict[str, Any],
+) -> dict[str, Any]:
+    download_metadata = download_result.get("metadata") or {}
+    normalized = download_metadata.get("remote_video") if isinstance(download_metadata, dict) else None
+    source = normalized if isinstance(normalized, dict) else remote_video
+    return {
+        key: source.get(key)
+        for key in (
+            "remote_id",
+            "id",
+            "guid",
+            "name",
+            "display_name",
+            "duration",
+            "duration_text",
+            "create_time",
+            "record_station",
+            "tv_station",
+            "mime_type",
+            "aspect",
+        )
+        if source.get(key) not in (None, "")
+    }
+
+
+def _first_editor_text(document: Any, keys: tuple[str, ...]) -> str:
+    if not isinstance(document, dict):
+        return ""
+    for key in keys:
+        value = document.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    for key in ("result", "content", "analysis", "news", "overview"):
+        nested = document.get(key)
+        if isinstance(nested, dict):
+            value = _first_editor_text(nested, keys)
+            if value:
+                return value
+    return ""
+
+
+def _editor_task_copy(task_dir: Path, manifest: dict[str, Any]) -> tuple[str, str, str]:
+    plan = read_json(_full_concat_plan_path(task_dir, manifest), {})
+    title = _first_editor_text(plan, ("title", "news_title", "topic", "target_column"))
+    summary = _first_editor_text(plan, ("summary", "content_summary", "abstract"))
+
+    step = (manifest.get("steps") or {}).get("video_understanding") or {}
+    output = step.get("output")
+    if output:
+        try:
+            understanding = read_json(_safe_child(task_dir, str(output)), {})
+        except HTTPException:
+            understanding = {}
+        title = title or _first_editor_text(
+            understanding,
+            ("title", "news_title", "topic", "event_title", "subject"),
+        )
+        summary = summary or _first_editor_text(
+            understanding,
+            ("summary", "content_summary", "event_summary", "abstract", "main_event"),
+        )
+
+    group_title = _task_group_meta(task_dir, manifest).get("group_title") or ""
+    title = title or str(group_title) or _display_title_from_task_id(task_dir.name)
+    cover_title = _first_editor_text(plan, ("cover_title", "title", "target_column")) or title
+    return title, summary, cover_title
+
+
+def _manual_editor_http_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, ProjectConflictError):
+        return HTTPException(409, str(exc))
+    if isinstance(exc, ProjectValidationError):
+        return HTTPException(422, str(exc))
+    return HTTPException(400, str(exc))
+
+
+@app.get("/api/editor/tasks/{task_id}")
+def get_editor_project(task_id: str) -> dict[str, Any]:
+    task_dir, manifest = _full_concat_editor_task(task_id)
+    try:
+        project = _load_or_initialize_editor_project(task_dir, manifest)
+        title, summary, cover_title = _editor_task_copy(task_dir, manifest)
+    except ManualEditorError as exc:
+        raise _manual_editor_http_error(exc) from exc
+    return {
+        "task_id": task_id,
+        "title": title,
+        "summary": summary,
+        "cover_title": cover_title,
+        "project": _editor_public_project(task_id, project),
+        "cover_config": public_provider_config(PROJECT_CONFIG),
+    }
+
+
+@app.put("/api/editor/tasks/{task_id}/project")
+def save_editor_project(task_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    task_dir, manifest = _full_concat_editor_task(task_id)
+    editor_root = _manual_editor_root(task_dir)
+    try:
+        with EDITOR_PROJECT_LOCK:
+            current = _load_or_initialize_editor_project(task_dir, manifest)
+            edited = apply_frontend_project(current, payload)
+            paths = save_project_revision(edited, editor_root)
+    except ManualEditorError as exc:
+        raise _manual_editor_http_error(exc) from exc
+    return {
+        "ok": True,
+        "project": _editor_public_project(task_id, edited),
+        "project_file": relpath(paths["project"], task_dir),
+        "revision_file": relpath(paths["revision"], task_dir),
+    }
+
+
+@app.get("/api/editor/tasks/{task_id}/assets/{asset_id}/preview")
+def preview_editor_asset(task_id: str, asset_id: str):
+    task_dir, manifest = _full_concat_editor_task(task_id)
+    try:
+        project = _load_or_initialize_editor_project(task_dir, manifest)
+    except ManualEditorError as exc:
+        raise _manual_editor_http_error(exc) from exc
+    asset = next(
+        (item for item in project.get("assets") or [] if str(item.get("asset_id")) == asset_id),
+        None,
+    )
+    if not asset:
+        raise HTTPException(404, "素材不存在")
+    path = Path(str(asset.get("path") or "")).expanduser().resolve()
+    if not path.is_file():
+        raise HTTPException(404, "素材文件不存在")
+    if path.suffix.lower() not in {".mp4", ".mov", ".mkv", ".m4v", ".avi"}:
+        raise HTTPException(400, "素材格式不支持预览")
+    return FileResponse(str(path))
+
+
+@app.post("/api/editor/tasks/{task_id}/assets")
+async def upload_editor_asset(task_id: str, file: UploadFile = File(...)) -> dict[str, Any]:
+    task_dir, manifest = _full_concat_editor_task(task_id)
+    suffix = Path(file.filename or "").suffix.lower()
+    if suffix not in {".mp4", ".mov", ".mkv", ".m4v", ".avi"}:
+        raise HTTPException(400, "仅支持 MP4/MOV/MKV/M4V/AVI 视频")
+    upload_dir = ensure_dir(_manual_editor_root(task_dir) / "assets")
+    safe_name = _safe_filename(file.filename or f"video{suffix}")
+    target = upload_dir / f"{uuid.uuid4().hex[:10]}_{safe_name}"
+    max_bytes = int(os.environ.get("MANUAL_EDITOR_MAX_UPLOAD_BYTES", 8 * 1024 * 1024 * 1024))
+    size = 0
+    try:
+        with target.open("wb") as out:
+            while chunk := await file.read(1024 * 1024):
+                size += len(chunk)
+                if size > max_bytes:
+                    raise HTTPException(413, "上传视频超过精剪素材大小限制")
+                out.write(chunk)
+    except Exception:
+        target.unlink(missing_ok=True)
+        raise
+    finally:
+        await file.close()
+
+    try:
+        with EDITOR_PROJECT_LOCK:
+            current = _load_or_initialize_editor_project(task_dir, manifest)
+            edited = add_asset(
+                current,
+                target,
+                asset_id=f"asset_{uuid.uuid4().hex[:12]}",
+                display_name=file.filename or target.name,
+                probe=True,
+            )
+            save_project_revision(edited, _manual_editor_root(task_dir))
+    except ManualEditorError as exc:
+        target.unlink(missing_ok=True)
+        raise _manual_editor_http_error(exc) from exc
+
+    public_project = _editor_public_project(task_id, edited)
+    public_asset = next(
+        item for item in public_project["assets"] if item["asset_id"] == edited["assets"][-1]["asset_id"]
+    )
+    return {"ok": True, "asset": public_asset, "project": public_project}
+
+
+@app.post("/api/editor/tasks/{task_id}/remote-assets")
+def add_remote_editor_asset(task_id: str, req: RemoteEditorAssetRequest) -> dict[str, Any]:
+    """Download a UCMS item to the shared cache and add it to the manual editor."""
+
+    task_dir, manifest = _full_concat_editor_task(task_id)
+    remote_video = req.remote_video
+    if not remote_video:
+        raise HTTPException(400, "remote_video is required")
+    if not REMOTE_UCMS_CONFIG.enabled:
+        raise HTTPException(409, "远程素材库未启用")
+
+    try:
+        expected_cache_path = remote_cache_path(REMOTE_UCMS_CONFIG, remote_video)
+    except Exception as exc:  # noqa: BLE001 - normalize provider payload errors at the API boundary
+        print(f"[manual-editor] invalid remote asset payload: {exc}", file=sys.stderr)
+        raise HTTPException(502, "远程素材信息无效") from exc
+
+    # A normal repeat add can return immediately without another remote request.
+    if not req.force_remote_download:
+        try:
+            with EDITOR_PROJECT_LOCK:
+                current = _load_or_initialize_editor_project(task_dir, manifest)
+                existing = _find_remote_editor_asset(
+                    current,
+                    remote_video,
+                    cache_path=expected_cache_path,
+                )
+                if existing and Path(str(existing.get("path") or "")).is_file():
+                    public_project = _editor_public_project(task_id, current)
+                    public_asset = next(
+                        item
+                        for item in public_project["assets"]
+                        if item["asset_id"] == existing["asset_id"]
+                    )
+                    return {
+                        "ok": True,
+                        "duplicate": True,
+                        "downloaded": False,
+                        "asset": public_asset,
+                        "project": public_project,
+                    }
+        except ManualEditorError as exc:
+            raise _manual_editor_http_error(exc) from exc
+
+    try:
+        download_result = download_ucms_video(
+            REMOTE_UCMS_CONFIG,
+            remote_video,
+            root_dir=ROOT,
+            force=req.force_remote_download,
+        )
+    except Exception as exc:  # noqa: BLE001 - remote transport/provider failures are upstream errors
+        print(f"[manual-editor] remote asset download failed: {exc}", file=sys.stderr)
+        raise HTTPException(502, "远程素材下载失败，请稍后重试") from exc
+
+    # The cache location is derived again from server configuration and UCMS identity;
+    # no path from the browser or provider response is trusted here.
+    cached_path = expected_cache_path.expanduser().resolve()
+    if not cached_path.is_file() or cached_path.stat().st_size <= 0:
+        raise HTTPException(502, "远程素材缓存文件不存在或为空")
+
+    remote_metadata = _remote_editor_public_metadata(remote_video, download_result)
+    display_name = str(
+        remote_metadata.get("display_name")
+        or remote_metadata.get("name")
+        or remote_video.get("display_name")
+        or remote_video.get("name")
+        or cached_path.name
+    )
+    source_id = str(
+        remote_metadata.get("remote_id")
+        or remote_metadata.get("id")
+        or remote_metadata.get("guid")
+        or f"remote_{hashlib.sha256(str(cached_path).encode('utf-8')).hexdigest()[:16]}"
+    )
+    remote_key = _remote_editor_stable_key(remote_video, cached_path)
+
+    try:
+        with EDITOR_PROJECT_LOCK:
+            # Re-check after the potentially long download so concurrent adds stay idempotent.
+            current = _load_or_initialize_editor_project(task_dir, manifest)
+            existing = _find_remote_editor_asset(
+                current,
+                remote_video,
+                cache_path=cached_path,
+            )
+            if existing:
+                public_project = _editor_public_project(task_id, current)
+                public_asset = next(
+                    item
+                    for item in public_project["assets"]
+                    if item["asset_id"] == existing["asset_id"]
+                )
+                return {
+                    "ok": True,
+                    "duplicate": True,
+                    "downloaded": bool(download_result.get("downloaded")),
+                    "asset": public_asset,
+                    "project": public_project,
+                }
+
+            edited = add_asset(
+                current,
+                cached_path,
+                asset_id=f"asset_remote_{uuid.uuid4().hex[:12]}",
+                source_id=source_id,
+                display_name=display_name,
+                probe=True,
+            )
+            added = edited["assets"][-1]
+            added.update(
+                {
+                    "source_type": "remote_ucms",
+                    "origin": "remote_ucms",
+                    "remote_key": remote_key,
+                    "remote_id": str(remote_metadata.get("remote_id") or source_id),
+                    "remote_guid": str(remote_metadata.get("guid") or ""),
+                    "record_station": str(remote_metadata.get("record_station") or ""),
+                    "create_time": str(remote_metadata.get("create_time") or ""),
+                    "metadata": {"remote_ucms": remote_metadata},
+                }
+            )
+            save_project_revision(edited, _manual_editor_root(task_dir))
+    except ManualEditorError as exc:
+        print(f"[manual-editor] remote asset could not be added: {exc}", file=sys.stderr)
+        if isinstance(exc, ProjectConflictError):
+            raise HTTPException(409, "编辑工程版本已更新，请刷新后重试") from exc
+        if isinstance(exc, ProjectValidationError):
+            raise HTTPException(422, "远程素材无法加入当前编辑工程") from exc
+        raise HTTPException(400, "远程素材无法加入编辑工程，请确认视频文件有效") from exc
+
+    public_project = _editor_public_project(task_id, edited)
+    public_asset = next(
+        item for item in public_project["assets"] if item["asset_id"] == added["asset_id"]
+    )
+    return {
+        "ok": True,
+        "duplicate": False,
+        "downloaded": bool(download_result.get("downloaded")),
+        "asset": public_asset,
+        "project": public_project,
+    }
+
+
+@app.post("/api/editor/tasks/{task_id}/export")
+def export_editor_video(task_id: str) -> dict[str, Any]:
+    task_dir, manifest = _full_concat_editor_task(task_id)
+    try:
+        with EDITOR_PROJECT_LOCK:
+            project = _load_or_initialize_editor_project(task_dir, manifest)
+            paths = save_project_revision(project, _manual_editor_root(task_dir))
+    except ManualEditorError as exc:
+        raise _manual_editor_http_error(exc) from exc
+    if not (project.get("timeline") or {}).get("clips"):
+        raise HTTPException(400, "时间轴没有可导出的片段")
+
+    revision = int(project["revision"])
+    export_dir = ensure_dir(_manual_editor_root(task_dir) / "exports")
+    cache_dir = ensure_dir(_manual_editor_root(task_dir) / "cache")
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output = export_dir / f"manual_export_v{revision:04d}_{stamp}_{uuid.uuid4().hex[:6]}.mp4"
+    job_id = f"job_editor_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+    log_dir = ensure_dir(task_dir / "web_jobs")
+    log_path = log_dir / f"{job_id}.log"
+    cmd = [
+        sys.executable,
+        "-u",
+        str(MANUAL_EDITOR_RUNNER),
+        "export",
+        str(paths["revision"]),
+        str(output),
+        "--cache-dir",
+        str(cache_dir),
+    ]
+
+    with JOB_LOCK:
+        active_job = _find_active_job_by_task_id(task_id)
+        if active_job and SAME_TASK_POLICY == "reject":
+            raise HTTPException(409, "当前任务已有运行中或排队中的处理，请完成后再导出")
+        active_count = sum(
+            1
+            for existing_job_id in list(JOBS)
+            if _refresh_job(existing_job_id, schedule_next=False).get("status") in {"pending", "running"}
+        )
+        if active_count >= MAX_ACTIVE_JOBS:
+            raise HTTPException(429, "后台处理已满，请稍后再导出")
+        pending_count = sum(1 for job in JOBS.values() if job.get("status") == "pending")
+        if pending_count >= MAX_PENDING_JOBS:
+            raise HTTPException(429, "等待队列已满，请稍后再导出")
+        log_path.write_text(" ".join(cmd) + "\n\n=== job queued ===\n", encoding="utf-8")
+        job = {
+            "job_id": job_id,
+            "job_type": "manual_editor_export",
+            "task_id": task_id,
+            "pid": None,
+            "cmd": cmd,
+            "log": relpath(log_path, ROOT),
+            "log_path": str(log_path),
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "started_at": "",
+            "status": "pending",
+            "returncode": None,
+            "submitted_by": "manual_editor",
+            "project_revision": revision,
+            "output_file": relpath(output, task_dir),
+            "output_url": _task_file_url(task_id, task_dir, output),
+        }
+        JOBS[job_id] = job
+        PENDING_JOB_IDS.append(job_id)
+        _persist_job(job)
+
+    _schedule_jobs()
+    return _public_job(JOBS[job_id])
+
+
+def _cover_result_urls(task_id: str, task_dir: Path, result: dict[str, Any]) -> dict[str, Any]:
+    public = dict(result)
+    public["files"] = []
+    for item in result.get("files", []) or []:
+        copied = dict(item)
+        path = _safe_child(task_dir, str(item.get("file") or ""))
+        if path.exists() and path.is_file():
+            copied["url"] = _task_file_url(task_id, task_dir, path)
+        public["files"].append(copied)
+    return public
+
+
+@app.get("/api/editor/tasks/{task_id}/cover-config")
+def get_editor_cover_config(task_id: str) -> dict[str, Any]:
+    _full_concat_editor_task(task_id)
+    return public_provider_config(PROJECT_CONFIG)
+
+
+@app.post("/api/editor/tasks/{task_id}/covers/prompt")
+def create_editor_cover_prompt(task_id: str, req: CoverPromptRequest) -> dict[str, Any]:
+    _full_concat_editor_task(task_id)
+    try:
+        return COVER_SERVICE.create_seedream_prompt(**req.model_dump())
+    except CoverServiceError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001 - provider errors need a stable user-facing boundary
+        raise HTTPException(502, f"豆包生成 Seedream 提示词失败：{exc}") from exc
+
+
+@app.post("/api/editor/tasks/{task_id}/covers/generate")
+def generate_editor_covers(task_id: str, req: CoverGenerateRequest) -> dict[str, Any]:
+    task_dir, _ = _full_concat_editor_task(task_id)
+    reference = _safe_child(task_dir, req.reference_file) if req.reference_file else None
+    if reference is not None and (not reference.exists() or reference.suffix.lower() not in {".jpg", ".jpeg", ".png", ".webp"}):
+        raise HTTPException(400, "参考图片无效")
+    try:
+        result = COVER_SERVICE.generate_images(
+            task_dir=task_dir,
+            prompt_doc=req.prompt_doc,
+            max_images=req.max_images,
+            watermark=req.watermark,
+            reference_image=reference,
+            edit_instruction=req.edit_instruction,
+        )
+    except CoverServiceError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, f"Seedream 生图失败：{exc}") from exc
+    return _cover_result_urls(task_id, task_dir, result)
+
+
+@app.post("/api/editor/tasks/{task_id}/covers/ai-restore")
+def restore_editor_cover(task_id: str, req: CoverRestoreRequest) -> dict[str, Any]:
+    task_dir, _ = _full_concat_editor_task(task_id)
+    source = _safe_child(task_dir, req.source_file)
+    if not source.exists() or source.suffix.lower() not in {".jpg", ".jpeg", ".png", ".webp"}:
+        raise HTTPException(400, "待修复图片无效")
+    instruction = (
+        "对参考图进行高保真高清修复和细节增强，保持原构图、人物身份、面部特征、服装、物体、"
+        "新闻现场关系和色彩基调不变，不新增或删除事实性内容，不生成文字、Logo或水印。"
+        + str(req.requirements or "")[:600]
+    )
+    prompt_doc = {
+        "prompt": instruction,
+        "size": req.size if req.size in COVER_CONFIG.allowed_sizes else COVER_CONFIG.allowed_sizes[-1],
+        "aspect_ratio": COVER_DEFAULT_ASPECT_RATIO,
+        "safe_area": COVER_DEFAULT_SAFE_AREA,
+        "chat_model": "manual_restore_instruction",
+        "skill_hash": "seedream_reference_restore_v1",
+    }
+    try:
+        result = COVER_SERVICE.generate_images(
+            task_dir=task_dir,
+            prompt_doc=prompt_doc,
+            max_images=1,
+            watermark=False,
+            reference_image=source,
+            edit_instruction="",
+        )
+    except CoverServiceError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, f"Seedream 高清修复失败：{exc}") from exc
+    return _cover_result_urls(task_id, task_dir, result)
+
+
+@app.post("/api/editor/tasks/{task_id}/covers/upload")
+async def upload_editor_cover(task_id: str, file: UploadFile = File(...)) -> dict[str, Any]:
+    task_dir, _ = _full_concat_editor_task(task_id)
+    suffix = Path(file.filename or "").suffix.lower()
+    if suffix not in {".jpg", ".jpeg", ".png", ".webp"}:
+        raise HTTPException(400, "仅支持 JPG/PNG/WebP 图片")
+    upload_dir = ensure_dir(task_dir / "edit" / "manual_editor" / "cover_uploads")
+    target = upload_dir / f"upload_{uuid.uuid4().hex}{suffix}"
+    size = 0
+    try:
+        with target.open("wb") as out:
+            while chunk := await file.read(1024 * 1024):
+                size += len(chunk)
+                if size > COVER_CONFIG.max_image_bytes:
+                    raise HTTPException(413, f"图片不能超过 {COVER_CONFIG.max_image_bytes // (1024 * 1024)}MB")
+                out.write(chunk)
+    except Exception:
+        target.unlink(missing_ok=True)
+        raise
+    finally:
+        await file.close()
+    try:
+        with Image.open(target) as image:
+            image.verify()
+        with Image.open(target) as image:
+            width, height = image.size
+        if width * height > COVER_CONFIG.max_image_pixels:
+            raise ValueError("图片像素过大")
+    except Exception as exc:
+        target.unlink(missing_ok=True)
+        raise HTTPException(400, f"图片文件无效：{exc}") from exc
+    return {
+        "file": relpath(target, task_dir),
+        "url": _task_file_url(task_id, task_dir, target),
+        "width": width,
+        "height": height,
+    }
+
+
+@app.get("/api/editor/tasks/{task_id}/fonts")
+def list_editor_fonts(task_id: str) -> list[dict[str, Any]]:
+    task_dir, _ = _full_concat_editor_task(task_id)
+    fonts_dir = task_dir / "edit" / "manual_editor" / "fonts"
+    if not fonts_dir.exists():
+        return []
+    return [
+        {"name": path.name, "file": relpath(path, task_dir), "url": _task_file_url(task_id, task_dir, path)}
+        for path in sorted(fonts_dir.iterdir())
+        if path.is_file() and path.suffix.lower() in {".ttf", ".otf"}
+    ]
+
+
+@app.post("/api/editor/tasks/{task_id}/fonts")
+async def upload_editor_font(task_id: str, file: UploadFile = File(...)) -> dict[str, Any]:
+    task_dir, _ = _full_concat_editor_task(task_id)
+    suffix = Path(file.filename or "").suffix.lower()
+    if suffix not in {".ttf", ".otf"}:
+        raise HTTPException(400, "仅支持 TTF/OTF 字体")
+    fonts_dir = ensure_dir(task_dir / "edit" / "manual_editor" / "fonts")
+    safe_stem = re.sub(r"[^A-Za-z0-9_-]", "_", Path(file.filename or "font").stem)[:60] or "font"
+    target = fonts_dir / f"{safe_stem}_{uuid.uuid4().hex[:8]}{suffix}"
+    size = 0
+    try:
+        with target.open("wb") as out:
+            while chunk := await file.read(1024 * 1024):
+                size += len(chunk)
+                if size > 20 * 1024 * 1024:
+                    raise HTTPException(413, "字体不能超过 20MB")
+                out.write(chunk)
+    except Exception:
+        target.unlink(missing_ok=True)
+        raise
+    finally:
+        await file.close()
+    try:
+        metadata = validate_font_file(target)
+    except CoverServiceError as exc:
+        target.unlink(missing_ok=True)
+        raise HTTPException(400, str(exc)) from exc
+    return {**metadata, "file": relpath(target, task_dir), "url": _task_file_url(task_id, task_dir, target)}
+
+
+@app.post("/api/editor/tasks/{task_id}/covers/compose")
+def compose_editor_cover(task_id: str, req: CoverComposeRequest) -> dict[str, Any]:
+    task_dir, _ = _full_concat_editor_task(task_id)
+    source = _safe_child(task_dir, req.source_file)
+    if not source.exists() or source.suffix.lower() not in {".jpg", ".jpeg", ".png", ".webp"}:
+        raise HTTPException(400, "封面源图片无效")
+    output_format = "jpg" if req.output_format.lower() in {"jpg", "jpeg"} else "png"
+    export_dir = ensure_dir(task_dir / "edit" / "manual_editor" / "cover_exports")
+    export_id = f"cover_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+    output = export_dir / f"{export_id}.{output_format}"
+    fonts_dir = task_dir / "edit" / "manual_editor" / "fonts"
+    try:
+        result = compose_cover(
+            source_path=source,
+            output_path=output,
+            width=req.width,
+            height=req.height,
+            crop=req.crop,
+            text_layers=req.text_layers,
+            enhance=req.enhance,
+            fonts_dir=fonts_dir,
+        )
+    except CoverServiceError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(500, f"封面导出失败：{exc}") from exc
+    composition = {
+        "export_id": export_id,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "source_file": req.source_file,
+        "output_file": relpath(output, task_dir),
+        "width": req.width,
+        "height": req.height,
+        "crop": req.crop,
+        "text_layers": req.text_layers,
+        "enhance": req.enhance,
+    }
+    write_json(export_dir / f"{export_id}.json", composition)
+    return {
+        **result,
+        "file": relpath(output, task_dir),
+        "url": _task_file_url(task_id, task_dir, output),
+        "composition": composition,
+    }
 
 
 @app.post("/api/run")
@@ -1634,7 +2528,7 @@ def _running_job_count() -> int:
 def _persist_job(job: dict[str, Any]) -> None:
     public_job = _public_job(job)
     write_json(OUTPUTS_DIR / job["task_id"] / "last_web_job.json", public_job)
-    JOB_STORE.save_job(job["task_id"], public_job)
+    JOB_STORE.save_job(job["job_id"], public_job)
 
 
 def _save_web_run_options(task_dir: Path, req: RunRequest) -> None:
@@ -1965,6 +2859,8 @@ def _list_draft_videos(task_dir: Path) -> list[Path]:
     seen: set[Path] = set()
     for index in render_indexes:
         data = read_json(index, {})
+        if "full_concat_drafts" in index.parts and data.get("semantic_qc_status") in {"fail", "failed"}:
+            continue
         for item in data.get("outputs", []):
             file_value = item.get("file")
             if not file_value:
@@ -1979,16 +2875,28 @@ def _list_draft_videos(task_dir: Path) -> list[Path]:
             task_dir / "edit" / "drafts",
             task_dir / "edit" / "reassembly_drafts",
             task_dir / "edit" / "full_concat_drafts",
+            task_dir / "edit" / "manual_editor" / "exports",
         ]
         for p in root.rglob("*.mp4")
         if "_clips" not in p.parts and p.is_file()
+        and not ("full_concat_drafts" in p.parts and _full_concat_is_quarantined(task_dir))
     ]
     for path in sorted(candidates, key=lambda p: p.stat().st_mtime, reverse=True):
         resolved = path.resolve()
         if resolved not in seen:
             ordered.append(resolved)
             seen.add(resolved)
-    return ordered
+    return sorted(ordered, key=lambda path: path.stat().st_mtime_ns, reverse=True)
+
+
+def _full_concat_is_quarantined(task_dir: Path) -> bool:
+    manifest = read_json(task_dir / "manifest.json", {})
+    step = (manifest.get("steps", {}) or {}).get("full_concat_output_qc", {}) or {}
+    output = step.get("output")
+    if not output:
+        return False
+    doc = read_json(task_dir / output, {})
+    return bool(doc.get("quarantined") or doc.get("publishable") is False)
 
 
 def _public_job(job: dict[str, Any]) -> dict[str, Any]:
@@ -2042,6 +2950,9 @@ def _is_task_already_completed(manifest: dict[str, Any], production_mode: str) -
         "highlight_reassembly": "reassembly_render",
         "full_concat": "full_concat_render",
     }.get(production_mode, "render")
+    if production_mode == "full_concat" and "full_concat_output_qc" in steps:
+        qc = steps.get("full_concat_output_qc", {}) or {}
+        return qc.get("status") in {"success", "partial_success"} and bool(qc.get("publishable", False))
     return steps.get(final_step, {}).get("status") in {"success", "partial_success"}
 
 
@@ -2568,30 +3479,16 @@ def _source_request_fingerprint(req: RunRequest, items: list[dict[str, Any]]) ->
 
 
 def _common_source_key(req: RunRequest, items: list[dict[str, Any]]) -> str:
-    payload_items: list[dict[str, Any]] = []
-    for index, item in enumerate(items, start=1):
-        if not isinstance(item, dict):
-            continue
-        source_type = str(item.get("source_type") or item.get("type") or "local")
-        if source_type in {"local", "video"}:
-            path_value = item.get("path") or item.get("input_video")
-            path = _resolve_input_video(str(path_value))
-            payload_items.append({"order": index, "source_type": "local", **_video_fingerprint(path)})
-            continue
-        if source_type in {"remote", "remote_ucms"}:
-            remote_video = item.get("remote_video") or item
-            payload_items.append({"order": index, "source_type": "remote_ucms", "remote": _remote_video_fingerprint(remote_video)})
-            continue
-        payload_items.append({"order": index, "source_type": source_type, "raw": item})
-    payload = {
-        "sources": payload_items,
+    request = {
+        "production_mode": req.production_mode,
         "aspect_ratio": req.aspect_ratio,
         "chunk_seconds": req.chunk_seconds,
         "frame_interval": req.frame_interval,
         "mode": req.mode,
+        "source_items": items,
     }
-    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+    profile = build_common_analysis_profile(request, config=PROJECT_CONFIG)
+    return build_common_source_key(items, profile, root=ROOT)
 
 
 def _display_source_request_name(items: list[dict[str, Any]]) -> str:

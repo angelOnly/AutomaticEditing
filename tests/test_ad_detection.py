@@ -197,6 +197,87 @@ def test_detect_splits_end_sponsor_card_from_target_outro():
     assert by_id["outro_frame_04"]["keep"] is False
 
 
+def test_detect_splits_real_10s_chunk_and_does_not_copy_parent_speech():
+    """生产配置就是10s；frame拆分必须执行，父ASR只能作为context，不能污染视觉子段。"""
+    parent_speech = "凤凰聚焦由华润集团赞助播出，随后报道英国政坛新闻"
+    chunks = [_chunk(
+        "ten_seconds",
+        "s",
+        290,
+        300,
+        speech=parent_speech,
+        screen=["鳳凰聚焦", "Phoenix TV 鳳凰新聞"],
+        footage=["片头包装"],
+    )]
+    chunks[0]["visual"] = "凤凰卫视传播矩阵相关的平台宣传画面"
+    chunks[0]["frame_shots"] = [
+        {"t": 290, "shot_type": "片头包装", "visual": "手机端节目列表中出现鳳凰聚焦入口"},
+        {"t": 295, "shot_type": "片头包装", "visual": "平板电脑显示Phoenix TV鳳凰新聞帖文界面"},
+    ]
+
+    res = ad.detect(chunks, cfg={**CFG, "use_llm": False}, fc_cfg=FC, schedule=SCHEDULE, source_items=[], override_column="凤凰聚焦")
+
+    assert len(res["segments"]) == 2
+    assert res["stats"]["split_parent_count"] == 1
+    assert all(s["speech"] == "" for s in res["segments"])
+    assert all(s["speech_context"] == parent_speech[:200] for s in res["segments"])
+    assert all(s["keep"] is False for s in res["segments"])
+
+
+def test_detect_platform_menu_target_name_is_mention_not_ownership():
+    chunks = [_chunk(
+        "platform",
+        "s",
+        290,
+        300,
+        speech="凤凰聚焦由华润集团赞助播出，新闻实现全球覆盖",
+        screen=["鳳凰秀", "鳳凰聚焦", "Phoenix TV 鳳凰新聞"],
+        footage=["片头包装"],
+    )]
+    chunks[0]["visual"] = "凤凰卫视传播矩阵宣传，手机和平板展示节目列表及社交平台帖文界面"
+
+    res = ad.detect(chunks, cfg={**CFG, "use_llm": False}, fc_cfg=FC, schedule=SCHEDULE, source_items=[], override_column="凤凰聚焦")
+    seg = res["segments"][0]
+
+    assert seg["label"] == "promo"
+    assert seg["decision_state"] == ad.STATE_HARD_DROP
+    assert seg["keep"] is False
+
+
+def test_detect_generic_station_packaging_not_rescued_by_target_speech():
+    chunks = [_chunk(
+        "station_pkg",
+        "s",
+        50,
+        60,
+        speech="您正在收看凤凰卫视，凤凰聚焦由华润赞助播出，斯塔默辞职令英国政坛动荡",
+        footage=["片头包装"],
+    )]
+    chunks[0]["visual"] = "金色凤凰卫视台标和抽象几何包装，声画不一致，无事件画面"
+
+    res = ad.detect(chunks, cfg={**CFG, "use_llm": False}, fc_cfg=FC, schedule=SCHEDULE, source_items=[], override_column="凤凰聚焦")
+    seg = res["segments"][0]
+
+    assert seg["label"] == "packaging_other"
+    assert seg["keep"] is False
+
+
+def test_detect_bridge_chain_has_total_duration_limit():
+    fc = {**FC, "bridge_max_total_seconds": 30.0, "bridge_edge_max_seconds": 30.0}
+    chunks = [_chunk("left", "s", 0, 10, bug="凤凰聚焦")]
+    chunks.extend(
+        _chunk(f"u{i}", "s", 10 + i * 10, 20 + i * 10, speech="无角标的连续新闻解说")
+        for i in range(4)
+    )
+    chunks.append(_chunk("right", "s", 50, 60, bug="凤凰聚焦"))
+
+    res = ad.detect(chunks, cfg={**CFG, "use_llm": False}, fc_cfg=fc, schedule=SCHEDULE, source_items=[], override_column="凤凰聚焦")
+    unknowns = [s for s in res["segments"] if s["segment_id"].startswith("u")]
+
+    assert len(unknowns) == 4
+    assert all(s["keep"] is False and s["label"] == "unknown_drop" for s in unknowns)
+
+
 def test_detect_packaging_footage_dropped():
     # 片头包装/台标卡（footage_types 含片头包装），非目标 → 删
     chunks = [_chunk("a", "s", 0, 8, speech="", bug="", footage=["片头包装"])]
@@ -325,6 +406,22 @@ def test_build_plan_safety_margin():
     plan = ad.build_plan(segments, source_order=["s"], cfg=cfg)
     assert plan["clips"][0]["local_start_seconds"] == 10.5
     assert plan["clips"][0]["local_end_seconds"] == 30
+
+
+def test_build_plan_never_merges_across_explicit_short_drop():
+    cfg = {"safety_margin_seconds": 0.0, "merge_gap_seconds": 1.5, "min_clip_seconds": 0.1}
+    segments = [
+        {"segment_id": "t1", "source_id": "s", "start_seconds": 0, "end_seconds": 10, "duration_seconds": 10,
+         "label": "target", "keep": True},
+        {"segment_id": "ad", "source_id": "s", "start_seconds": 10, "end_seconds": 11, "duration_seconds": 1,
+         "label": "ad", "keep": False},
+        {"segment_id": "t2", "source_id": "s", "start_seconds": 11, "end_seconds": 20, "duration_seconds": 9,
+         "label": "target", "keep": True},
+    ]
+
+    plan = ad.build_plan(segments, source_order=["s"], cfg=cfg)
+
+    assert [(c["local_start_seconds"], c["local_end_seconds"]) for c in plan["clips"]] == [(0.0, 10.0), (11.0, 20.0)]
 
 
 def test_build_plan_drops_too_short():
